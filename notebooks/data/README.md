@@ -34,7 +34,7 @@ with open('test_split.json', 'w') as f:
 4. create a dataloading python script under rock_detection_3d/datasets/segmentation. E.g. rock_las.py   
 
 
-5. create a notebook to check your dataloading script under rock_detection_3d/notebooks. E.g. dataset_test.ipynb
+5. create a notebook to check your dataloading script under rock_detection_3d/notebooks. E.g. dataset_test.ipynb  
 
 
 References:  

@@ -17,7 +17,6 @@ from torch_points3d.datasets.base_dataset import BaseDataset, save_used_properti
 from torch_points3d.utils.download import download_url
 
 
-
 class RockLAS(InMemoryDataset):
     r"""
     Args:
@@ -185,25 +184,35 @@ class RockLAS(InMemoryDataset):
             # print(name)
             las_file = os.path.join(self.raw_dir, name)
             las = laspy.read(las_file)
-            pos = np.array((las.x.scaled_array(), las.y.scaled_array(), las.z.scaled_array())).transpose()
-            x = np.array((las.red, las.green, las.blue)).transpose().astype(np.float32) / (2**16)
+            pos = np.array((las.x.scaled_array(), las.y.scaled_array(), las.z.scaled_array())).transpose().astype(np.float64)
+            x = np.array((las.red, las.green, las.blue)).transpose().astype(np.float64) / (2**16)
             try:
                 y = (las.isPBR==0)*1
             except AttributeError:
                 y = np.logical_not((las.notPBR==1))*1
-            pos = torch.from_numpy(pos)
+            pos = torch.from_numpy(pos) 
             y = torch.from_numpy(y)
-            x = torch.from_numpy(x)
+            x = torch.from_numpy(x) 
                 
             category = torch.ones(x.shape[0], dtype=torch.long) * 0
             id_scan_tensor = torch.from_numpy(np.asarray([id_scan])).clone()
-            data = Data(pos=pos, x=x, y=y, category=category, id_scan=id_scan_tensor)
+            
+            # normalize scale
+            center = pos.mean(axis=0)
+            pos = pos - center
+            scale = ((1 / pos.abs().max()) * 0.999999).reshape((1))
+            pos = pos * scale
+            normalize_attr = {'center': center, 'scale': scale}
+            
+            data = Data(pos=pos, x=x, y=y, category=category, id_scan=id_scan_tensor, scale=scale, center=center, file_name=name)
             data = SaveOriginalPosId()(data)
             if self.pre_filter is not None and not self.pre_filter(data):
                 continue
             data_raw_list.append(data.clone() if has_pre_transform else data)
             if has_pre_transform:
                 data = self.pre_transform(data)
+                data.x = data.x.float()  # cast float64 to float32 after  transformation; if before, there is a server data precision loss issue
+                data.pos = data.pos.float()
                 data_list.append(data)
         if not has_pre_transform:
             return [], data_raw_list
@@ -264,7 +273,7 @@ class RockLASDataset(BaseDataset):
             include_color=dataset_opt.color,
             split="val",
             pre_transform=self.pre_transform,
-            transform=self.val_transform,
+            transform=self.test_transform,  # valid dataset has the same transform as the test dataset
             is_test=is_test,
         )
 
