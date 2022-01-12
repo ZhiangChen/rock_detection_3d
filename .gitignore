@@ -1,3 +1,9 @@
+**.cpg
+**.dbf
+**.prj
+**.shp
+**.shx
+
 */tensorboard/
 **.las
 **.pt
