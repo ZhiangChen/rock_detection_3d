@@ -41,11 +41,19 @@ class Dataset(object):
         shp = gpd.read_file(shp_path)
         masks = []
         for poly in shp.geometry:
+            if poly is None:
+                continue
             tif = rasterio.open(data_path)
             p = self._poly_from_utm(poly, tif.meta['transform'])
             mask = rasterize([p], (self.pixel_size, self.pixel_size))
             if np.count_nonzero(mask) > 0:
-                masks.append(mask)
+                pos = np.where(mask)
+                xmin = np.min(pos[1])
+                xmax = np.max(pos[1])
+                ymin = np.min(pos[0])
+                ymax = np.max(pos[0])
+                if (xmax - xmin > 0) & (ymax - ymin > 0):
+                    masks.append(mask)
         
         num_objs = len(masks)
         if num_objs > 0:
@@ -64,6 +72,8 @@ class Dataset(object):
             boxes.append([xmin, ymin, xmax, ymax])
 
         # convert everything into a torch.Tensor
+        image = torch.from_numpy(image/255.).float()
+        image = image.permute((2, 0, 1))
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         obj_ids = np.ones(num_objs)
         labels = torch.as_tensor(obj_ids, dtype=torch.int64)
@@ -105,7 +115,9 @@ class Dataset(object):
 
     def show(self, idx):
         image, target = self.__getitem__(idx)
-        rgb = image[:, :, :3].astype(np.uint8)
+        rgb = (image.permute((1, 2, 0))*255).numpy()
+        rgb = rgb.astype(np.uint8)
+        #rgb = rgb[:, :, :3].astype(np.uint8)
         rgb = Image.fromarray(rgb)
         rgb.show()
         masks = target["masks"]
@@ -129,14 +141,3 @@ class Dataset(object):
         return np.mean(images, axis=0).tolist(), np.std(images, axis=0).tolist(), \
                np.max(images, axis=0).tolist(), np.min(images, axis=0).tolist()
 
-
-
-
-
-if __name__  ==  "__main__":
-    #ds = Dataset("./datasets/Rock/data/")
-    ds = Dataset("./datasets/iros/bishop/aug/",input_channel=4)
-    image_mean, image_std, image_max, image_min = ds.imageStat()
-    image, target = ds[0]
-    print(image.shape)
-    print(image_mean, image_std, image_max, image_min)

@@ -10,11 +10,9 @@ import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
-from visualize import *
 
-def get_model_instance_segmentation(num_classes, image_mean, image_std, stats=False):
+def get_model_instance_segmentation(num_classes, image_mean, image_std, stats=False, input_channel=3, detections_per_img=256, anchor_size=((16,), (32,), (64,), (128,), (256,))):
     # load an instance segmentation model pre-trained pre-trained on COCO
-    #model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
 
     # get number of input features for the classifier
@@ -23,11 +21,11 @@ def get_model_instance_segmentation(num_classes, image_mean, image_std, stats=Fa
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
     # the size shape and the aspect_ratios shape should be the same as the shape in the loaded model
-    anchor_generator = AnchorGenerator(sizes=((32,), (64,), (128,), (256,), (512,)),
+    anchor_generator = AnchorGenerator(sizes=anchor_size,
                                        aspect_ratios=((0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0)))
     model.rpn.anchor_generator = anchor_generator
 
-    if stats:
+    if stats:  # the default stats are based on COCO datasets
         model.transform.image_mean = image_mean
         model.transform.image_std = image_std
     # now get the number of input features for the mask classifier
@@ -37,43 +35,16 @@ def get_model_instance_segmentation(num_classes, image_mean, image_std, stats=Fa
     model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask,
                                                        hidden_layer,
                                                        num_classes)
-    model.roi_heads.detections_per_img = 256
-
-    return model
-
-def get_rock_model_instance_segmentation(num_classes, input_channel=8, image_mean=None, image_std=None, pretrained=True):
-    # load an instance segmentation model pre-trained pre-trained on COCO
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=pretrained)
+    # modify detection candidates per image
+    model.roi_heads.detections_per_img = detections_per_img
+    # modify input channels
     if input_channel != 3:
-        model.transform.image_mean = image_mean
-        model.transform.image_std = image_std
-
-    input_channel = abs(input_channel)
-
-    # get number of input features for the classifier
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    # replace the pre-trained head with a new one
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
-    # the size shape and the aspect_ratios shape should be the same as the shape in the loaded model
-    anchor_generator = AnchorGenerator(sizes=((16,), (32,), (64,), (128,), (256,)),
-                                       aspect_ratios=((0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0), (0.5, 1.0, 2.0)))
-    model.rpn.anchor_generator = anchor_generator
-
-    # now get the number of input features for the mask classifier
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    hidden_layer = 256
-    # and replace the mask predictor with a new one
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask,
-                                                       hidden_layer,
-                                                       num_classes)
-
-    model.backbone.body.conv1 = nn.Conv2d(input_channel, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-    model.roi_heads.detections_per_img = 200
+        model.backbone.body.conv1 = nn.Conv2d(input_channel, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False) 
 
     return model
 
 
+'''
 def predict(model, data, device, batch=False):
     model.eval()
     if not batch:
@@ -133,6 +104,4 @@ def visualize_result(model, data):
 
 def train(model, epochs, device):
     pass
-
-if __name__  ==  "__main__":
-    model = get_model_instance_segmentation(3)
+'''

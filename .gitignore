@@ -4,13 +4,14 @@
 **.shp
 **.shx
 
+
 */tensorboard/
 **.las
 **.pt
 **.obj
 **.tif
 *key
-
+**.param
 
 
 # Byte-compiled / optimized / DLL files
