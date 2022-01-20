@@ -5,6 +5,7 @@
 **.shx
 **.npy
 **.pickle
+*/data/**.png
 
 
 */tensorboard/
