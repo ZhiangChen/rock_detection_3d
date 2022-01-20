@@ -3,6 +3,8 @@
 **.prj
 **.shp
 **.shx
+**.npy
+**.pickle
 
 
 */tensorboard/
