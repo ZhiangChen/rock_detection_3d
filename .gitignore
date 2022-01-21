@@ -5,7 +5,7 @@
 **.shx
 **.npy
 **.pickle
-*/data/**.png
+**/prediction_2d/
 
 
 */tensorboard/

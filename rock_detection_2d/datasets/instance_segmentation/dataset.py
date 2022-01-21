@@ -37,7 +37,7 @@ def create_datasets(data_path, split=(0.6,0.8)):
 
 
 class Dataset(object):
-    def __init__(self, json_file_list, pixel_size, input_channel=(0,1,2), transforms=None, include_name=True):
+    def __init__(self, json_file_list, pixel_size, input_channel=(0,1,2), transforms=None):
         self.data_files = []
         for json_file in json_file_list:
             assert os.path.isfile(json_file)
@@ -50,7 +50,6 @@ class Dataset(object):
                 
                 
         self.transforms = transforms
-        self.include_name = include_name
         self.pixel_size = pixel_size
         self.input_channel = input_channel
 
@@ -111,8 +110,7 @@ class Dataset(object):
         target["image_id"] = image_id
         target["area"] = area
         target["iscrowd"] = iscrowd
-        if self.include_name:
-            target["image_name"] = data_path
+        target["image_name"] = data_path
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
