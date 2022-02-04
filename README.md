@@ -33,8 +33,6 @@ The objective of the third step is to reduce false detections from the first ste
 
 
 ## Todo
-- merge inference instances
 - make the dataset more general
 - implement weighted loss to focus on edge point segmentation
-- write a trainer class
 - try different optimizers
