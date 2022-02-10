@@ -41,8 +41,9 @@ rock_detection_3d/notebooks/data/rocklas/
 5) train Mask R-CNN and conduct inference: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_1_training_2D_instance_segmentation.ipynb).
 6) instance registration: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_2_merging_inference_instances.ipynb) to create a shapefile of your inference results. With the shapefile, you can edit the prediction polygons as needed. 
 
-3D part: 
-7) 2D bounding box extraction: from the above inference shapefile (or original annotation shapefile), georeferenced 2D bounding boxes are extracted. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/1_extract_bounding_box_from_geotiff.ipynb).
+3D part:
+
+7) 2D bounding box extraction: from the above inference shapefile (or original annotation shapefile), georeferenced 2D bounding boxes are extracted. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/1_extract_bounding_box_from_geotiff.ipynb).  
 8) 3D rock extraction: this step uses the above georeferenced 2D bounding boxes to crop individual 3D rock point clouds. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/2_extract_pointcloud_objects.ipynb).  
 9) 3D annotation: the above rock point clouds include both pedestal and PBR points. We need to classify each point in the above rock point clouds. The objective of this step is to annotate points on the rock of interest. Here is a tutorial of using cloudcompare for point annotation: https://www.youtube.com/watch?v=B61WNd7R_w4
 10) 3D point segmentation: before you start 3D point segmentation, you should prepare torch-points3d dataset (see a [tutorial of create your own dataset](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md)). Then refer to this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/4_pbr_segmentation_kpconv.ipynb) to train your model. 
@@ -62,6 +63,7 @@ rock_detection_3d/notebooks/data/rocklas/
 5) instance registration: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_2_merging_inference_instances.ipynb) to create a shapefile of your inference results. With the shapefile, you can edit the prediction polygons as needed. 
 
 3D part:
+
 6) 2D bounding box extraction: from the above inference shapefile (or original annotation shapefile), georeferenced 2D bounding boxes are extracted. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/1_extract_bounding_box_from_geotiff.ipynb).
 7) 3D rock extraction: this step uses the above georeferenced 2D bounding boxes to crop individual 3D rock point clouds. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/2_extract_pointcloud_objects.ipynb).  
 8) 3D point segmentation: before you start 3D point segmentation, you should prepare torch-points3d dataset (see a [tutorial of create your own dataset](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md)). Then refer to this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/4_pbr_segmentation_kpconv.ipynb) to conduct inference for your model. 
