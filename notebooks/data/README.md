@@ -1,5 +1,28 @@
 # create your own dataset
+## Splitting 2D datasets
+Create json files for your training, validation, and test splits under `data/rocklas/tiles`
+```
+import json
+import os
+from random import shuffle
+las_files = [f for f in os.listdir('.') if f.endswith('.tif')]
+shuffle(las_files)
+nm = len(las_files)
+train_files = las_files[:int(nm*0.6)]
+valid_files = las_files[int(nm*0.6):int(nm*0.8)]
+test_files = las_files[int(nm*0.8):]
+with open('train_split.json', 'w') as f:
+    json.dump(train_files, f)
 
+with open('valid_split.json', 'w') as f:
+    json.dump(valid_files, f)
+
+with open('test_split.json', 'w') as f:
+    json.dump(test_files, f)
+
+```
+
+## Splitting 3D datasets
 1. create a folder of your dataset under data directory and two sub-folders  
 ```
 - rocklas
@@ -9,7 +32,7 @@
 
 2. copy all your .las annotations under raw directory  
 
-3. create a json file to include your training, validation, and test splits under raw  
+3. create a json file to include your training, validation, and test splits under `raw`  
 ```
 import json
 import os

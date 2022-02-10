@@ -6,6 +6,7 @@
 **.npy
 **.pickle
 **/prediction_2d/
+**.zip
 
 
 */tensorboard/
