@@ -77,3 +77,11 @@ rock_detection_3d/notebooks/data/rocklas/
 ## Todo
 - implement weighted loss to focus on edge point segmentation
 - try different optimizers
+- synthetic rock segmentation data
+    - generate synthetic rocks -> rock point cloud
+    - generate synthetic terrains (background) -> pedestal point cloud
+    - randomize orientations of the rock point cloud and the pedestal point cloud
+    - place the rock point cloud on the pedestal point cloud 
+    - merge two point clouds
+        - iteratively remove points on the rock point cloud
+        - given a rock point (x, y, z), use (x, y) to search the pedestal point with the nearest (x_i, y_j). The nearest pedestal point has coordinates (x_i, y_j, z_j). Compare z and z_j. Remove the rock point, if z < z_j.
