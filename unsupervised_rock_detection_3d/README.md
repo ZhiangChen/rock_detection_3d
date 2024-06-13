@@ -45,22 +45,20 @@ The module involves two primary unsupervised segmentation techniques:
 
 #### Mathematical Definitions
 
-* **Smoothness**: Smoothness is evaluated using the dot product between the normal of a point and the normals of its second-order neighbors. For a point $\ ( p )$ with normal $\ ( \mathbf{n}_p )$, and its second-order neighbors $\ ( q )$ with normals $\ ( \mathbf{n}_q )$:
+* **Smoothness**: Smoothness is evaluated using the dot product between the normal of a point and the normals of its second-order neighbors. For a point $`( p )`$ with normal $`( \mathbf{n}_p )`$, and its second-order neighbors $`( q )`$ with normals $`( \mathbf{n}_q )`$:
 
   $$\ Smoothness = \min \left( \mathbf{n}_p \cdot \mathbf{n}_q \right)$$
 
-  where $\cdot $ denotes the dot product. We use the minimum value to ensure that we capture the maximum deviation, helping to avoid over-inclusion of points in densely packed clouds.
+  where $`\cdot`$ denotes the dot product. We use the minimum value to ensure that we capture the maximum deviation, helping to avoid over-inclusion of points in densely packed clouds.
 
-* **Curvature**: Curvature is computed using the cross product of vectors formed by the difference between neighbor normals and the current normal. For a point $\ ( p )$ with normal $\ ( \mathbf{n}_p )$, and its neighbors $\ ( q_i )$ with normals $\ ( \mathbf{n}_{q_i} )$:
+* **Curvature**: Curvature is computed using the cross product of vectors formed by the difference between neighbor normals and the current normal. For a point $`( p )`$ with normal $`( \mathbf{n}_p )`$, and its neighbors $`( q_i )`$ with normals $`( \mathbf{n}_{q_i})`$:
 
-  $$
-  \text{Curvature} = \frac{1}{k} \sum_{i=1}^k \left\| \mathbf{n}_{q_i} \times (\mathbf{n}_{q_i} - \mathbf{n}_p) \right\|
+  $$\
+  Curvature = \frac{1}{k} \sum_{i=1}^k \left\| \mathbf{n}_{q_i} \times (\mathbf{n}_{q_i} - \mathbf{n}_p) \right\| $$
 
- $$
+  where $`\times`$ denotes the cross product, and $`k`$ is the number of neighbors. This measure captures the variation in normal directions, indicating surface roughness.
 
-  where $ \times $ denotes the cross product, and $ k $ is the number of neighbors. This measure captures the variation in normal directions, indicating surface roughness.
-
-#### Usage:
+#### Usage
 
 * We suggest use of only one segmentation criteria, either smoothness or curvature, not both, depending on the specific requirements of your application.
 
