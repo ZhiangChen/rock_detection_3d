@@ -2,10 +2,24 @@ import argparse
 import numpy as np
 import open3d as o3d
 from collections import deque
+import time
 
 class RegionGrowingSegmentation:
-    def __init__(self, pcd, num_neighbors=50, smoothness_threshold=0.5, distance_threshold=0.05, curvature_threshold=0.5, use_smoothness=True, use_curvature=True):
-        voxel_size = 0.01
+    def __init__(self, pcd, voxel_size=0.01, num_neighbors=50, smoothness_threshold=0.5, distance_threshold=0.05, curvature_threshold=0.5, use_smoothness=True, use_curvature=True):
+        """
+        Initialize the RegionGrowingSegmentation class.
+        
+        Parameters:
+        pcd (open3d.geometry.PointCloud): The input point cloud.
+        voxel_size (float): The size of voxels for downsampling the point cloud. Lower the voxel_size, better the resolution and more the computation time.
+        num_neighbors (int): Number of neighboring points to consider for normal estimation.
+        smoothness_threshold (float): Threshold for the dot product of normal vectors to determine smoothness.
+        distance_threshold (float): Radius within which to search for neighboring points.
+        curvature_threshold (float): Threshold for point curvature; lower values favor smoother regions.
+        use_smoothness (bool): Flag to use smoothness criteria.
+        use_curvature (bool): Flag to use curvature criteria.
+        """
+        
         self.pcd = pcd.voxel_down_sample(voxel_size)
         
         # Estimate normals
@@ -26,6 +40,12 @@ class RegionGrowingSegmentation:
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
 
     def precompute_neighbors(self):
+        """
+        Precompute the neighbors for each point within the specified distance threshold.
+        
+        Returns:
+        neighbors (list of np.array): List of neighbors for each point.
+        """
         neighbors = []
         for i in range(len(self.pcd.points)):
             [k, idx, _] = self.pcd_tree.search_radius_vector_3d(self.pcd.points[i], self.distance_threshold)
@@ -33,6 +53,16 @@ class RegionGrowingSegmentation:
         return neighbors
 
     def calculate_segmentation_criteria(self, neighbor_index, neighbors):
+        """
+        Calculate the segmentation criteria for a neighbor based on the dot product of normal vectors.
+        
+        Parameters:
+        neighbor_index (int): The index of the neighbor point.
+        neighbors (list of np.array): List of neighbors for each point.
+        
+        Returns:
+        float: The minimum dot product of normal vectors between the neighbor and its segmented neighbors.
+        """
         neighbor_normal = self.normals[neighbor_index]
         second_order_neighbors = neighbors[neighbor_index]
 
@@ -47,6 +77,15 @@ class RegionGrowingSegmentation:
         return np.min(dot_products)
 
     def estimate_curvature(self, index):
+        """
+        Estimate the curvature of a point based on its neighbors.
+        
+        Parameters:
+        index (int): The index of the point.
+        
+        Returns:
+        float: The estimated curvature of the point.
+        """
         k, idx, _ = self.pcd_tree.search_radius_vector_3d(self.pcd.points[index], self.distance_threshold)
         if k > 1:
             neighbor_normals = self.normals[idx, :]
@@ -56,6 +95,14 @@ class RegionGrowingSegmentation:
             return 0
 
     def grow_region(self, starting_index, region_index, neighbors):
+        """
+        Grow a region starting from a seed point by evaluating neighbors based on segmentation criteria.
+        
+        Parameters:
+        starting_index (int): The index of the seed point.
+        region_index (int): The index of the region to grow.
+        neighbors (list of np.array): List of neighbors for each point.
+        """
         queue = deque([starting_index])
         self.labels[starting_index] = region_index
 
@@ -82,6 +129,14 @@ class RegionGrowingSegmentation:
                     queue.append(neighbor_index)
 
     def segment(self):
+        """
+        Perform the region growing segmentation on the point cloud.
+        
+        Returns:
+        pcd (open3d.geometry.PointCloud): The segmented point cloud.
+        labels (np.array): Array of labels for each point in the point cloud.
+        """
+        
         # Compute the bounding box of the point cloud
         points = np.asarray(self.pcd.points)
         min_bound = points.min(axis=0)
@@ -109,7 +164,15 @@ class RegionGrowingSegmentation:
         return self.pcd, self.labels
 
     def color_point_cloud(self):
+        """
+        Color the segmented point cloud for visualization.
+        
+        Returns:
+        pcd (open3d.geometry.PointCloud): The colored point cloud.
+        """
+
         points = np.asarray(self.pcd.points)
+        print(len(points), "points")
         colors = np.zeros_like(points)
 
         # Color all points grey
@@ -128,21 +191,18 @@ class RegionGrowingSegmentation:
 
         return self.pcd
 
-    # def morphological_closing(self, structure_size=2):
-    #     # Create a binary mask of labeled points
-    #     binary_labels = (self.labels != -1).astype(int)
-        
-    #     # Define a 3D structuring element
-    #     struct_elem = ndimage.generate_binary_structure(1, structure_size)
-        
-    #     # Perform dilation followed by erosion
-    #     dilated = ndimage.binary_dilation(binary_labels, structure=struct_elem)
-    #     closed = ndimage.binary_erosion(dilated, structure=struct_elem)
-        
-    #     # Apply the closing to the labels
-    #     self.labels = np.where(closed, self.labels, -1)
 
     def conditional_label_propagation(self, distance_threshold=0.05):
+        """
+        Assign labels to remaining unlabeled points based on majority labels of their neighbors.
+        
+        Parameters:
+        distance_threshold (float): Radius within which to search for neighboring points.
+        
+        Returns:
+        labels (np.array): Updated array of labels for each point in the point cloud.
+        """
+        
         points = np.asarray(self.pcd.points)
         tree = self.pcd_tree
         
@@ -164,8 +224,9 @@ class RegionGrowingSegmentation:
 def main():
     parser = argparse.ArgumentParser(description="Region Growing Segmentation for Point Clouds")
     parser.add_argument('pcd_path', type=str, help="Path to the input point cloud file")
+    parser.add_argument('--voxel_size', type=float, default=0.01, help="Voxel size for downsampling the point cloud")
     parser.add_argument('--distance_threshold', type=float, default=0.05, help="Distance threshold for region growing")
-    parser.add_argument('--smoothness_threshold', type=float, default=0.95, help="Smoothness threshold for region growing")
+    parser.add_argument('--smoothness_threshold', type=float, default=0.99, help="Smoothness threshold for region growing")
     parser.add_argument('--curvature_threshold', type=float, default=0.15, help="Curvature threshold for region growing")
     parser.add_argument('--use_smoothness', action='store_true', default=True, help="Use smoothness criteria for segmentation")
     parser.add_argument('--use_curvature', action='store_true', default=True, help="Use curvature criteria for segmentation")
@@ -176,9 +237,13 @@ def main():
     print("Loading Point cloud...")
     pcd = o3d.io.read_point_cloud(args.pcd_path)
 
+    # Record the start time
+    start_time = time.time()
+
     # Initialize the segmenter
     segmenter = RegionGrowingSegmentation(
         pcd,
+        voxel_size=args.voxel_size,
         distance_threshold=args.distance_threshold,
         smoothness_threshold=args.smoothness_threshold,
         curvature_threshold=args.curvature_threshold,
@@ -194,7 +259,12 @@ def main():
     segmenter.conditional_label_propagation()
 
     colored_pcd = segmenter.color_point_cloud()
-    print("Segmentation complete.")
+
+    # Record the end time
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    print(f"Segmentation complete. Total time taken: {total_time:.2f} seconds")
     
     # Save the colored point cloud
     o3d.visualization.draw_geometries([colored_pcd],
