@@ -149,3 +149,6 @@ dmypy.json
 .pyre/
 
 unsupervised_rock_detection_3d/box_pbr
+unsupervised_rock_detection_3d/*.las
+unsupervised_rock_detection_3d/batch_results.py
+unsupervised_rock_detection_3d/box_pbr_annotation
