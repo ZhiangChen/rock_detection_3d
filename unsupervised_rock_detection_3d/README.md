@@ -4,7 +4,7 @@
 
 This module extends the 3D Rock Detection project by focusing on unsupervised segmentation techniques for 3D rock point clouds. It emphasizes k-means clustering and region growing segmentation to enhance rock detection accuracy. The k-means clustering technique groups similar points based on their spatial features, while region growing relies on seed points and neighboring criteria to expand regions. These techniques enable precise segmentation of rock points from supporting surfaces, thus facilitating in-depth geometric analysis of geological formations.
 
-To enhance usability and enable interactive feedback, we have also developed a Graphical User Interface (GUI). The GUI allows geologists and students to run segmentation algorithms, visualize each step, and provide feedback by selecting initial seeds or basal points.
+To enhance usability and enable interactive control, we have also developed a Graphical User Interface (GUI). The GUI allows geologists and students to run segmentation algorithms, visualize each step, and have control over the segmentation by selecting initial seeds or basal points.
 
 **Original and Segmented point cloud:**
 
@@ -15,6 +15,8 @@ To enhance usability and enable interactive feedback, we have also developed a G
 - **Interactive Segmentation**: Users can select seed points and basal points directly on the point cloud visualization to guide the region growing algorithm.
 - **Visualization**: Visualize the original, intermediate, and final segmented point clouds with different colors representing different regions.
 - **Feedback Incorporation**: Users can iteratively refine the segmentation results by providing feedback and selecting more basal points.
+
+<img src="./images/GUI_Workflow.png" height="400">
 
 **Interactive Point Selection Visualizer:** <br>
 <img src="./images/PointSelection_GUI.png" height="400">
