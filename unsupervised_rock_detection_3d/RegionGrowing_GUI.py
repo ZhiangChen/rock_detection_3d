@@ -13,6 +13,10 @@ from PyQt5.QtWidgets import (
 import open3d as o3d
 import numpy as np
 import laspy
+from basal_points_algo import (
+    BasalPointSelection,
+    BasalPointAlgorithm,
+)
 
 
 # Visualize point cloud
@@ -35,6 +39,8 @@ def pick_points(self, pcd):
     """
     Pick points from the point cloud for seed selection.
     """
+    if self.process:
+        self.process.terminate()
     self.seed_selection_vis = o3d.visualization.VisualizerWithEditing()
     self.seed_selection_vis.create_window()
     pcd.paint_uniform_color([0.5, 0.5, 0.5])
@@ -117,6 +123,10 @@ class MainWindow(QMainWindow):
         self.rock_seeds = []
         self.pedestal_seeds = []
         self.poc_points = []
+        self.basal_point_selection = (
+            None  # Placeholder for BasalPointSelection instance
+        )
+        self.basal_points = []  # Store basal points for multiple estimations
 
         self.init_ui()
 
@@ -168,10 +178,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.run_button)
 
         # Button to input points of contact
-        self.input_poc_button = QPushButton("Input Point of Contacts")
+        self.input_poc_button = QPushButton("Input Points of Contact")
         self.input_poc_button.setVisible(False)
         self.input_poc_button.clicked.connect(self.input_point_of_contacts)
         layout.addWidget(self.input_poc_button)
+
+        # Button to estimate basal points
+        self.estimate_basal_points_button = QPushButton("Estimate Basal Points")
+        self.estimate_basal_points_button.setVisible(False)
+        self.estimate_basal_points_button.clicked.connect(self.estimate_basal_points)
+        layout.addWidget(self.estimate_basal_points_button)
+
+        # Button to add more basal points
+        self.add_more_basal_points_button = QPushButton("Add More Basal Points")
+        self.add_more_basal_points_button.setVisible(False)
+        self.add_more_basal_points_button.clicked.connect(self.add_more_basal_points)
+        layout.addWidget(self.add_more_basal_points_button)
 
         # Button to save the segmented point cloud
         self.save_pcd_button = QPushButton("Save Point Cloud")
@@ -318,7 +340,11 @@ class MainWindow(QMainWindow):
         self.instructions_label.setText("")
         self.input_poc_button.setVisible(True)
         self.save_pcd_button.setVisible(True)
-        show_point_cloud(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors))
+        self.process = multiprocessing.Process(
+            target=show_point_cloud,
+            args=(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors)),
+        )
+        self.process.start()
 
     def run_region_growing_with_selected_seeds(self):
         """
@@ -336,33 +362,82 @@ class MainWindow(QMainWindow):
         self.instructions_label.setText("")
         self.input_poc_button.setVisible(True)
         self.save_pcd_button.setVisible(True)
-        show_point_cloud(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors))
+        self.process = multiprocessing.Process(
+            target=show_point_cloud,
+            args=(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors)),
+        )
+        self.process.start()
 
     def input_point_of_contacts(self):
         """
         Input points of contact for the region growing algorithm.
         """
+        if self.process:
+            self.process.terminate()
         self.hide_buttons_for_poc()
         self.instructions_label.setText(
             "Selecting Points of Contact.\n \n"
             "1) Please pick points using [shift + left click].\n"
             "2) Press [shift + right click] to undo point picking.\n"
-            "3) After picking points, press 'Next' to continue."
+            "3) After picking points, press 'Next' to estimate basal points."
         )
-        self.next_button.setVisible(True)
+        self.estimate_basal_points_button.setVisible(True)
         if self.process:
             self.process.terminate()
         pick_points(self, self.pcd)
 
-    def next_after_poc_selection(self):
+    def estimate_basal_points(self):
         """
-        Proceed to the next step after selecting points of contact.
+        Estimate basal points based on the selected points of contact.
         """
-        self.pedestal_seeds = self.get_selected_points_close_window()
-        self.instructions_label.setText("Plane fitting here.")
-        self.next_button.setVisible(False)
-        self.input_poc_button.setVisible(False)
-        self.save_pcd_button.setVisible(False)
+        self.poc_points = self.get_selected_points_close_window()
+        self.instructions_label.setText("Estimating basal points. Please wait...")
+        QApplication.processEvents()
+
+        # Use BasalPointAlgorithm to estimate the basal points
+        algorithm = BasalPointAlgorithm(self.pcd)
+        basal_points = algorithm.run(self.poc_points)
+
+        # Add the newly estimated basal points to the list
+        self.basal_points = basal_points
+
+        # Highlight the basal points in the point cloud
+        self.highlight_points(self.basal_points)
+
+        self.instructions_label.setText(
+            "Basal points estimation completed. Would you like to add more basal points or run region growing again?"
+        )
+        self.estimate_basal_points_button.setVisible(False)
+        self.add_more_basal_points_button.setVisible(True)
+        self.run_button.setVisible(True)
+        # self.save_pcd_button.setVisible(True)
+        show_point_cloud(np.asarray(self.pcd.points), np.asarray(self.pcd.colors))
+
+    def add_more_basal_points(self):
+        self.add_more_basal_points_button.setVisible(False)
+        self.run_button.setVisible(False)
+        self.input_point_of_contacts()
+
+    def highlight_points(self, points):
+        """
+        Highlight the points in the point cloud.
+        """
+        colors = np.full((len(self.pcd.points), 3), [0.5, 0.5, 0.5])
+        for point in points:
+            idx = np.argmin(np.linalg.norm(np.asarray(self.pcd.points) - point, axis=1))
+            colors[idx] = [1, 0, 0]  # Red for basal points
+
+        self.pcd.colors = o3d.utility.Vector3dVector(colors)
+        points = np.asarray(self.pcd.points)
+        colors = np.asarray(self.pcd.colors)
+
+        if self.process:
+            self.process.terminate()
+
+        self.process = multiprocessing.Process(
+            target=show_point_cloud, args=(points, colors)
+        )
+        self.process.start()
 
     def save_point_cloud(self):
         """
