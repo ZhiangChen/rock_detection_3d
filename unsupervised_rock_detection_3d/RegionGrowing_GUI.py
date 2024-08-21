@@ -103,12 +103,15 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
         downsample=False,
         rock_seeds=rock_seed_indices,
         pedestal_seeds=pedestal_seed_indices,
+        basal_points=self.basal_points,
     )
 
     segmented_pcd, labels = self.segmenter.segment()
     self.segmenter.conditional_label_propagation()
     labels[labels == -1] = 1
     colored_pcd = self.segmenter.color_point_cloud()
+    if np.any(self.basal_points):
+        colored_pcd = self.segmenter.highlight_proximity_points(colored_pcd)
 
     return colored_pcd
 
@@ -126,7 +129,7 @@ class MainWindow(QMainWindow):
         self.basal_point_selection = (
             None  # Placeholder for BasalPointSelection instance
         )
-        self.basal_points = []  # Store basal points for multiple estimations
+        self.basal_points = None  # Store basal points for multiple estimations
 
         self.init_ui()
 
@@ -190,7 +193,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.estimate_basal_points_button)
 
         # Button to add more basal points
-        self.add_more_basal_points_button = QPushButton("Add More Basal Points")
+        self.add_more_basal_points_button = QPushButton("Reselect Basal Points")
         self.add_more_basal_points_button.setVisible(False)
         self.add_more_basal_points_button.clicked.connect(self.add_more_basal_points)
         layout.addWidget(self.add_more_basal_points_button)
@@ -330,7 +333,8 @@ class MainWindow(QMainWindow):
         """
         Run the region growing algorithm with the selected seeds.
         """
-        self.pedestal_seeds = self.get_selected_points_close_window()
+        if not np.any(self.basal_points):
+            self.pedestal_seeds = self.get_selected_points_close_window()
         self.instructions_label.setText("Running Region Growing. Please wait...")
         QApplication.processEvents()
 
@@ -338,7 +342,8 @@ class MainWindow(QMainWindow):
             self, self.pcd, self.rock_seeds, self.pedestal_seeds
         )
         self.instructions_label.setText("")
-        self.input_poc_button.setVisible(True)
+        if not np.any(self.basal_points):
+            self.input_poc_button.setVisible(True)
         self.save_pcd_button.setVisible(True)
         self.process = multiprocessing.Process(
             target=show_point_cloud,
@@ -355,7 +360,6 @@ class MainWindow(QMainWindow):
         self.hide_all_buttons()
         self.instructions_label.setText("Running Region Growing. Please wait...")
         QApplication.processEvents()
-
         colored_pcd = region_growing(
             self, self.pcd, self.rock_seeds, self.pedestal_seeds
         )
@@ -384,6 +388,7 @@ class MainWindow(QMainWindow):
         self.estimate_basal_points_button.setVisible(True)
         if self.process:
             self.process.terminate()
+        self.basal_points = None
         pick_points(self, self.pcd)
 
     def estimate_basal_points(self):

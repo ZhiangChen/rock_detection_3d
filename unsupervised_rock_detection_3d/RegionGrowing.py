@@ -65,7 +65,11 @@ class RegionGrowingSegmentation:
         use_curvature=True,
         rock_seeds=None,
         pedestal_seeds=None,
+        basal_points=None,
+        basal_proximity_threshold=0.2,  # New threshold for proximity
+        basal_proximity_check=False,  # Flag to enable proximity check
     ):
+
         print("Downsampling pointcloud")
         if downsample:
             self.pcd = pcd.voxel_down_sample(voxel_size)  # Downsample the point cloud
@@ -90,11 +94,25 @@ class RegionGrowingSegmentation:
         self.use_curvature = use_curvature
         self.rock_seeds = rock_seeds
         self.pedestal_seeds = pedestal_seeds
+        self.basal_points = basal_points
+        self.basal_proximity_threshold = basal_proximity_threshold
+        self.basal_proximity_check = True if np.any(self.basal_points) else False
 
         self.labels = np.array([-1] * len(self.pcd.points))
         print(len(self.labels), "points after downsampling")  # -1 indicates unlabeled
         self.normals = np.asarray(self.pcd.normals)
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+
+    # def is_near_basal_points(self, point):
+    #     if not np.any(self.basal_points):
+    #         return False
+
+    #     point = np.array(point)
+    #     basal_points = np.array(self.basal_points)
+
+    #     distances = np.linalg.norm(basal_points - point, axis=1)
+
+    #     return np.any(distances < self.basal_proximity_threshold)
 
     def precompute_neighbors(self):
         neighbors = []
@@ -136,31 +154,68 @@ class RegionGrowingSegmentation:
         else:
             return 0
 
+    def highlight_proximity_points(self, colored_pcd):
+        basal_points = np.array(self.basal_points)
+        points = np.asarray(colored_pcd.points)
+        distances_to_basal = np.linalg.norm(
+            basal_points[:, np.newaxis] - points, axis=2
+        )
+        is_near_basal = np.any(
+            distances_to_basal < self.basal_proximity_threshold, axis=0
+        )
+
+        # Visualize the proximity points in a different color, e.g., green
+        colors = np.asarray(colored_pcd.colors)
+        colors[is_near_basal] = [0, 1, 0]  # Green for proximity
+        colored_pcd.colors = o3d.utility.Vector3dVector(colors)
+        return colored_pcd
+
     def grow_region(self, starting_queue, region_index, neighbors):
+        if self.basal_proximity_check:
+            print(self.basal_points)
         queue = deque(starting_queue)
-        print(starting_queue, queue)
         self.labels[starting_queue[0]] = region_index
 
         while queue:
             current_index = queue.popleft()
-            current_normal = self.normals[current_index]
-
+            current_point = np.asarray(self.pcd.points)[current_index]
             neighbor_indices = neighbors[current_index]
-
-            for neighbor_index in neighbor_indices:
-                if self.labels[neighbor_index] != -1:
-                    continue
-
-                min_dot_product = self.calculate_segmentation_criteria(
-                    neighbor_index, neighbors
+            neighbor_indices = neighbors[current_index]
+            neighbor_points = np.asarray(self.pcd.points)[neighbor_indices]
+            if self.basal_proximity_check:
+                distances_to_basal = np.linalg.norm(
+                    np.asarray(self.basal_points)[:, np.newaxis] - neighbor_points,
+                    axis=2,
                 )
-                curvature = self.estimate_curvature(neighbor_index)
+                is_near_basal = np.any(
+                    distances_to_basal < self.basal_proximity_threshold, axis=0
+                )
 
-                if (
-                    self.use_smoothness and min_dot_product >= self.smoothness_threshold
-                ) or (self.use_curvature and curvature < self.curvature_threshold):
-                    self.labels[neighbor_index] = region_index
-                    queue.append(neighbor_index)
+                # Identify neighbors not near basal points and not yet labeled
+                valid_neighbors = neighbor_indices[
+                    (~is_near_basal) & (self.labels[neighbor_indices] == -1)
+                ]
+
+                # Update labels for valid neighbors and extend the queue
+                self.labels[valid_neighbors] = region_index
+                queue.extend(valid_neighbors)
+            else:
+                print("not after basal")
+                for neighbor_index in neighbor_indices:
+                    if self.labels[neighbor_index] != -1:
+                        continue
+
+                    min_dot_product = self.calculate_segmentation_criteria(
+                        neighbor_index, neighbors
+                    )
+                    curvature = self.estimate_curvature(neighbor_index)
+
+                    if (
+                        self.use_smoothness
+                        and min_dot_product >= self.smoothness_threshold
+                    ) or (self.use_curvature and curvature < self.curvature_threshold):
+                        self.labels[neighbor_index] = region_index
+                        queue.append(neighbor_index)
 
     def segment(self):
 
