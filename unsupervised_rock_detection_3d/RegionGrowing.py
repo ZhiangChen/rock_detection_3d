@@ -10,6 +10,9 @@ import time
 
 
 def load_las_as_open3d_point_cloud(las_file_path, evaluate=False):
+    """
+    Load a LAS file and convert it to an Open3D point cloud.
+    """
     # Read LAS file
     pc = laspy.read(las_file_path)
     x = pc.x.scaled_array()
@@ -65,10 +68,13 @@ class RegionGrowingSegmentation:
         use_curvature=True,
         rock_seeds=None,
         pedestal_seeds=None,
-        basal_points=None,
-        basal_proximity_threshold=0.2,  # New threshold for proximity
-        basal_proximity_check=False,  # Flag to enable proximity check
+        basal_points=None,  # List or array of basal points (optional, default is None)
+        basal_proximity_threshold=0.2,  # Threshold distance for checking proximity to basal points
+        basal_proximity_check=False,  # Flag to override the smoothness and curvature criteria and use basal proximity
     ):
+        """
+        Initialize the region growing segmentation object.
+        """
 
         print("Downsampling pointcloud")
         if downsample:
@@ -96,25 +102,19 @@ class RegionGrowingSegmentation:
         self.pedestal_seeds = pedestal_seeds
         self.basal_points = basal_points
         self.basal_proximity_threshold = basal_proximity_threshold
-        self.basal_proximity_check = True if np.any(self.basal_points) else False
+        self.basal_proximity_check = (
+            True if np.any(self.basal_points) else False
+        )  # Enable the proximity check if basal points are provided, otherwise keep it disabled
 
         self.labels = np.array([-1] * len(self.pcd.points))
         print(len(self.labels), "points after downsampling")  # -1 indicates unlabeled
         self.normals = np.asarray(self.pcd.normals)
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
 
-    # def is_near_basal_points(self, point):
-    #     if not np.any(self.basal_points):
-    #         return False
-
-    #     point = np.array(point)
-    #     basal_points = np.array(self.basal_points)
-
-    #     distances = np.linalg.norm(basal_points - point, axis=1)
-
-    #     return np.any(distances < self.basal_proximity_threshold)
-
     def precompute_neighbors(self):
+        """
+        Precompute the neighbors for each point in the point cloud based on a distance threshold.
+        """
         neighbors = []
         for i in range(len(self.pcd.points)):
             [k, idx, _] = self.pcd_tree.search_radius_vector_3d(
@@ -126,24 +126,37 @@ class RegionGrowingSegmentation:
         return neighbors
 
     def calculate_segmentation_criteria(self, neighbor_index, neighbors):
+        """
+        Calculate the smoothness criteria for a neighboring point.
+        """
+        # Get the normal of the current point and the normal of the neighboring point
         neighbor_normal = self.normals[neighbor_index]
         second_order_neighbors = neighbors[neighbor_index]
 
+        # Filter out the neighbors that are not yet labeled
         filtered_neighbors = [n for n in second_order_neighbors if self.labels[n] != -1]
         if len(filtered_neighbors) == 0:
             return float("inf")
 
+        # Calculate the dot product of the normals between the neighboring point and its labeled neighbors
         filtered_normals = self.normals[filtered_neighbors]
         dot_products = np.clip(np.dot(filtered_normals, neighbor_normal), -1.0, 1.0)
 
         return np.min(dot_products)
 
     def estimate_curvature(self, index):
+        """
+        Estimate the curvature at a given point.
+        """
+        # Retrieve the neighboring points within a certain radius
         k, idx, _ = self.pcd_tree.search_radius_vector_3d(
             self.pcd.points[index], self.distance_threshold
         )
+
+        # Skip the first index as it's the point itself
         if k > 1:
             neighbor_normals = self.normals[idx, :]
+            # Calculate the curvature based on the cross product of the normals
             curvature = np.mean(
                 np.linalg.norm(
                     np.cross(neighbor_normals - self.normals[index], neighbor_normals),
@@ -152,14 +165,20 @@ class RegionGrowingSegmentation:
             )
             return curvature
         else:
+            # If no neighbors are found, return 0
             return 0
 
     def highlight_proximity_points(self, colored_pcd):
+        """
+        Highlight points that are near basal points in a different color.
+        """
+        # Calculate the distances from each point to all basal points
         basal_points = np.array(self.basal_points)
         points = np.asarray(colored_pcd.points)
         distances_to_basal = np.linalg.norm(
             basal_points[:, np.newaxis] - points, axis=2
         )
+        # Determine which points are near any basal point
         is_near_basal = np.any(
             distances_to_basal < self.basal_proximity_threshold, axis=0
         )
@@ -171,45 +190,74 @@ class RegionGrowingSegmentation:
         return colored_pcd
 
     def grow_region(self, starting_queue, region_index, neighbors):
+        """
+        Perform region growing segmentation starting from the given seeds.
+        """
+
+        # If basal proximity check is enabled, that is, we have basal information and the algorithm just needs to find the distance of current point to basal points,
+        # print them just as a sanity check
         if self.basal_proximity_check:
             print(self.basal_points)
+
+        # Initialize the queue with the starting points (seeds) for region growing
         queue = deque(starting_queue)
+
+        # Label the initial point (seed) with the current region index
         self.labels[starting_queue[0]] = region_index
 
+        # Process the queue until it's empty
         while queue:
+            # Get the next point from the queue
             current_index = queue.popleft()
             current_point = np.asarray(self.pcd.points)[current_index]
+
+            # Retrieve the indices of neighboring points
             neighbor_indices = neighbors[current_index]
-            neighbor_indices = neighbors[current_index]
+
+            # Retrieve the coordinates of the neighboring points
             neighbor_points = np.asarray(self.pcd.points)[neighbor_indices]
+
+            # If basal proximity check is enabled, perform the proximity-based region growing
             if self.basal_proximity_check:
+
+                # Calculate the distances from each neighbor to all basal points
                 distances_to_basal = np.linalg.norm(
                     np.asarray(self.basal_points)[:, np.newaxis] - neighbor_points,
                     axis=2,
                 )
+
+                # Determine which neighbors are near any basal point
                 is_near_basal = np.any(
                     distances_to_basal < self.basal_proximity_threshold, axis=0
                 )
 
-                # Identify neighbors not near basal points and not yet labeled
+                # Identify neighbors that are not near any basal point and not yet labeled
                 valid_neighbors = neighbor_indices[
                     (~is_near_basal) & (self.labels[neighbor_indices] == -1)
                 ]
 
-                # Update labels for valid neighbors and extend the queue
+                # Label the valid neighbors with the current region index
                 self.labels[valid_neighbors] = region_index
+
+                # Add the valid neighbors to the queue for further processing
                 queue.extend(valid_neighbors)
             else:
-                print("not after basal")
+                # For non-basal proximity checks, print a debug message
+                print("No basal information provided. Skipping proximity check.")
+
+                # Iterate over the neighboring points
                 for neighbor_index in neighbor_indices:
                     if self.labels[neighbor_index] != -1:
                         continue
 
+                    # Calculate the smoothness criteria (dot product of normals)
                     min_dot_product = self.calculate_segmentation_criteria(
                         neighbor_index, neighbors
                     )
+                    # Estimate the curvature for the neighboring point
                     curvature = self.estimate_curvature(neighbor_index)
 
+                    # Apply the region growing criteria based on smoothness and curvature
                     if (
                         self.use_smoothness
                         and min_dot_product >= self.smoothness_threshold
@@ -218,8 +266,12 @@ class RegionGrowingSegmentation:
                         queue.append(neighbor_index)
 
     def segment(self):
+        """
+        Perform the full region growing segmentation.
+        """
 
         if self.rock_seeds is None or self.pedestal_seeds is None:
+            # Auto-select seeds if not provided
             points = np.asarray(self.pcd.points)
             min_bound = points.min(axis=0)
             max_bound = points.max(axis=0)
@@ -238,17 +290,24 @@ class RegionGrowingSegmentation:
 
         neighbors = self.precompute_neighbors()
 
+        # Grow the region starting from rock and pedestal seeds
         self.grow_region(self.rock_seeds, region_index=1, neighbors=neighbors)
         self.grow_region(self.pedestal_seeds, region_index=0, neighbors=neighbors)
 
         return self.pcd, self.labels
 
     def color_point_cloud(self):
+        """
+        Color the segmented point cloud based on the labels.
+        """
+
         points = np.asarray(self.pcd.points)
         colors = np.zeros_like(points)
 
+        # Default color (gray)
         colors[:, :] = [0.5, 0.5, 0.5]
 
+        # Color rock region red and pedestal region blue
         colors[self.labels == 1] = [1, 0, 0]
         colors[self.labels == 0] = [0, 0, 1]
 
@@ -256,37 +315,46 @@ class RegionGrowingSegmentation:
         colored_pcd.points = o3d.utility.Vector3dVector(points)
         colored_pcd.colors = o3d.utility.Vector3dVector(colors)
 
+        # Update the point cloud colors
         self.pcd.colors = o3d.utility.Vector3dVector(colors)
 
         return self.pcd
 
     def conditional_label_propagation(self, distance_threshold=0.05):
+        """
+        Propagate labels to unlabeled points based on the labels of nearby points.
+        """
         points = np.asarray(self.pcd.points)
         tree = self.pcd_tree
 
         unlabeled_indices = np.where(self.labels == -1)[0]
+        # Perform label propagation until no more points are labeled
         unchanged_iterations = 0
         prev_unlabeled_count = len(unlabeled_indices)
 
         while len(unlabeled_indices) > 0:
             for index in unlabeled_indices:
+                # Find the neighbors within a certain radius
                 [k, idx, _] = tree.search_radius_vector_3d(
                     points[index], distance_threshold
                 )
                 neighbor_labels = self.labels[idx]
-
+                # Filter out the unlabeled neighbors
                 labeled_neighbors = neighbor_labels[neighbor_labels != -1]
                 if len(labeled_neighbors) > 0:
+                    # Assign the most common label among the neighbors
                     self.labels[index] = np.bincount(labeled_neighbors).argmax()
 
             unlabeled_indices = np.where(self.labels == -1)[0]
             current_unlabeled_count = len(unlabeled_indices)
 
+            # Check for convergence
             if current_unlabeled_count == prev_unlabeled_count:
                 unchanged_iterations += 1
             else:
                 unchanged_iterations = 0
 
+            # Break if no more points are labeled or the number of unlabeled points is unchanged
             if unchanged_iterations >= 2:
                 break
 
@@ -295,9 +363,13 @@ class RegionGrowingSegmentation:
         return self.labels
 
     def transfer_labels_to_dense(self, dense_pcd, sparse_pcd, sparse_labels):
+        """
+        Transfer labels from a sparse point cloud to a dense point cloud.
+        """
         dense_points = np.asarray(dense_pcd.points)
         sparse_points = np.asarray(sparse_pcd.points)
 
+        # Find the nearest neighbor in the sparse point cloud for each point in the dense point cloud
         nbrs = NearestNeighbors(n_neighbors=1, algorithm="auto").fit(sparse_points)
         distances, indices = nbrs.kneighbors(dense_points)
 
@@ -306,6 +378,9 @@ class RegionGrowingSegmentation:
         return dense_labels
 
     def evaluate_segmentation_performance(self, ground_truth_labels, predicted_labels):
+        """
+        Evaluate the segmentation performance using various metrics.
+        """
         accuracy = np.mean(ground_truth_labels == predicted_labels)
         conf_matrix = pd.DataFrame(
             confusion_matrix(
