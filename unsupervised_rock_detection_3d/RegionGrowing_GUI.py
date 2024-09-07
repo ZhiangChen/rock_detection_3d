@@ -124,6 +124,9 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
     self.segmenter = RegionGrowingSegmentation(
         pcd,
         downsample=False,
+        smoothness_threshold=0.9 if np.any(self.basal_points) else 0.99, # Relaxed smoothness threshold if basal points are available
+        distance_threshold=0.05,
+        curvature_threshold=0.1 if np.any(self.basal_points) else 0.15, # Relaxed curvature threshold if basal points are available
         rock_seeds=rock_seed_indices,
         pedestal_seeds=pedestal_seed_indices,
         basal_points=self.basal_points,
@@ -131,6 +134,7 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
 
     # Segment the point cloud and perform conditional label propagation
     segmented_pcd, labels = self.segmenter.segment()
+    #if not np.any(self.basal_points):
     self.segmenter.conditional_label_propagation()
 
     # Assign a default label for unlabeled points
@@ -140,8 +144,8 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
     colored_pcd = self.segmenter.color_point_cloud()
 
     # Highlight proximity points if basal points are available
-    if np.any(self.basal_points):
-        colored_pcd = self.segmenter.highlight_proximity_points(colored_pcd)
+    # if np.any(self.basal_points):
+    #     colored_pcd = self.segmenter.highlight_proximity_points(colored_pcd)
 
     return colored_pcd
 

@@ -69,15 +69,16 @@ class RegionGrowingSegmentation:
         rock_seeds=None,
         pedestal_seeds=None,
         basal_points=None,  # List or array of basal points (optional, default is None)
-        basal_proximity_threshold=0.2,  # Threshold distance for checking proximity to basal points
+        basal_proximity_threshold=0.05,  # Threshold distance for checking proximity to basal points
         basal_proximity_check=False,  # Flag to override the smoothness and curvature criteria and use basal proximity
+        stepwise_visualize=False,
     ):
         """
         Initialize the region growing segmentation object.
         """
 
-        print("Downsampling pointcloud")
         if downsample:
+            print("Downsampling pointcloud")
             self.pcd = pcd.voxel_down_sample(voxel_size)  # Downsample the point cloud
         else:
             self.pcd = pcd  # No downsampling
@@ -105,6 +106,7 @@ class RegionGrowingSegmentation:
         self.basal_proximity_check = (
             True if np.any(self.basal_points) else False
         )  # Enable the proximity check if basal points are provided, otherwise keep it disabled
+        self.stepwise_visualize = stepwise_visualize
 
         self.labels = np.array([-1] * len(self.pcd.points))
         print(len(self.labels), "points after downsampling")  # -1 indicates unlabeled
@@ -194,8 +196,7 @@ class RegionGrowingSegmentation:
         Perform region growing segmentation starting from the given seeds.
         """
 
-        # If basal proximity check is enabled, that is, we have basal information and the algorithm just needs to find the distance of current point to basal points,
-        # print them just as a sanity check
+        # If basal proximity check is enabled, print basal points as a sanity check
         if self.basal_proximity_check:
             print(self.basal_points)
 
@@ -205,8 +206,17 @@ class RegionGrowingSegmentation:
         # Label the initial point (seed) with the current region index
         self.labels[starting_queue[0]] = region_index
 
+        points_marked = 0
+
         # Process the queue until it's empty
         while queue:
+
+            if (self.stepwise_visualize) and (points_marked % 10000 == 0):
+                print(f"Visualizing after marking {points_marked} points.")
+                self.visualize_current_segmentation()
+
+            points_marked += 1
+
             # Get the next point from the queue
             current_index = queue.popleft()
             current_point = np.asarray(self.pcd.points)[current_index]
@@ -217,53 +227,53 @@ class RegionGrowingSegmentation:
             # Retrieve the coordinates of the neighboring points
             neighbor_points = np.asarray(self.pcd.points)[neighbor_indices]
 
-            # If basal proximity check is enabled, perform the proximity-based region growing
-            if self.basal_proximity_check:
+            # Iterate over the neighboring points
+            for neighbor_index in neighbor_indices:
+                if self.labels[neighbor_index] != -1:
+                    continue
 
-                # Calculate the distances from each neighbor to all basal points
-                distances_to_basal = np.linalg.norm(
-                    np.asarray(self.basal_points)[:, np.newaxis] - neighbor_points,
-                    axis=2,
-                )
+                neighbor_point = np.asarray(self.pcd.points)[neighbor_index]
 
-                # Determine which neighbors are near any basal point
-                is_near_basal = np.any(
-                    distances_to_basal < self.basal_proximity_threshold, axis=0
-                )
-
-                # Identify neighbors that are not near any basal point and not yet labeled
-                valid_neighbors = neighbor_indices[
-                    (~is_near_basal) & (self.labels[neighbor_indices] == -1)
-                ]
-
-                # Label the valid neighbors with the current region index
-                self.labels[valid_neighbors] = region_index
-
-                # Add the valid neighbors to the queue for further processing
-                queue.extend(valid_neighbors)
-            else:
-                # For non-basal proximity checks, print a debug message
-                print("No basal information provided. Skipping proximity check.")
-
-                # Iterate over the neighboring points
-                for neighbor_index in neighbor_indices:
-                    if self.labels[neighbor_index] != -1:
-                        continue
-
-                    # Calculate the smoothness criteria (dot product of normals)
-                    min_dot_product = self.calculate_segmentation_criteria(
-                        neighbor_index, neighbors
+                # If basal proximity check is enabled, perform the proximity-based region growing
+                if self.basal_proximity_check:
+                    # Calculate the distances from the neighbor to all basal points
+                    distances_to_basal = np.linalg.norm(
+                        np.asarray(self.basal_points) - neighbor_point, axis=1
                     )
-                    # Estimate the curvature for the neighboring point
-                    curvature = self.estimate_curvature(neighbor_index)
 
-                    # Apply the region growing criteria based on smoothness and curvature
-                    if (
-                        self.use_smoothness
-                        and min_dot_product >= self.smoothness_threshold
-                    ) or (self.use_curvature and curvature < self.curvature_threshold):
-                        self.labels[neighbor_index] = region_index
-                        queue.append(neighbor_index)
+                    # Determine if this neighbor is near any basal point
+                    is_near_basal = np.any(
+                        distances_to_basal < self.basal_proximity_threshold
+                    )
+
+                    if is_near_basal:
+                        continue  # Skip the point if it is near the basal points
+
+                # If the point is not near basal or no basal proximity check is enabled,
+                # apply the smoothness and curvature thresholds
+
+                # Calculate the smoothness criteria (dot product of normals)
+                min_dot_product = self.calculate_segmentation_criteria(
+                    neighbor_index, neighbors
+                )
+                # Estimate the curvature for the neighboring point
+                curvature = self.estimate_curvature(neighbor_index)
+
+                # Apply the region growing criteria based on smoothness and curvature
+                if (
+                    self.use_smoothness and min_dot_product >= self.smoothness_threshold
+                ) or (self.use_curvature and curvature < self.curvature_threshold):
+                    self.labels[neighbor_index] = region_index
+                    queue.append(neighbor_index)
+
+        print(f"Points marked: {points_marked}")
+
+    def visualize_current_segmentation(self):
+        """
+        Visualize the current state of the point cloud segmentation.
+        """
+        colored_pcd = self.color_point_cloud()
+        o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
 
     def segment(self):
         """

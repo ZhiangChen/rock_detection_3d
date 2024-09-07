@@ -85,6 +85,8 @@ class BasalPointAlgorithm:
         logging.debug(
             f"Vector-directed algorithm completed with {len(dense_points)} dense points"
         )
+        # Save Basal information for testing purposes
+        np.save("basal_points_28.npy", np.array(dense_points))
         return np.array(dense_points)
 
 
