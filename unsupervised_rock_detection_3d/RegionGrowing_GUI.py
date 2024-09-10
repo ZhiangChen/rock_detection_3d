@@ -28,6 +28,8 @@ def show_point_cloud(points, colors=None):
     pcd.points = o3d.utility.Vector3dVector(points)
     if colors is not None:
         pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Estimate normals for the point cloud to enhance visualization
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
     )
@@ -39,16 +41,28 @@ def pick_points(self, pcd):
     """
     Pick points from the point cloud for seed selection.
     """
+
+    # Terminate any existing visualizations before starting point picking
     if self.process:
         self.process.terminate()
+
+    # Initialize Open3D visualizer with editing capability for point picking
     self.seed_selection_vis = o3d.visualization.VisualizerWithEditing()
     self.seed_selection_vis.create_window()
+
+    # Set uniform color for the point cloud for better visibility during selection
     pcd.paint_uniform_color([0.5, 0.5, 0.5])
+
+    # Estimate normals for the point cloud to assist in point picking
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
     )
+
+    # Add the point cloud to the visualizer
     self.seed_selection_vis.add_geometry(pcd)
     self.seed_selection_vis.run()  # user picks points
+
+    # Retrieve the indices of the picked points
     picked_points = self.seed_selection_vis.get_picked_points()
     return picked_points
 
@@ -58,9 +72,13 @@ def load_las_as_open3d_point_cloud(self, las_file_path, evaluate=False):
     """
     Load a LAS file and convert it to an Open3D point cloud.
     """
+
+    # Read LAS file using laspy
     pc = laspy.read(las_file_path)
     x, y, z = pc.x, pc.y, pc.z
     ground_truth_labels = None
+
+    # Check if ground truth labels are available for evaluation
     if evaluate and "Original cloud index" in pc.point_format.dimension_names:
         ground_truth_labels = np.int_(pc["Original cloud index"])
 
@@ -71,6 +89,8 @@ def load_las_as_open3d_point_cloud(self, las_file_path, evaluate=False):
 
     # Recenter the point cloud
     xyz = np.vstack((x - self.x_mean, y - self.y_mean, z - self.z_mean)).transpose()
+
+    # Check if RGB color information is available in the LAS file
     if all(dim in pc.point_format.dimension_names for dim in ["red", "green", "blue"]):
         r = np.uint8(pc.red / 65535.0 * 255)
         g = np.uint8(pc.green / 65535.0 * 255)
@@ -79,6 +99,7 @@ def load_las_as_open3d_point_cloud(self, las_file_path, evaluate=False):
     else:
         rgb = np.zeros((len(x), 3))
 
+    # Create Open3D PointCloud object and set points and colors
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     pcd.colors = o3d.utility.Vector3dVector(rgb)
@@ -95,20 +116,36 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
     """
     from RegionGrowing import RegionGrowingSegmentation
 
+    # Convert seed indices to integers
     rock_seed_indices = list(map(int, rock_seeds))
     pedestal_seed_indices = list(map(int, pedestal_seeds))
 
+    # Initialize the region growing segmentation with the selected seeds and basal points
     self.segmenter = RegionGrowingSegmentation(
         pcd,
         downsample=False,
+        smoothness_threshold=0.9 if np.any(self.basal_points) else 0.99, # Relaxed smoothness threshold if basal points are available
+        distance_threshold=0.05,
+        curvature_threshold=0.1 if np.any(self.basal_points) else 0.15, # Relaxed curvature threshold if basal points are available
         rock_seeds=rock_seed_indices,
         pedestal_seeds=pedestal_seed_indices,
+        basal_points=self.basal_points,
     )
 
+    # Segment the point cloud and perform conditional label propagation
     segmented_pcd, labels = self.segmenter.segment()
+    #if not np.any(self.basal_points):
     self.segmenter.conditional_label_propagation()
+
+    # Assign a default label for unlabeled points
     labels[labels == -1] = 1
+
+    # Color the segmented point cloud
     colored_pcd = self.segmenter.color_point_cloud()
+
+    # Highlight proximity points if basal points are available
+    # if np.any(self.basal_points):
+    #     colored_pcd = self.segmenter.highlight_proximity_points(colored_pcd)
 
     return colored_pcd
 
@@ -120,13 +157,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Region Growing with PyQt and Open3D")
         self.pcd = None
         self.process = None
-        self.rock_seeds = []
-        self.pedestal_seeds = []
-        self.poc_points = []
+        self.rock_seeds = []  # List to store rock seeds
+        self.pedestal_seeds = []  # List to store pedestal seeds
+        self.poc_points = []  # List to store points of contact
         self.basal_point_selection = (
             None  # Placeholder for BasalPointSelection instance
         )
-        self.basal_points = []  # Store basal points for multiple estimations
+        self.basal_points = None  # List to store basal points after estimation
 
         self.init_ui()
 
@@ -189,8 +226,8 @@ class MainWindow(QMainWindow):
         self.estimate_basal_points_button.clicked.connect(self.estimate_basal_points)
         layout.addWidget(self.estimate_basal_points_button)
 
-        # Button to add more basal points
-        self.add_more_basal_points_button = QPushButton("Add More Basal Points")
+        # Button to reselect basal points
+        self.add_more_basal_points_button = QPushButton("Reselect Basal Points")
         self.add_more_basal_points_button.setVisible(False)
         self.add_more_basal_points_button.clicked.connect(self.add_more_basal_points)
         layout.addWidget(self.add_more_basal_points_button)
@@ -201,6 +238,7 @@ class MainWindow(QMainWindow):
         self.save_pcd_button.clicked.connect(self.save_point_cloud)
         layout.addWidget(self.save_pcd_button)
 
+        # Set the main layout and central widget for the window
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
@@ -218,18 +256,21 @@ class MainWindow(QMainWindow):
             options=options,
         )
         if file_name:
+            # Load the LAS file as an Open3D point cloud
             self.pcd, _ = load_las_as_open3d_point_cloud(self, file_name)
             points = np.asarray(self.pcd.points)
             colors = np.asarray(self.pcd.colors)
 
+            # Close any existing visualization windows
             if self.process:
                 self.process.terminate()
 
+            # Start a new process to display the point cloud
             self.process = multiprocessing.Process(
                 target=show_point_cloud, args=(points, colors)
             )
             self.process.start()
-
+            # Enable the continue button to proceed to seed selection
             self.continue_button.setEnabled(True)
 
     def continue_to_select_seeds(self):
@@ -240,7 +281,7 @@ class MainWindow(QMainWindow):
         voxel_size = 0.01
         self.pcd = self.pcd.voxel_down_sample(voxel_size)
 
-        # Seed selection logic
+        # Computer selected seeds for rock and pedestal
         points = np.asarray(self.pcd.points)
         min_bound = points.min(axis=0)
         max_bound = points.max(axis=0)
@@ -294,7 +335,10 @@ class MainWindow(QMainWindow):
         """
         Start manual selection of seeds.
         """
+        # Hide all buttons except the 'Next' button to guide the user through the process
         self.hide_buttons_except_next()
+
+        # Update the instructions label with steps for selecting rock seeds
         self.instructions_label.setText(
             "Currently selecting seeds for Rock.\n \n"
             "1) Please pick points using [shift + left click].\n"
@@ -302,10 +346,13 @@ class MainWindow(QMainWindow):
             "3) After picking points, press 'Next' to select Pedestal seeds."
         )
         self.next_button.setVisible(True)
+
+        # Terminate any existing processes before starting point picking
         self.seed_selection_vis = None
         if self.process:
             self.process.terminate()
 
+        # Call the function to allow the user to pick points
         pick_points(self, self.pcd)
 
     def select_pedestal_seeds(self):
@@ -328,18 +375,33 @@ class MainWindow(QMainWindow):
 
     def run_region_growing(self):
         """
-        Run the region growing algorithm with the selected seeds.
+        Run the region growing algorithm with the selected seeds or with basal information.
         """
-        self.pedestal_seeds = self.get_selected_points_close_window()
+
+        # Check if basal points are available or not
+        if not np.any(self.basal_points):
+            # If basal points are not available, it means region growing is being run for the first time after manual seed selection,
+            # so get and store the selected seeds
+            self.pedestal_seeds = self.get_selected_points_close_window()
+
         self.instructions_label.setText("Running Region Growing. Please wait...")
         QApplication.processEvents()
 
+        # Run the region growing algorithm with the selected seeds
         colored_pcd = region_growing(
             self, self.pcd, self.rock_seeds, self.pedestal_seeds
         )
         self.instructions_label.setText("")
-        self.input_poc_button.setVisible(True)
+
+        # If no basal points are present, it means we are ran region growing for the first time after manual seed selection,
+        # so show the input point of contact button
+        if not np.any(self.basal_points):
+            self.input_poc_button.setVisible(True)
+
+        # Make the save point cloud button visible
         self.save_pcd_button.setVisible(True)
+
+        # Start a new process to show the segmented point cloud
         self.process = multiprocessing.Process(
             target=show_point_cloud,
             args=(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors)),
@@ -350,15 +412,21 @@ class MainWindow(QMainWindow):
         """
         Run the region growing algorithm with automatically selected seeds.
         """
+        # Close all the visualization windows before running region growing
         if self.process:
             self.process.terminate()
+
+        # Hide all buttons except the 'Next' button to guide the user through the process
         self.hide_all_buttons()
         self.instructions_label.setText("Running Region Growing. Please wait...")
         QApplication.processEvents()
 
+        # Run the region growing algorithm with the selected seeds
         colored_pcd = region_growing(
             self, self.pcd, self.rock_seeds, self.pedestal_seeds
         )
+
+        # Show the segmented point cloud and enable the input point of contact and save button
         self.instructions_label.setText("")
         self.input_poc_button.setVisible(True)
         self.save_pcd_button.setVisible(True)
@@ -372,8 +440,10 @@ class MainWindow(QMainWindow):
         """
         Input points of contact for the region growing algorithm.
         """
+        # Close all the visualization windows before starting point picking
         if self.process:
             self.process.terminate()
+
         self.hide_buttons_for_poc()
         self.instructions_label.setText(
             "Selecting Points of Contact.\n \n"
@@ -382,8 +452,12 @@ class MainWindow(QMainWindow):
             "3) After picking points, press 'Next' to estimate basal points."
         )
         self.estimate_basal_points_button.setVisible(True)
+
         if self.process:
             self.process.terminate()
+
+        # Call the function to allow the user to pick points
+        self.basal_points = None
         pick_points(self, self.pcd)
 
     def estimate_basal_points(self):
@@ -414,13 +488,19 @@ class MainWindow(QMainWindow):
         show_point_cloud(np.asarray(self.pcd.points), np.asarray(self.pcd.colors))
 
     def add_more_basal_points(self):
+        """
+        Allow the user to reselect or add more basal points.
+        """
+        # Hide the buttons related to basal points and region growing
         self.add_more_basal_points_button.setVisible(False)
         self.run_button.setVisible(False)
+
+        # Allow the user to reselect points of contact
         self.input_point_of_contacts()
 
     def highlight_points(self, points):
         """
-        Highlight the points in the point cloud.
+        Highlight estimated basal points in the point cloud.
         """
         colors = np.full((len(self.pcd.points), 3), [0.5, 0.5, 0.5])
         for point in points:
@@ -452,27 +532,32 @@ class MainWindow(QMainWindow):
             options=options,
         )
         if file_name:
+            # Ensure the file has a .las extension
             if not file_name.lower().endswith(".las"):
                 file_name += ".las"
+
+            # Create a new LAS file header and data structure
             header = laspy.LasHeader(point_format=3, version="1.2")
             las = laspy.LasData(header)
 
+            # Get the point coordinates and undo the recentering
             points = np.asarray(self.pcd.points)
-
-            # Undo the recentering
             points[:, 0] += self.x_mean
             points[:, 1] += self.y_mean
             points[:, 2] += self.z_mean
 
+            # Assign the recentered coordinates to the LAS file
             las.x = points[:, 0]
             las.y = points[:, 1]
             las.z = points[:, 2]
 
+            # Convert colors to the LAS format and assign them
             colors = (np.asarray(self.pcd.colors) * 65535).astype(np.uint16)
             las.red = colors[:, 0]
             las.green = colors[:, 1]
             las.blue = colors[:, 2]
 
+            # Assign labels (e.g., intensity) to the LAS file
             labels = np.asarray(self.segmenter.labels, dtype=np.uint16)
             las.intensity = labels
 
@@ -526,8 +611,13 @@ class MainWindow(QMainWindow):
 
 # Main entry point for the application
 if __name__ == "__main__":
+    # Set the start method for multiprocessing to 'spawn' (required for some platforms)
     multiprocessing.set_start_method("spawn")
+
+    # Create the application instance and main window
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+
+    # Start the application's event loop
     sys.exit(app.exec_())
