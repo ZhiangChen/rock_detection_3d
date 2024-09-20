@@ -2,7 +2,7 @@
 
 ## Overview
 
-This module extends the 3D Rock Detection project by focusing on unsupervised segmentation techniques for 3D rock point clouds. It emphasizes k-means clustering and region growing segmentation to enhance rock detection accuracy. The k-means clustering technique groups similar points based on their spatial features, while region growing relies on seed points and neighboring criteria to expand regions. These techniques enable precise segmentation of rock points from supporting surfaces, thus facilitating in-depth geometric analysis of geological formations.
+This module extends the 3D Rock Detection project by focusing on unsupervised segmentation techniques for 3D rock point clouds. It emphasizes region growing segmentation and k-means clustering to enhance rock detection accuracy. The region growing relies on seed points and neighboring criteria to expand regions, while k-means clustering technique groups similar points based on their spatial features . These techniques enable precise segmentation of rock points from supporting surfaces, thus facilitating in-depth geometric analysis of geological formations.
 
 To enhance usability and enable interactive control, we have also developed a Graphical User Interface (GUI). The GUI allows geologists and students to run segmentation algorithms, visualize each step, and have control over the segmentation by selecting initial seeds or basal points.
 
@@ -20,6 +20,9 @@ To enhance usability and enable interactive control, we have also developed a Gr
 
 **Interactive Point Selection Visualizer:** <br>
 <img src="./images/PointSelection_GUI.png" height="400">
+
+**Basal Estimation:** <br>
+<img src="./images/BasalEstimation.png" height="500">
 
 **Completed segmentation in GUI:** <br>
 <img src="./images/RegionGrowing_GUI.png" height="500">
@@ -44,16 +47,27 @@ The module involves two primary unsupervised segmentation techniques:
     - Identify the point with the highest z value near the centroid, representing a potential rock seed.
     - Identify the lowest point in the bounding box, representing a potential terrain seed.
 
-3. **Region Growing**:
+3. **Basal Estimation (Optional)**:
+
+    - Pair Basal Points: For each pair of consecutive user-input basal points (including the last to the first), follow the steps below:
+      - Initialize: Start with the first basal point in the pair.
+      - Calculate the direction vector between the two points.
+      - Identify candidate points in the point cloud that align with the direction and lie between the two basal points.
+      - Select the closest unvisited point from the candidate points.
+      - Mark the point as visited and add it to the list of dense points.
+      - Repeat until reaching the second basal point or no suitable points are found.
+
+4. **Region Growing (integrating Basal inforamtion)**:
 
     - Precompute neighbors for each point within the specified distance threshold to speed up segmentation.
     - Initialize regions from the selected seed points (highest point for rocks, bottommost point for terrain).
     - Expand regions from seeds by evaluating neighbors based on the segmentation criteria (normal vector smoothness and curvature):
         - Start with the seed point in a queue.
         - For each point, evaluate its neighbors based on the segmentation criteria.
-        - Check if neighbors meet the smoothness and curvature thresholds. If they do, add them to the current region and the queue.
-        - Assign labels to points based on the region they belong to.
-4. **Post Processing**:
+        - If basal information is available, check if neighbors are near the basal area using the basal proximity threshold. If not, check if they meet the smoothness and curvature thresholds.
+        - Add qualifying neighbors to the queue and assign labels to them based on the region they belong to.
+
+5. **Post Processing**:
 
     - Perform conditional label propagation to assign labels to remaining unlabeled points based on majority labels of their neighbors.
     - Color the segmented point cloud for visualization by assigning different colors to different regions (e.g., red for rocks, blue for terrain).

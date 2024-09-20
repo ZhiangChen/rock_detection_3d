@@ -69,7 +69,7 @@ class RegionGrowingSegmentation:
         rock_seeds=None,
         pedestal_seeds=None,
         basal_points=None,  # List or array of basal points (optional, default is None)
-        basal_proximity_threshold=0.05,  # Threshold distance for checking proximity to basal points
+        basal_proximity_threshold=0.01,  # Threshold distance for checking proximity to basal points
         basal_proximity_check=False,  # Flag to override the smoothness and curvature criteria and use basal proximity
         stepwise_visualize=False,
     ):
@@ -112,6 +112,7 @@ class RegionGrowingSegmentation:
         print(len(self.labels), "points after downsampling")  # -1 indicates unlabeled
         self.normals = np.asarray(self.pcd.normals)
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+        print("Performing region growing with", self.smoothness_threshold, "smoothness threshold", self.curvature_threshold, "curvature threshold") 
 
     def precompute_neighbors(self):
         """
@@ -196,10 +197,6 @@ class RegionGrowingSegmentation:
         Perform region growing segmentation starting from the given seeds.
         """
 
-        # If basal proximity check is enabled, print basal points as a sanity check
-        if self.basal_proximity_check:
-            print(self.basal_points)
-
         # Initialize the queue with the starting points (seeds) for region growing
         queue = deque(starting_queue)
 
@@ -211,7 +208,7 @@ class RegionGrowingSegmentation:
         # Process the queue until it's empty
         while queue:
 
-            if (self.stepwise_visualize) and (points_marked % 10000 == 0):
+            if (self.stepwise_visualize) and (points_marked % 5000 == 0):
                 print(f"Visualizing after marking {points_marked} points.")
                 self.visualize_current_segmentation()
 
@@ -221,11 +218,29 @@ class RegionGrowingSegmentation:
             current_index = queue.popleft()
             current_point = np.asarray(self.pcd.points)[current_index]
 
-            # Retrieve the indices of neighboring points
-            neighbor_indices = neighbors[current_index]
+            # Check if basal proximity check is enabled and compute distance to nearest basal point
+            if self.basal_proximity_check:
+                distances_to_basal = np.linalg.norm(
+                    np.asarray(self.basal_points) - current_point, axis=1
+                )
+                min_distance_to_basal = np.min(distances_to_basal)
 
-            # Retrieve the coordinates of the neighboring points
-            neighbor_points = np.asarray(self.pcd.points)[neighbor_indices]
+                # Use a constant radius for neighbor search initially
+                search_radius = self.distance_threshold
+
+                # If the distance to the nearest basal point is less than the threshold, adapt the search radius
+                if min_distance_to_basal < search_radius:
+                    search_radius = min_distance_to_basal
+
+                    # Retrieve the indices of neighboring points using the adaptive radius
+                    [k, neighbor_indices, _] = self.pcd_tree.search_radius_vector_3d(current_point, search_radius)
+                    neighbor_indices = neighbor_indices[1:]  # Skip the first index as it's the point itself
+                else:
+                    # Use a constant radius for neighbor search initially
+                    neighbor_indices = neighbors[current_index]
+            else:
+                # If no basal proximity check, use the precomputed neighbors
+                neighbor_indices = neighbors[current_index]
 
             # Iterate over the neighboring points
             for neighbor_index in neighbor_indices:
@@ -256,6 +271,7 @@ class RegionGrowingSegmentation:
                 min_dot_product = self.calculate_segmentation_criteria(
                     neighbor_index, neighbors
                 )
+
                 # Estimate the curvature for the neighboring point
                 curvature = self.estimate_curvature(neighbor_index)
 
@@ -267,6 +283,7 @@ class RegionGrowingSegmentation:
                     queue.append(neighbor_index)
 
         print(f"Points marked: {points_marked}")
+
 
     def visualize_current_segmentation(self):
         """

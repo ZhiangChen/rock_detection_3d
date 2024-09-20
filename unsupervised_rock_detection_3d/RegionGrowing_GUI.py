@@ -9,7 +9,11 @@ from PyQt5.QtWidgets import (
     QWidget,
     QFileDialog,
     QLabel,
+    QSlider,
+    QHBoxLayout,
+    QFormLayout,
 )
+from PyQt5.QtCore import Qt
 import open3d as o3d
 import numpy as np
 import laspy
@@ -64,6 +68,8 @@ def pick_points(self, pcd):
 
     # Retrieve the indices of the picked points
     picked_points = self.seed_selection_vis.get_picked_points()
+    self.seed_selection_vis.destroy_window()  # Ensure the window is closed
+    self.seed_selection_vis = None
     return picked_points
 
 
@@ -124,9 +130,9 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
     self.segmenter = RegionGrowingSegmentation(
         pcd,
         downsample=False,
-        smoothness_threshold=0.9 if np.any(self.basal_points) else 0.99, # Relaxed smoothness threshold if basal points are available
+        smoothness_threshold=self.smoothness_threshold,
         distance_threshold=0.05,
-        curvature_threshold=0.1 if np.any(self.basal_points) else 0.15, # Relaxed curvature threshold if basal points are available
+        curvature_threshold=self.curvature_threshold,
         rock_seeds=rock_seed_indices,
         pedestal_seeds=pedestal_seed_indices,
         basal_points=self.basal_points,
@@ -157,13 +163,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Region Growing with PyQt and Open3D")
         self.pcd = None
         self.process = None
-        self.rock_seeds = []  # List to store rock seeds
-        self.pedestal_seeds = []  # List to store pedestal seeds
-        self.poc_points = []  # List to store points of contact
-        self.basal_point_selection = (
-            None  # Placeholder for BasalPointSelection instance
-        )
-        self.basal_points = None  # List to store basal points after estimation
+        self.rock_seeds = None
+        self.pedestal_seeds = None
+        self.poc_points = []
+        self.basal_point_selection = None
+        self.basal_points = None
+
+        self.smoothness_threshold = 0.99  # Initial default value for the smoothness threshold (0-1)
+        self.curvature_threshold = 0.15   # Initial default value for the curvature threshold (0-1)
 
         self.init_ui()
 
@@ -193,9 +200,7 @@ class MainWindow(QMainWindow):
         # Button to continue with the selected seeds
         self.continue_with_seeds_button = QPushButton("Continue with Selected Seeds")
         self.continue_with_seeds_button.setVisible(False)
-        self.continue_with_seeds_button.clicked.connect(
-            self.run_region_growing_with_selected_seeds
-        )
+        self.continue_with_seeds_button.clicked.connect(lambda: self.show_sliders(smoothness_threshold=0.99, curvature_threshold=0.15))
         layout.addWidget(self.continue_with_seeds_button)
 
         # Label to show instructions
@@ -207,6 +212,48 @@ class MainWindow(QMainWindow):
         self.next_button.setVisible(False)
         self.next_button.clicked.connect(self.select_pedestal_seeds)
         layout.addWidget(self.next_button)
+
+        self.slider_layout = QFormLayout()
+
+        # Descriptions for sliders
+        smoothness_description = QLabel("Controls surface smoothness variation; higher values include only smoother points.\n")
+        curvature_description = QLabel("Sets the curvature limit; higher values allow more curved points.\n")
+
+        # Smoothness Threshold Slider
+        smoothness_slider_layout = QHBoxLayout()
+        self.smoothness_slider = QSlider(Qt.Horizontal)
+        self.smoothness_slider.setRange(0, 100)  # Slider range 0-100, but mapped to 0-1
+        self.smoothness_slider.setValue(int(self.smoothness_threshold * 100))
+        self.smoothness_slider.setMinimumWidth(300)
+        self.smoothness_slider.valueChanged.connect(self.update_smoothness_threshold)
+        smoothness_value_label = QLabel(f"{self.smoothness_threshold:.2f}")
+        self.smoothness_slider.valueChanged.connect(lambda: smoothness_value_label.setText(f"{self.smoothness_threshold:.2f}"))
+        smoothness_slider_layout.addWidget(self.smoothness_slider)
+        smoothness_slider_layout.addWidget(smoothness_value_label)
+        self.slider_layout.addRow("Smoothness Threshold", smoothness_slider_layout)
+        self.slider_layout.addRow(smoothness_description)
+
+        # Curvature Threshold Slider
+        curvature_slider_layout = QHBoxLayout()
+        self.curvature_slider = QSlider(Qt.Horizontal)
+        self.curvature_slider.setRange(0, 100)  # Slider range 0-100, but mapped to 0-1
+        self.curvature_slider.setValue(int(self.curvature_threshold * 100))
+        self.curvature_slider.setMinimumWidth(300)
+        self.curvature_slider.valueChanged.connect(self.update_curvature_threshold)
+        curvature_value_label = QLabel(f"{self.curvature_threshold:.2f}")
+        self.curvature_slider.valueChanged.connect(lambda: curvature_value_label.setText(f"{self.curvature_threshold:.2f}"))
+        curvature_slider_layout.addWidget(self.curvature_slider)
+        curvature_slider_layout.addWidget(curvature_value_label)
+        self.slider_layout.addRow("Curvature Threshold", curvature_slider_layout)
+        self.slider_layout.addRow(curvature_description)
+
+
+        slider_widget = QWidget()
+        slider_widget.setLayout(self.slider_layout)
+        slider_widget.setVisible(False)
+        self.slider_widget = slider_widget
+
+        layout.addWidget(slider_widget)
 
         # Button to run the region growing algorithm
         self.run_button = QPushButton("Run Region Growing")
@@ -243,6 +290,22 @@ class MainWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
+    def update_smoothness_threshold(self, value):
+        print("update_smoothness_threshold", value)
+        self.smoothness_threshold = value / 100.0  # Scale slider value to 0-1
+
+    def update_curvature_threshold(self, value):
+        self.curvature_threshold = value / 100.0
+
+    def show_sliders(self, smoothness_threshold=0.99, curvature_threshold=0.15):
+        self.hide_all_buttons()
+        self.slider_widget.setVisible(True)
+        print("show_sliders", smoothness_threshold, curvature_threshold)
+        self.smoothness_slider.setValue(int(smoothness_threshold * 100))
+        self.curvature_slider.setValue(int(curvature_threshold * 100))
+        self.run_button.setVisible(True)
+        self.run_button.setVisible(True)
+        
     def load_las_file(self):
         """
         Load a LAS file and display the point cloud.
@@ -324,9 +387,9 @@ class MainWindow(QMainWindow):
         """
         Retrieve selected points and close the visualization window.
         """
-        selected_points = self.seed_selection_vis.get_picked_points()
-        if self.seed_selection_vis:
-            self.seed_selection_vis.destroy_window()
+        if self.seed_selection_vis is not None:
+            selected_points = self.seed_selection_vis.get_picked_points()
+            self.seed_selection_vis.destroy_window()  # Ensure the window is closed
             self.seed_selection_vis = None
 
         return selected_points
@@ -353,13 +416,13 @@ class MainWindow(QMainWindow):
             self.process.terminate()
 
         # Call the function to allow the user to pick points
-        pick_points(self, self.pcd)
+        self.rock_seeds = pick_points(self, self.pcd) 
 
     def select_pedestal_seeds(self):
         """
         Select pedestal seeds after rock seeds have been selected.
         """
-        self.next_button.setVisible(False)
+        self.show_sliders()
         self.rock_seeds = self.get_selected_points_close_window()
         self.instructions_label.setText(
             "Currently selecting seeds for Pedestal.\n \n"
@@ -378,11 +441,18 @@ class MainWindow(QMainWindow):
         Run the region growing algorithm with the selected seeds or with basal information.
         """
 
+        if self.process:
+            self.process.terminate()
+
+        # Hide all buttons except the 'Next' button to guide the user through the process
+        self.hide_all_buttons()
+
         # Check if basal points are available or not
         if not np.any(self.basal_points):
             # If basal points are not available, it means region growing is being run for the first time after manual seed selection,
             # so get and store the selected seeds
-            self.pedestal_seeds = self.get_selected_points_close_window()
+            if self.pedestal_seeds is None:
+                self.pedestal_seeds = self.get_selected_points_close_window()
 
         self.instructions_label.setText("Running Region Growing. Please wait...")
         QApplication.processEvents()
@@ -393,7 +463,7 @@ class MainWindow(QMainWindow):
         )
         self.instructions_label.setText("")
 
-        # If no basal points are present, it means we are ran region growing for the first time after manual seed selection,
+        # If no basal points are present, it means we are running region growing for the first time after manual seed selection,
         # so show the input point of contact button
         if not np.any(self.basal_points):
             self.input_poc_button.setVisible(True)
@@ -408,33 +478,6 @@ class MainWindow(QMainWindow):
         )
         self.process.start()
 
-    def run_region_growing_with_selected_seeds(self):
-        """
-        Run the region growing algorithm with automatically selected seeds.
-        """
-        # Close all the visualization windows before running region growing
-        if self.process:
-            self.process.terminate()
-
-        # Hide all buttons except the 'Next' button to guide the user through the process
-        self.hide_all_buttons()
-        self.instructions_label.setText("Running Region Growing. Please wait...")
-        QApplication.processEvents()
-
-        # Run the region growing algorithm with the selected seeds
-        colored_pcd = region_growing(
-            self, self.pcd, self.rock_seeds, self.pedestal_seeds
-        )
-
-        # Show the segmented point cloud and enable the input point of contact and save button
-        self.instructions_label.setText("")
-        self.input_poc_button.setVisible(True)
-        self.save_pcd_button.setVisible(True)
-        self.process = multiprocessing.Process(
-            target=show_point_cloud,
-            args=(np.asarray(colored_pcd.points), np.asarray(colored_pcd.colors)),
-        )
-        self.process.start()
 
     def input_point_of_contacts(self):
         """
@@ -477,6 +520,8 @@ class MainWindow(QMainWindow):
 
         # Highlight the basal points in the point cloud
         self.highlight_points(self.basal_points)
+
+        self.show_sliders(smoothness_threshold=0.9, curvature_threshold=0.1)  
 
         self.instructions_label.setText(
             "Basal points estimation completed. Would you like to add more basal points or run region growing again?"
@@ -599,6 +644,7 @@ class MainWindow(QMainWindow):
         self.run_button.setVisible(False)
         self.input_poc_button.setVisible(False)
         self.save_pcd_button.setVisible(False)
+        self.slider_widget.setVisible(False)
 
     def closeEvent(self, event):
         """
