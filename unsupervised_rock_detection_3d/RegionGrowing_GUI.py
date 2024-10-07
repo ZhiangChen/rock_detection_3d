@@ -21,24 +21,31 @@ from basal_points_algo import (
     BasalPointSelection,
     BasalPointAlgorithm,
 )
+from scipy.spatial import cKDTree
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import os
 
-
-# Visualize point cloud
-def show_point_cloud(points, colors=None):
+def show_point_cloud(points_or_mesh_path, colors=None, is_mesh=False):
     """
-    Visualize the point cloud using Open3D.
+    Visualize the point cloud or mesh using Open3D.
     """
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    if colors is not None:
-        pcd.colors = o3d.utility.Vector3dVector(colors)
+    if not is_mesh:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_or_mesh_path)
+        if colors is not None:
+            pcd.colors = o3d.utility.Vector3dVector(colors)
 
-    # Estimate normals for the point cloud to enhance visualization
-    pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
-    )
-    o3d.visualization.draw_geometries([pcd])
-
+        # Estimate normals for the point cloud to enhance visualization
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
+        )
+        geometry = pcd
+    else:
+        # Load the mesh from the file
+        geometry = o3d.io.read_triangle_mesh(points_or_mesh_path)
+        
+    o3d.visualization.draw_geometries([geometry])
 
 # Point picking function
 def pick_points(self, pcd):
@@ -136,6 +143,7 @@ def region_growing(self, pcd, rock_seeds, pedestal_seeds):
         rock_seeds=rock_seed_indices,
         pedestal_seeds=pedestal_seed_indices,
         basal_points=self.basal_points,
+        basal_proximity_threshold=self.basal_proximity_threshold 
     )
 
     # Segment the point cloud and perform conditional label propagation
@@ -171,6 +179,7 @@ class MainWindow(QMainWindow):
 
         self.smoothness_threshold = 0.99  # Initial default value for the smoothness threshold (0-1)
         self.curvature_threshold = 0.15   # Initial default value for the curvature threshold (0-1)
+        self.basal_proximity_threshold = 0.05  # Default value for basal proximity threshold (0-1)
 
         self.init_ui()
 
@@ -218,6 +227,8 @@ class MainWindow(QMainWindow):
         # Descriptions for sliders
         smoothness_description = QLabel("Controls surface smoothness variation; higher values include only smoother points.\n")
         curvature_description = QLabel("Sets the curvature limit; higher values allow more curved points.\n")
+        #proximity_description = QLabel("Controls how close points should be to basal points to stop region growing.\n")
+
 
         # Smoothness Threshold Slider
         smoothness_slider_layout = QHBoxLayout()
@@ -246,6 +257,30 @@ class MainWindow(QMainWindow):
         curvature_slider_layout.addWidget(curvature_value_label)
         self.slider_layout.addRow("Curvature Threshold", curvature_slider_layout)
         self.slider_layout.addRow(curvature_description)
+
+       
+        # Store the proximity slider label, slider, and proximity value label references
+        self.proximity_slider_label = QLabel("Basal Proximity Threshold")
+
+        proximity_slider_layout = QHBoxLayout()
+        self.proximity_slider = QSlider(Qt.Horizontal)
+        self.proximity_slider.setRange(0, 100)  # Slider range 0-100, but mapped to 0-1
+        self.proximity_slider.setValue(int(self.basal_proximity_threshold * 100))
+        self.proximity_slider.setMinimumWidth(300)
+        self.proximity_slider.valueChanged.connect(self.update_basal_proximity_threshold)
+
+        # Store reference to the value label that shows the slider's current value
+        self.proximity_value_label = QLabel(f"{self.basal_proximity_threshold:.2f}")
+        self.proximity_slider.valueChanged.connect(lambda: self.proximity_value_label.setText(f"{self.basal_proximity_threshold:.2f}"))
+
+        # Add the slider and value label to the layout
+        proximity_slider_layout.addWidget(self.proximity_slider)
+        proximity_slider_layout.addWidget(self.proximity_value_label)
+
+        # Add the proximity slider label and layout to the form layout
+        self.slider_layout.addRow(self.proximity_slider_label, proximity_slider_layout)
+
+
 
 
         slider_widget = QWidget()
@@ -285,6 +320,18 @@ class MainWindow(QMainWindow):
         self.save_pcd_button.clicked.connect(self.save_point_cloud)
         layout.addWidget(self.save_pcd_button)
 
+        # Button to reconstruct mesh
+        self.reconstruct_mesh_button = QPushButton("Reconstruct Mesh")
+        self.reconstruct_mesh_button.setVisible(False)
+        self.reconstruct_mesh_button.clicked.connect(self.reconstruct_mesh)
+        layout.addWidget(self.reconstruct_mesh_button)
+
+        # Button to save mesh
+        self.save_mesh_button = QPushButton("Save Mesh")
+        self.save_mesh_button.setVisible(False)
+        self.save_mesh_button.clicked.connect(self.save_mesh)
+        layout.addWidget(self.save_mesh_button)
+
         # Set the main layout and central widget for the window
         container = QWidget()
         container.setLayout(layout)
@@ -297,14 +344,33 @@ class MainWindow(QMainWindow):
     def update_curvature_threshold(self, value):
         self.curvature_threshold = value / 100.0
 
+    def update_basal_proximity_threshold(self, value):
+        self.basal_proximity_threshold = value / 100.0  
+
     def show_sliders(self, smoothness_threshold=0.99, curvature_threshold=0.15):
         self.hide_all_buttons()
         self.slider_widget.setVisible(True)
         print("show_sliders", smoothness_threshold, curvature_threshold)
+
+        # Update the smoothness and curvature sliders
         self.smoothness_slider.setValue(int(smoothness_threshold * 100))
         self.curvature_slider.setValue(int(curvature_threshold * 100))
+
+        # Only show the proximity slider layout if basal points are available
+        if self.basal_points is not None and len(self.basal_points) > 0:
+            self.proximity_slider.setValue(int(self.basal_proximity_threshold * 100))
+            self.proximity_slider_label.setVisible(True)  # Show label for proximity slider
+            self.proximity_slider.setVisible(True)  # Show the proximity slider itself
+            self.proximity_value_label.setVisible(True)  # Show the proximity value label
+        else:
+            self.proximity_slider_label.setVisible(False)  # Hide label for proximity slider
+            self.proximity_slider.setVisible(False)  # Hide the proximity slider itself
+            self.proximity_value_label.setVisible(False)  # Hide the proximity value label
+
         self.run_button.setVisible(True)
-        self.run_button.setVisible(True)
+
+
+
         
     def load_las_file(self):
         """
@@ -470,6 +536,7 @@ class MainWindow(QMainWindow):
 
         # Make the save point cloud button visible
         self.save_pcd_button.setVisible(True)
+        self.reconstruct_mesh_button.setVisible(True)
 
         # Start a new process to show the segmented point cloud
         self.process = multiprocessing.Process(
@@ -566,7 +633,8 @@ class MainWindow(QMainWindow):
 
     def save_point_cloud(self):
         """
-        Save the segmented point cloud to a LAS file.
+        Save rock region points, pedestal points, and basal points to a LAS file.
+        Intensity values: Rock = 0, Pedestal = 1, Basal = 2
         """
         options = QFileDialog.Options()
         file_name, _ = QFileDialog.getSaveFileName(
@@ -577,36 +645,232 @@ class MainWindow(QMainWindow):
             options=options,
         )
         if file_name:
-            # Ensure the file has a .las extension
             if not file_name.lower().endswith(".las"):
                 file_name += ".las"
 
-            # Create a new LAS file header and data structure
-            header = laspy.LasHeader(point_format=3, version="1.2")
-            las = laspy.LasData(header)
-
-            # Get the point coordinates and undo the recentering
             points = np.asarray(self.pcd.points)
+            labels = np.asarray(self.segmenter.labels)
+
+            # Create intensity array based on labels
+            intensity = np.zeros(len(points), dtype=np.uint16)
+            intensity[labels == 0] = 0  # Pedestal points
+            intensity[labels == 1] = 1  # Rock points
+
+            # Add basal points if they exist
+            if self.basal_points is not None:
+                basal_points = np.asarray(self.basal_points)
+                points = np.vstack((points, basal_points))
+                basal_intensity = np.full(len(basal_points), 2, dtype=np.uint16)
+                intensity = np.hstack((intensity, basal_intensity))
+
+            # Undo the recentering
             points[:, 0] += self.x_mean
             points[:, 1] += self.y_mean
             points[:, 2] += self.z_mean
 
-            # Assign the recentered coordinates to the LAS file
+            # Create a new LAS file
+            header = laspy.LasHeader(point_format=3, version="1.2")
+            las = laspy.LasData(header)
+
+            # Assign coordinates and intensity
             las.x = points[:, 0]
             las.y = points[:, 1]
             las.z = points[:, 2]
+            las.intensity = intensity
 
-            # Convert colors to the LAS format and assign them
+            # Assign colors
             colors = (np.asarray(self.pcd.colors) * 65535).astype(np.uint16)
+            if self.basal_points is not None:
+                basal_colors = np.full((len(basal_points), 3), [65535, 0, 0], dtype=np.uint16)  # Red for basal points
+                colors = np.vstack((colors, basal_colors))
+
             las.red = colors[:, 0]
             las.green = colors[:, 1]
             las.blue = colors[:, 2]
 
-            # Assign labels (e.g., intensity) to the LAS file
-            labels = np.asarray(self.segmenter.labels, dtype=np.uint16)
-            las.intensity = labels
-
+            # Write the LAS file
             las.write(file_name)
+
+    @staticmethod
+    def detect_basal_points_optimized(points, labels, k=30, threshold=0.35):
+        tree = cKDTree(points)
+        distances, indices = tree.query(points, k=k)
+        
+        neighborhood_labels = labels[indices]
+        rock_ratios = np.sum(neighborhood_labels == 1, axis=1) / k
+        
+        basal_points = (threshold <= rock_ratios) & (rock_ratios <= (1 - threshold))
+        return basal_points
+
+    def reconstruct_mesh(self):
+        self.hide_all_buttons()
+        self.instructions_label.setText("Reconstructing mesh. Please wait...")
+        QApplication.processEvents()
+
+        # Perform basal detection if not available
+        if self.basal_points is None:
+            points = np.asarray(self.pcd.points)
+            labels = np.asarray(self.segmenter.labels)
+            self.basal_points = self.detect_basal_points_optimized(points, labels)
+            print(f"Detected {np.sum(self.basal_points)} basal points.")
+
+        # Filter the point cloud to keep only rock and basal points
+        rock_points = np.asarray(self.segmenter.labels) == 1
+        filtered_indices = np.logical_or(rock_points, self.basal_points)
+        filtered_points = np.asarray(self.pcd.points)[filtered_indices]
+        filtered_colors = np.asarray(self.pcd.colors)[filtered_indices]
+
+        # Create a new point cloud with only rock and basal points
+        filtered_pcd = o3d.geometry.PointCloud()
+        filtered_pcd.points = o3d.utility.Vector3dVector(filtered_points)
+        filtered_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
+
+        # Perform open face interpolation
+        basal_indices = np.where(self.basal_points[filtered_indices])[0]
+        interpolated_pcd = self.generate_boundary_filling_points(filtered_pcd, basal_indices, n_points=10)
+
+        # Change the color of all the points in interpolated_pcd to red
+        interpolated_pcd.paint_uniform_color([1, 0, 0])
+
+        # Perform Poisson reconstruction
+        mesh = self.poisson_reconstruction(interpolated_pcd)
+        self.reconstructed_mesh = mesh
+        
+
+        self.instructions_label.setText("Mesh reconstruction completed.")
+        self.save_mesh_button.setVisible(True)
+        QApplication.processEvents()
+
+        # Visualize the mesh
+        if self.process:
+            self.process.terminate()
+        
+        # Save the mesh to a temporary file
+        with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as temp_file:
+            temp_mesh_path = temp_file.name
+            self.temp_mesh_path = temp_mesh_path
+        o3d.io.write_triangle_mesh(temp_mesh_path, mesh)
+
+        self.process = multiprocessing.Process(
+            target=show_point_cloud, args=(temp_mesh_path, None, True)
+        )
+        self.process.start()
+
+    @staticmethod
+    def generate_boundary_filling_points(pcd, basal_indices, n_points=10):
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+        basal_points = points[basal_indices]
+
+        # Calculate the centroid of the basal points
+        centroid = np.mean(basal_points, axis=0)
+
+        # Build KD-Tree for efficient nearest neighbor search
+        tree = cKDTree(points)
+
+        # Set all original points to red
+        colors[:] = [1, 0, 0]  # Red for all original points
+        colors[basal_indices] = [0, 1, 1]  # Set basal points that were used to cyan
+
+        def process_basal_point(basal_point):
+            # Calculate the direction vector from the basal point to the centroid
+            direction_vector = centroid - basal_point
+            direction_vector /= np.linalg.norm(direction_vector)  # Normalize
+
+            # Step along the vector and find the first point in the point cloud that intersects with this direction
+            steps = np.linspace(0.5, 2, 100)  # Reduced number of steps
+            candidate_points = basal_point + steps[:, np.newaxis] * direction_vector
+
+            # Query KD-Tree for nearest neighbors
+            distances, indices = tree.query(candidate_points, k=1)
+
+            # Find the first valid intersection
+            mask = (distances < 0.05) & (distances > 1e-6)
+            if np.any(mask):
+                first_valid_idx = np.argmax(mask)
+                opposite_point = points[indices[first_valid_idx]]
+
+                # Generate new points between the basal point and the opposite point
+                t = np.linspace(0, 1, n_points)[:, np.newaxis]
+                new_points = basal_point + t * (opposite_point - basal_point)
+                return new_points
+            return None
+
+        new_points = []
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(process_basal_point, bp) for bp in basal_points[:len(basal_points)//2]]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    new_points.extend(result)
+
+        # Add new points to the point cloud
+        new_points = np.array(new_points)
+        new_colors = np.full((new_points.shape[0], 3), [0, 0, 1])  # Blue color for new points
+
+        # Add new points to the point cloud
+        pcd.points = o3d.utility.Vector3dVector(np.vstack((points, new_points)))
+        pcd.colors = o3d.utility.Vector3dVector(np.vstack((colors, new_colors)))
+
+        return pcd
+
+    @staticmethod
+    def poisson_reconstruction(pcd):
+        # Estimate normals
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+        )
+
+        # Orient normals consistently
+        pcd.orient_normals_consistent_tangent_plane(k=30)
+
+        # Get points and normals as numpy arrays
+        points = np.asarray(pcd.points)
+        normals = np.asarray(pcd.normals)
+
+        # Calculate normal lengths
+        normal_lengths = np.linalg.norm(normals, axis=1)
+
+        # Create a mask for valid normals (non-zero length)
+        valid_mask = normal_lengths > 1e-6
+
+        # Filter out points with undefined or zero-length normals
+        valid_points = points[valid_mask]
+        valid_normals = normals[valid_mask]
+
+        # Create a new point cloud with only valid points and normals
+        valid_pcd = o3d.geometry.PointCloud()
+        valid_pcd.points = o3d.utility.Vector3dVector(valid_points)
+        valid_pcd.normals = o3d.utility.Vector3dVector(valid_normals)
+
+        print(f"Original point cloud size: {len(points)}")
+        print(f"Filtered point cloud size: {len(valid_points)}")
+
+        # Invert normals
+        pcd.normals = o3d.utility.Vector3dVector(-np.asarray(pcd.normals))
+
+        # Apply Poisson surface reconstruction
+        mesh, densities = mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+    pcd, depth=8, linear_fit=False
+)
+
+        return mesh
+    
+    def save_mesh(self):
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Mesh",
+            "",
+            "PLY Files (*.ply);;All Files (*)",
+            options=options,
+        )
+        if file_name:
+            if not file_name.lower().endswith(".ply"):
+                file_name += ".ply"
+            o3d.io.write_triangle_mesh(file_name, self.reconstructed_mesh)
+            self.instructions_label.setText(f"Mesh saved to {file_name}")
+            os.unlink(self.temp_mesh_path)
 
     def hide_buttons_except_next(self):
         """
@@ -631,6 +895,8 @@ class MainWindow(QMainWindow):
         self.run_button.setVisible(False)
         self.input_poc_button.setVisible(False)
         self.save_pcd_button.setVisible(False)
+        self.save_mesh_button.setVisible(False)
+        self.reconstruct_mesh_button.setVisible(False)
 
     def hide_all_buttons(self):
         """
@@ -644,6 +910,8 @@ class MainWindow(QMainWindow):
         self.run_button.setVisible(False)
         self.input_poc_button.setVisible(False)
         self.save_pcd_button.setVisible(False)
+        self.reconstruct_mesh_button.setVisible(False)
+        self.save_mesh_button.setVisible(False)
         self.slider_widget.setVisible(False)
 
     def closeEvent(self, event):

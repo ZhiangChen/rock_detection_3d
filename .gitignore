@@ -172,3 +172,6 @@ unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.csv
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.json
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.md
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.txt
+unsupervised_rock_detection_3d/mrc_pa.py
+unsupervised_rock_detection_3d/test.py
+unsupervised_rock_detection_3d/detect_basal.py
