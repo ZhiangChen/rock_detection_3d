@@ -47,17 +47,7 @@ The module involves two primary unsupervised segmentation techniques:
     - Identify the point with the highest z value near the centroid, representing a potential rock seed.
     - Identify the lowest point in the bounding box, representing a potential terrain seed.
 
-3. **Basal Estimation (Optional)**:
-
-    - Pair Basal Points: For each pair of consecutive user-input basal points (including the last to the first), follow the steps below:
-      - Initialize: Start with the first basal point in the pair.
-      - Calculate the direction vector between the two points.
-      - Identify candidate points in the point cloud that align with the direction and lie between the two basal points.
-      - Select the closest unvisited point from the candidate points.
-      - Mark the point as visited and add it to the list of dense points.
-      - Repeat until reaching the second basal point or no suitable points are found.
-
-4. **Region Growing (integrating Basal inforamtion)**:
+3. **Region Growing (integrating Basal inforamtion)**:
 
     - Precompute neighbors for each point within the specified distance threshold to speed up segmentation.
     - Initialize regions from the selected seed points (highest point for rocks, bottommost point for terrain).
@@ -67,11 +57,66 @@ The module involves two primary unsupervised segmentation techniques:
         - If basal information is available, check if neighbors are near the basal area using the basal proximity threshold. If not, check if they meet the smoothness and curvature thresholds.
         - Add qualifying neighbors to the queue and assign labels to them based on the region they belong to.
 
+4. **Basal Point Handling**:
+
+    The workflow typically follows one of two paths:
+    1. If initial segmentation is satisfactory → Use automatic detection (B) → Proceed to mesh reconstruction
+    2. If initial segmentation needs guidance → Use manual definition (A) → Re-run segmentation → Proceed to mesh reconstruction
+
+    A. **Manual Basal Line Definition** (Optional):
+
+    - Pair Basal Points: For each pair of consecutive user-input basal points (including the last to the first), follow the steps below:
+      - Initialize: Start with the first basal point in the pair.
+      - Calculate the direction vector between the two points.
+      - Identify candidate points in the point cloud that align with the direction and lie between the two basal points.
+      - Select the closest unvisited point from the candidate points.
+      - Mark the point as visited and add it to the list of dense points.
+      - Repeat until reaching the second basal point or no suitable points are found.
+
+    B. **Automatic Basal Point Detection**:
+    - Applied after successful initial segmentation
+    - Uses neighborhood analysis to identify transition zones:
+      - For each point, examines k-nearest neighbors (default k=30)
+      - Calculates ratio of rock-labeled points in neighborhood
+      - Points with balanced ratio (between threshold and 1-threshold) are classified as basal
+    - These automatically detected points are used for:
+      - Generating the bottom surface for mesh reconstruction
+
 5. **Post Processing**:
 
     - Perform conditional label propagation to assign labels to remaining unlabeled points based on majority labels of their neighbors.
     - Color the segmented point cloud for visualization by assigning different colors to different regions (e.g., red for rocks, blue for terrain).
     - Visualize the segmented point cloud to assess the regions' boundaries.
+
+6. **Bottom Face Generation**:
+
+    - Filter the point cloud to keep only rock and basal points
+    - Generate a continuous bottom surface using NURBS (Non-Uniform Rational B-Spline) interpolation:
+        - Project basal points onto a best-fit plane for 2D parameterization
+        - Create a boundary-aware grid that maintains connection with basal points
+        - Fit a NURBS surface through the grid points
+        - Generate dense surface points with fine sampling
+        - Ensure smooth connection between the surface and basal points
+        - Add additional boundary points for better mesh connectivity
+
+7. **Mesh Reconstruction**:
+
+    1. **Point Cloud Preparation**:
+        - Combine rock points and generated bottom face points
+        - Estimate normals for both sets of points
+        - Orient normals consistently
+
+    2. **Poisson Surface Reconstruction**:
+        - Perform Poisson reconstruction to generate a watertight mesh
+        - Parameters:
+            - Depth: 8 (controls mesh resolution)
+            - Linear fit: False (better for organic shapes)
+
+    3. **Mesh Export**:
+        - Save the reconstructed mesh in PLY format
+        - Clean up temporary files
+
+This workflow creates a complete 3D model of the rock, including a geometrically plausible bottom surface. The resulting mesh is watertight and suitable for volume calculations or further analysis.
 
 #### Mathematical Definitions
 
