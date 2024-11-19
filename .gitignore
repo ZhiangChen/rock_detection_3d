@@ -172,3 +172,16 @@ unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.csv
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.json
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.md
 unsupervised_rock_detection_3d/.VSCodeCounter/2024-09-20_00-21-48/results.txt
+unsupervised_rock_detection_3d/mrc_pa.py
+unsupervised_rock_detection_3d/test.py
+unsupervised_rock_detection_3d/detect_basal.py
+unsupervised_rock_detection_3d/compare_axes.py
+unsupervised_rock_detection_3d/evaluate_segmentation.py
+unsupervised_rock_detection_3d/geo_analysis.py
+unsupervised_rock_detection_3d/geometric_analysis_results.csv
+unsupervised_rock_detection_3d/rbf.py
+unsupervised_rock_detection_3d/segmentation_evaluation.csv
+unsupervised_rock_detection_3d/test_normal_orientation.py
+unsupervised_rock_detection_3d/.vscode/settings.json
+unsupervised_rock_detection_3d/.vscode/launch.json
+unsupervised_rock_detection_3d/Symposium/*
