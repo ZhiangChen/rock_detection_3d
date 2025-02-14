@@ -6,6 +6,8 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout,
 import open3d as o3d
 import numpy as np
 import laspy
+from scipy.spatial import cKDTree
+from scipy.interpolate import splprep, splev
 
 # Configure logging
 logging.basicConfig(
@@ -16,77 +18,164 @@ logging.basicConfig(
 class BasalPointAlgorithm:
     def __init__(self, pcd):
         self.pcd = pcd
+        self.vis = None
+        self.current_dense_points = []
 
-    def run(self, basal_points):
-        logging.debug("Starting vector-directed algorithm")
+    def visualize_progress(self, dense_points):
+        """Visualize the current progress of basal point estimation"""
+        logging.debug(f"Visualizing progress with {len(dense_points)} points")
+        
+        # Create colors array (grey for all points, red for dense points)
+        colors = np.full((len(self.pcd.points), 3), [0.5, 0.5, 0.5])
+        
+        # Find indices of dense points in the point cloud
+        points = np.asarray(self.pcd.points)
+        tree = cKDTree(points)
+        _, indices = tree.query(dense_points)
+        
+        # Color dense points red
+        colors[indices] = [1, 0, 0]
+        
+        # Update point cloud visualization
+        pcd_vis = o3d.geometry.PointCloud()
+        pcd_vis.points = o3d.utility.Vector3dVector(points)
+        pcd_vis.colors = o3d.utility.Vector3dVector(colors)
+        pcd_vis.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
+        )
+        
+        # Show the visualization
+        o3d.visualization.draw_geometries([pcd_vis])
+
+    def smooth_path(self, points, smoothing_factor=0.1):
+        """
+        Smooth the path using spline interpolation.
+        """
+        # Separate x, y, z coordinates
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        
+        # Fit the spline
+        tck, u = splprep([x, y, z], s=smoothing_factor)
+        
+        # Generate new points
+        new_points = np.array(splev(u, tck)).T
+        
+        return new_points
+
+    def run(self, basal_points, show_progress=False, close_loop=True):
+        """
+        Run the basal point estimation algorithm
+        
+        Args:
+            basal_points: Can be either indices into the point cloud or actual points
+            show_progress: Boolean to control visualization
+            close_loop: Boolean to control whether to close the loop between last and first point
+        """
+        logging.debug("Starting basal point estimation")
         points = np.asarray(self.pcd.points)
         dense_points = []
         visited_points = set()
-        num_points = len(basal_points)
+        
+        # Check if basal_points are actual points or indices
+        if isinstance(basal_points[0], (int, np.integer)):
+            # If they're indices, use them directly
+            basal_indices = basal_points
+            basal_points_coords = points[basal_indices]
+        else:
+            # If they're points, use them directly and create corresponding indices
+            basal_points_coords = np.array(basal_points)
+            # Find closest points in the point cloud for these coordinates
+            tree = cKDTree(points)
+            _, basal_indices = tree.query(basal_points_coords)
 
-        for i in range(num_points):
-            p1_idx = basal_points[i]
-            p2_idx = basal_points[(i + 1) % num_points]
-            p1 = points[p1_idx]
-            p2 = points[p2_idx]
+        num_points = len(basal_points_coords)
+        end_range = num_points if close_loop else num_points - 1
 
-            logging.debug(f"Processing basal point pair: {p1_idx} -> {p2_idx}")
+        MAX_STEP_SIZE = 0.1
+        MAX_ITERATIONS = 1000
+        MIN_PROGRESS = 0.01
+
+        for i in range(end_range):
+            p1 = basal_points_coords[i]
+            p2 = basal_points_coords[0] if (i == num_points - 1 and close_loop) else basal_points_coords[i + 1]
+            
+            pair_dense_points = []
+            logging.debug(f"Processing pair {i+1}/{num_points}")
 
             current_point = p1
-            dense_points.append(current_point)
+            if not dense_points or not np.allclose(current_point, dense_points[-1], atol=1e-3):
+                pair_dense_points.append(current_point)
             visited_points.add(tuple(current_point))
 
+            iteration_count = 0
+            initial_distance = np.linalg.norm(p2 - current_point)
+            previous_distance = initial_distance
+
             while not np.allclose(current_point, p2, atol=1e-3):
+                iteration_count += 1
+                if iteration_count > MAX_ITERATIONS:
+                    break
+
                 direction = p2 - current_point
                 distance_to_p2 = np.linalg.norm(direction)
-                direction /= distance_to_p2
 
+                if distance_to_p2 < 1e-6:
+                    break
+                
+                direction /= distance_to_p2
                 vectors = points - current_point
                 projections = np.dot(vectors, direction)
-                mask = (projections > 0) & (projections < distance_to_p2)
+                
+                mask = (projections > 0) & (projections < min(distance_to_p2, MAX_STEP_SIZE))
                 candidates = points[mask]
 
                 if len(candidates) == 0:
-                    logging.debug(
-                        "No candidates found in the direction. Breaking loop."
-                    )
                     break
 
-                distances = np.linalg.norm(candidates - current_point, axis=1)
-                sorted_indices = np.argsort(distances)
+                distances_to_target = np.linalg.norm(candidates - p2, axis=1)
+                distances_to_current = np.linalg.norm(candidates - current_point, axis=1)
+                
+                progress_mask = distances_to_target < (distance_to_p2 - MIN_PROGRESS)
+                if not any(progress_mask):
+                    break
+                    
+                candidates = candidates[progress_mask]
+                distances_to_current = distances_to_current[progress_mask]
+                
+                sorted_indices = np.argsort(distances_to_current)
 
                 for idx in sorted_indices:
                     next_point = candidates[idx]
                     if tuple(next_point) not in visited_points:
                         break
                 else:
-                    logging.debug("No unvisited points found. Breaking loop.")
                     break
 
-                if np.linalg.norm(next_point - current_point) < 1e-6:
-                    logging.debug(
-                        "Next point too close to current point. Breaking loop."
-                    )
+                new_distance = np.linalg.norm(next_point - p2)
+                if new_distance >= previous_distance:
                     break
+                previous_distance = new_distance
 
-                if np.allclose(next_point, p2, atol=1e-3):
-                    dense_points.append(p2)
-                    logging.debug(f"Reached target point: {p2}. Moving to next pair.")
-                    break
-
-                dense_points.append(next_point)
+                pair_dense_points.append(next_point)
                 visited_points.add(tuple(next_point))
                 current_point = next_point
 
-                if len(dense_points) >= 2000:
-                    logging.debug(f"Reached 2000 dense points. Stopping algorithm.")
-                    return np.array(dense_points)
+                # # Show progress if requested
+                # if show_progress and len(pair_dense_points) % 10 == 0:  # Update every 10 points
+                #     self.visualize_progress(np.array(dense_points + pair_dense_points))
 
-        logging.debug(
-            f"Vector-directed algorithm completed with {len(dense_points)} dense points"
-        )
-        # Save Basal information for testing purposes
-        np.save("basal_points_28.npy", np.array(dense_points))
+            if not np.allclose(current_point, p2, atol=1e-3):
+                pair_dense_points.append(p2)
+                
+            dense_points.extend(pair_dense_points)
+
+            # Show progress after completing each pair if requested
+            if show_progress:
+                self.visualize_progress(np.array(dense_points))
+
+        logging.debug(f"Found {len(dense_points)} dense points")
         return np.array(dense_points)
 
 
@@ -188,6 +277,8 @@ class BasalPointSelection(QMainWindow):
         )
         self.process.start()
         logging.debug("Points highlighted and visualization updated")
+    
+    
 
     @staticmethod
     def show_point_cloud(points, colors=None):
