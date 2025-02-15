@@ -59,7 +59,7 @@ class RegionGrowingSegmentation:
         self,
         pcd,
         downsample=True,
-        voxel_size=0.01,
+        voxel_size=0.02,
         num_neighbors=50,
         smoothness_threshold=0.99,
         distance_threshold=0.05,
@@ -76,12 +76,52 @@ class RegionGrowingSegmentation:
         """
         Initialize the region growing segmentation object.
         """
+        self.original_pcd = pcd  # Store the original point cloud
+        self.voxel_size = voxel_size
+        num_points = len(pcd.points)
+
+        # Validate seed indices
+        if rock_seeds is not None:
+            rock_seeds = [idx for idx in rock_seeds if 0 <= idx < num_points]
+            if not rock_seeds:
+                raise ValueError("No valid rock seeds provided")
+            print(f"Valid rock seeds: {rock_seeds}")
+
+        if pedestal_seeds is not None:
+            pedestal_seeds = [idx for idx in pedestal_seeds if 0 <= idx < num_points]
+            if not pedestal_seeds:
+                raise ValueError("No valid pedestal seeds provided")
+            print(f"Valid pedestal seeds: {pedestal_seeds}")
 
         if downsample:
-            print("Downsampling pointcloud")
-            self.pcd = pcd.voxel_down_sample(voxel_size)  # Downsample the point cloud
+            print(f"Points before downsampling: {len(self.original_pcd.points)}")
+            self.pcd = pcd.voxel_down_sample(voxel_size)
+            print(f"Points after downsampling: {len(self.pcd.points)}")
+            
+            # Transfer seeds to downsampled point cloud
+            if rock_seeds is not None or pedestal_seeds is not None:
+                print("Transferring seeds to downsampled point cloud")
+                dense_points = np.asarray(self.original_pcd.points)
+                sparse_points = np.asarray(self.pcd.points)
+                
+                # Find nearest neighbors in downsampled point cloud
+                nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(sparse_points)
+                
+                if rock_seeds is not None:
+                    dense_rock_points = dense_points[rock_seeds]
+                    _, rock_indices = nbrs.kneighbors(dense_rock_points)
+                    self.rock_seeds = rock_indices.flatten()
+                    print(f"Transferred {len(rock_seeds)} rock seeds")
+                
+                if pedestal_seeds is not None:
+                    dense_pedestal_points = dense_points[pedestal_seeds]
+                    _, pedestal_indices = nbrs.kneighbors(dense_pedestal_points)
+                    self.pedestal_seeds = pedestal_indices.flatten()
+                    print(f"Transferred {len(pedestal_seeds)} pedestal seeds")
         else:
-            self.pcd = pcd  # No downsampling
+            self.pcd = pcd
+            self.rock_seeds = rock_seeds
+            self.pedestal_seeds = pedestal_seeds
 
         # Estimate normals
         radius_normal = voxel_size * 5
@@ -99,8 +139,6 @@ class RegionGrowingSegmentation:
         self.curvature_threshold = curvature_threshold
         self.use_smoothness = use_smoothness
         self.use_curvature = use_curvature
-        self.rock_seeds = rock_seeds
-        self.pedestal_seeds = pedestal_seeds
         self.basal_points = basal_points
         self.basal_proximity_threshold = basal_proximity_threshold
         self.basal_proximity_check = (
@@ -109,7 +147,8 @@ class RegionGrowingSegmentation:
         self.stepwise_visualize = stepwise_visualize
 
         self.labels = np.array([-1] * len(self.pcd.points))
-        print(len(self.labels), "points after downsampling")  # -1 indicates unlabeled
+        print(f"Points before downsampling: {len(self.original_pcd.points)}")
+        print(f"Points after downsampling: {len(self.labels)}")  # -1 indicates unlabeled
         self.normals = np.asarray(self.pcd.normals)
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
         print("Performing region growing with", self.smoothness_threshold, "smoothness threshold", self.curvature_threshold, "curvature threshold") 
@@ -296,7 +335,6 @@ class RegionGrowingSegmentation:
         """
         Perform the full region growing segmentation.
         """
-
         if self.rock_seeds is None or self.pedestal_seeds is None:
             # Auto-select seeds if not provided
             points = np.asarray(self.pcd.points)
@@ -321,6 +359,19 @@ class RegionGrowingSegmentation:
         self.grow_region(self.rock_seeds, region_index=1, neighbors=neighbors)
         self.grow_region(self.pedestal_seeds, region_index=0, neighbors=neighbors)
 
+        # Transfer labels back to original dense point cloud if downsampling was used
+        if hasattr(self, 'original_pcd'):
+            print("Transferring labels to dense point cloud")
+            self.labels = self.transfer_labels_to_dense(
+                self.original_pcd, 
+                self.pcd, 
+                self.labels
+            )
+            # Update the point cloud and KD-tree to use the original dense point cloud
+            self.pcd = self.original_pcd
+            self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+            return self.pcd, self.labels
+        
         return self.pcd, self.labels
 
     def color_point_cloud(self):
@@ -355,6 +406,8 @@ class RegionGrowingSegmentation:
         tree = self.pcd_tree
 
         unlabeled_indices = np.where(self.labels == -1)[0]
+        print(f"Starting label propagation with {len(unlabeled_indices)} unlabeled points")
+        
         # Perform label propagation until no more points are labeled
         unchanged_iterations = 0
         prev_unlabeled_count = len(unlabeled_indices)
@@ -375,6 +428,8 @@ class RegionGrowingSegmentation:
             unlabeled_indices = np.where(self.labels == -1)[0]
             current_unlabeled_count = len(unlabeled_indices)
 
+            print(f"Unlabeled points remaining: {current_unlabeled_count}")
+
             # Check for convergence
             if current_unlabeled_count == prev_unlabeled_count:
                 unchanged_iterations += 1
@@ -393,15 +448,28 @@ class RegionGrowingSegmentation:
         """
         Transfer labels from a sparse point cloud to a dense point cloud.
         """
+        print(f"Transferring labels from {len(sparse_labels)} points to {len(dense_pcd.points)} points")
         dense_points = np.asarray(dense_pcd.points)
         sparse_points = np.asarray(sparse_pcd.points)
+
+        # Initialize labels array with the correct size
+        dense_labels = np.full(len(dense_points), -1, dtype=np.int32)
 
         # Find the nearest neighbor in the sparse point cloud for each point in the dense point cloud
         nbrs = NearestNeighbors(n_neighbors=1, algorithm="auto").fit(sparse_points)
         distances, indices = nbrs.kneighbors(dense_points)
 
+        # Transfer labels
         dense_labels = sparse_labels[indices.flatten()]
-
+        
+        # Verify the sizes match
+        assert len(dense_labels) == len(dense_points), (
+            f"Label transfer mismatch: {len(dense_labels)} labels for {len(dense_points)} points"
+        )
+        
+        print(f"Label transfer complete. Dense points: {len(dense_points)}, Labels: {len(dense_labels)}")
+        print(f"Unique labels: {np.unique(dense_labels)}")
+        
         return dense_labels
 
     def evaluate_segmentation_performance(self, ground_truth_labels, predicted_labels):
