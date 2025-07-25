@@ -64,14 +64,34 @@ class BasalPointAlgorithm:
         
         return new_points
 
-    def run(self, basal_points, show_progress=False, close_loop=True):
+    def smooth_with_moving_average(self, points, window_size=5):
         """
-        Run the basal point estimation algorithm
+        Smooth the path using a moving average filter.
         
         Args:
-            basal_points: Can be either indices into the point cloud or actual points
-            show_progress: Boolean to control visualization
-            close_loop: Boolean to control whether to close the loop between last and first point
+            points: Array of points to smooth.
+            window_size: Number of neighboring points to include in the moving average.
+        
+        Returns:
+            Smoothed points as a numpy array.
+        """
+        smoothed_points = np.copy(points)
+        for i in range(len(points)):
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(points), i + window_size // 2 + 1)
+            smoothed_points[i] = np.mean(points[start_idx:end_idx], axis=0)
+        return smoothed_points
+
+    def run(self, basal_points, show_progress=False, close_loop=True, smoothing_factor=0.2, window_size=5):
+        """
+        Run the basal point estimation algorithm and smooth the resulting dense points.
+        
+        Args:
+            basal_points: Can be either indices into the point cloud or actual points.
+            show_progress: Boolean to control visualization.
+            close_loop: Boolean to control whether to close the loop between last and first point.
+            smoothing_factor: Smoothing factor for spline interpolation (default: 0.1).
+            window_size: Window size for moving average smoothing (default: 5).
         """
         logging.debug("Starting basal point estimation")
         points = np.asarray(self.pcd.points)
@@ -175,7 +195,17 @@ class BasalPointAlgorithm:
             if show_progress:
                 self.visualize_progress(np.array(dense_points))
 
-        logging.debug(f"Found {len(dense_points)} dense points")
+        # Smooth the dense points using spline interpolation
+        # if len(dense_points) > 2:  # Ensure there are enough points for smoothing
+        #     dense_points = self.smooth_path(np.array(dense_points), smoothing_factor)
+        #     logging.debug(f"Smoothed dense points with spline smoothing factor {smoothing_factor}")
+
+        # # Further smooth the dense points using a moving average filter
+        # if len(dense_points) > window_size:
+        #     dense_points = self.smooth_with_moving_average(dense_points, window_size)
+        #     logging.debug(f"Smoothed dense points with moving average (window size {window_size})")
+
+        # logging.debug(f"Found {len(dense_points)} dense points after smoothing")
         return np.array(dense_points)
 
 

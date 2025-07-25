@@ -9,6 +9,10 @@ from geomdl import utilities
 from scipy.spatial import cKDTree
 import traceback
 import os
+from sklearn.cluster import DBSCAN
+# import pymeshlab
+
+from visualization import PointCloudVisualization
 
 class MeshProcessor:
     """
@@ -20,25 +24,118 @@ class MeshProcessor:
         self.temp_mesh_path = None
         self.reconstructed_mesh = None
 
+    def clean_outliers_dbscan(self, pcd: o3d.geometry.PointCloud, 
+                             eps: float = 0.05, 
+                             min_samples: int = 50,
+                             return_inlier_indices: bool = False) -> Union[o3d.geometry.PointCloud, Tuple[o3d.geometry.PointCloud, np.ndarray]]:
+        """
+        Remove outliers using DBSCAN clustering algorithm.
+        
+        Args:
+            pcd: Input point cloud
+            eps: Maximum distance between points in the same cluster
+            min_samples: Minimum number of points to form a dense region
+            return_inlier_indices: Whether to return indices of inlier points
+            
+        Returns:
+            Cleaned point cloud and optionally indices of inlier points
+        """
+        try:
+            logging.info("Removing outliers using DBSCAN clustering...")
+            points = np.asarray(pcd.points)
+            
+            # Skip if too few points
+            if len(points) < min_samples:
+                logging.warning(f"Too few points ({len(points)}) to perform DBSCAN. Skipping outlier removal.")
+                if return_inlier_indices:
+                    return pcd, np.arange(len(points))
+                return pcd
+                
+            # Apply DBSCAN clustering
+            db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit(points)
+            labels = db.labels_
+            
+            # Count points in each cluster (including noise as -1)
+            unique_labels, counts = np.unique(labels, return_counts=True)
+            cluster_count = len(unique_labels) - (1 if -1 in unique_labels else 0)
+            logging.info(f"DBSCAN found {cluster_count} clusters")
+            
+            if -1 in unique_labels:
+                noise_idx = np.where(unique_labels == -1)[0][0]
+                noise_count = counts[noise_idx]
+                outlier_percentage = noise_count/len(points)*100
+                logging.info(f"DBSCAN identified {noise_count} outliers ({outlier_percentage:.2f}% of points)")
+                
+                # Add more detailed information about the outlier detection
+                if outlier_percentage < 0.5:
+                    logging.warning("Very few outliers detected (<0.5%). Consider using more aggressive parameters.")
+            else:
+                logging.warning("No outliers identified. All points belong to clusters.")
+                logging.info("Try decreasing 'eps' or increasing 'min_samples' for more aggressive outlier removal.")
+            
+            # Check if too many points would be removed (>50%)
+            if np.sum(labels == -1) > len(points) * 0.7:
+                logging.warning("DBSCAN would remove >50% of points. Adjusting parameters...")
+                # Try with more lenient parameters
+                return self.clean_outliers_dbscan(pcd, eps=eps*1.5, min_samples=max(5, min_samples//2), 
+                                                return_inlier_indices=return_inlier_indices)
+            
+            # Get indices of inlier points (not labeled as noise)
+            inlier_indices = np.where(labels != -1)[0]
+            
+            # Create cleaned point cloud
+            cleaned_pcd = o3d.geometry.PointCloud()
+            cleaned_pcd.points = o3d.utility.Vector3dVector(points[inlier_indices])
+            
+            # Copy colors and normals if they exist
+            if pcd.has_colors():
+                cleaned_pcd.colors = o3d.utility.Vector3dVector(np.asarray(pcd.colors)[inlier_indices])
+            
+            if pcd.has_normals():
+                cleaned_pcd.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals)[inlier_indices])
+            
+            logging.info(f"Removed {len(points) - len(inlier_indices)} outliers. Kept {len(inlier_indices)} points.")
+            
+            if return_inlier_indices:
+                return cleaned_pcd, inlier_indices
+            return cleaned_pcd
+            
+        except Exception as e:
+            logging.error(f"Error in DBSCAN outlier removal: {str(e)}\n{traceback.format_exc()}")
+            logging.warning("Continuing with original point cloud without outlier removal")
+            if return_inlier_indices:
+                return pcd, np.arange(len(points))
+            return pcd
+
     def reconstruct_mesh(self, pcd: o3d.geometry.PointCloud, labels: np.ndarray, 
-                        basal_points: np.ndarray, dense_basal_parts: list = None, degree_u: int = 3, degree_v: int = 3,
-                        control_points_u: int = 12, control_points_v: int = 12) -> o3d.geometry.TriangleMesh:
+                        basal_points: np.ndarray, dense_basal_parts: list = None, 
+                        dense_basal_parts_is_lateral: list = None, degree_u: int = 4, degree_v: int = 4,
+                        control_points_u: int = 5, control_points_v: int = 5, use_dbscan_cleaning: bool = False,
+                        depth: int = 8, debug_mode: bool = False, 
+                        intermediate_visualization: bool = False) -> o3d.geometry.TriangleMesh:
         """
         Reconstructs a 3D mesh from the segmented point cloud.
         Process:
         1. Filters points to keep rock and basal points
-        2. Generates bottom face using NURBS interpolation
-        3. Performs Poisson reconstruction
+        2. Optionally removes outliers using DBSCAN
+        3. Generates bottom face using NURBS interpolation
+        4. Performs Poisson reconstruction (Open3D or PyMeshLab)
         
         Args:
             pcd: Open3D PointCloud object
             labels: Array of point labels (0 for pedestal, 1 for rock)
             basal_points: Array of basal point indices or boolean mask
+            dense_basal_parts: List of dense basal parts
+            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral
             degree_u, degree_v: Degrees for NURBS surface
             control_points_u, control_points_v: Number of control points for NURBS surface
+            use_dbscan_cleaning: Whether to use DBSCAN for outlier removal
+            depth: The maximum depth of the octree used for Poisson reconstruction
+            debug_mode: Whether to show debug visualizations (for test scripts)
+            intermediate_visualization: Whether to show intermediate visualization and return early
             
         Returns:
-            o3d.geometry.TriangleMesh: Reconstructed mesh
+            o3d.geometry.TriangleMesh: Reconstructed mesh, or tuple if intermediate_visualization is True
         """
         try:
             # Get the points and labels
@@ -66,15 +163,48 @@ class MeshProcessor:
             filtered_pcd.points = o3d.utility.Vector3dVector(filtered_points)
             filtered_pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
 
-            # Get indices for basal points in filtered point cloud
-            basal_indices = np.where(basal_mask[filtered_indices])[0]
-            rock_indices = np.where(rock_points[filtered_indices])[0]
+            # Clean outliers using DBSCAN clustering if enabled
+            if use_dbscan_cleaning:
+                filtered_pcd, inlier_indices = self.clean_outliers_dbscan(
+                    filtered_pcd, 
+                    eps=0.05,  # Adjust based on point cloud density
+                    min_samples=10,
+                    return_inlier_indices=True
+                )
+                
+                # Update indices for basal points in clean point cloud
+                if len(inlier_indices) < len(filtered_points):
+                    # Create a mapping from original indices to new indices
+                    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(inlier_indices)}
+                    
+                    # Get indices for basal points in filtered point cloud
+                    basal_indices_in_filtered = np.where(basal_mask[filtered_indices])[0]
+                    
+                    # Map to new indices in cleaned point cloud
+                    basal_indices = np.array([old_to_new[idx] for idx in basal_indices_in_filtered 
+                                            if idx in old_to_new])
+                    
+                    # Get indices for rock points in filtered point cloud
+                    rock_indices_in_filtered = np.where(rock_points[filtered_indices])[0]
+                    
+                    # Map to new indices in cleaned point cloud
+                    rock_indices = np.array([old_to_new[idx] for idx in rock_indices_in_filtered 
+                                        if idx in old_to_new])
+                else:
+                    # Get indices for basal points in filtered point cloud
+                    basal_indices = np.where(basal_mask[filtered_indices])[0]
+                    rock_indices = np.where(rock_points[filtered_indices])[0]
+            else:
+                # Skip DBSCAN cleaning, just use the filtered indices directly
+                basal_indices = np.where(basal_mask[filtered_indices])[0]
+                rock_indices = np.where(rock_points[filtered_indices])[0]
 
             # Generate bottom face points
             bottom_points = self.generate_bottom_face_points(
                 filtered_pcd,
                 basal_indices,
                 dense_basal_parts=dense_basal_parts,
+                dense_basal_parts_is_lateral=dense_basal_parts_is_lateral,
                 degree_u=degree_u,
                 degree_v=degree_v,
                 control_points_u=control_points_u,
@@ -93,16 +223,77 @@ class MeshProcessor:
             rock_pcd.estimate_normals(
                 search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
             )
-            rock_pcd.orient_normals_consistent_tangent_plane(100)
+            rock_pcd.orient_normals_consistent_tangent_plane(100, 10)
             
             # Process bottom points
             bottom_pcd = o3d.geometry.PointCloud()
             bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points)
+
+            # # Add a small gap by moving bottom points down
+            # bottom_points_array = np.asarray(bottom_pcd.points)
+            # gap_size = 0.02  # Adjust gap size (meters)
+            # bottom_points_array[:, 2] -= gap_size  # Shift Z coordinates down
+            # bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points_array)
+            
             bottom_pcd.estimate_normals(
                 search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
             )
-            bottom_pcd.orient_normals_consistent_tangent_plane(100)
             
+            # Reorient normals for rock_pcd
+            logging.info("Reorienting normals for rock_pcd...")
+            rock_center = rock_pcd.get_center()
+            rock_points = np.asarray(rock_pcd.points)
+            rock_normals = np.asarray(rock_pcd.normals)
+            rock_directions = rock_points - rock_center
+            rock_directions = rock_directions / np.linalg.norm(rock_directions, axis=1)[:, np.newaxis]
+            rock_dots = np.sum(rock_directions * rock_normals, axis=1)
+            rock_normals[rock_dots < 0] = -rock_normals[rock_dots < 0]
+            rock_pcd.normals = o3d.utility.Vector3dVector(rock_normals)
+
+            # Reorient normals for bottom_pcd
+            logging.info("Reorienting normals for bottom_pcd...")
+            bottom_center = bottom_pcd.get_center()
+            bottom_points = np.asarray(bottom_pcd.points)
+            bottom_normals = np.asarray(bottom_pcd.normals)
+            bottom_directions = bottom_points - bottom_center
+            bottom_directions = bottom_directions / np.linalg.norm(bottom_directions, axis=1)[:, np.newaxis]
+            bottom_dots = np.sum(bottom_directions * bottom_normals, axis=1)
+            bottom_normals[bottom_dots < 0] = -bottom_normals[bottom_dots < 0]
+            bottom_pcd.normals = o3d.utility.Vector3dVector(bottom_normals)
+            bottom_pcd.orient_normals_consistent_tangent_plane(100, 10)
+
+            # Visualize the rock points with bottom face points before SOR filter (only in debug mode)
+            if debug_mode:
+                logging.info("Visualizing rock points with bottom face points before SOR filter...")
+                visualizer = PointCloudVisualization()
+                combined_points_pre_sor = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
+                combined_colors_pre_sor = np.vstack((
+                    np.full((len(np.asarray(rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
+                    np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
+                ))
+                visualizer.show_point_cloud(combined_points_pre_sor, combined_colors_pre_sor, "Before SOR Filter")
+
+            # Apply SOR filter to the rock points
+            logging.info("Applying SOR filter to rock points...")
+            rock_pcd, inlier_indices = rock_pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.0)
+
+            # Visualize the rock points with bottom face points after SOR filter
+            logging.info("Visualizing rock points with bottom face points after SOR filter...")
+            combined_points_post_sor = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
+            combined_colors_post_sor = np.vstack((
+                np.full((len(np.asarray(rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
+                np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
+            ))
+            
+            # If intermediate visualization is requested, show it and return the prepared data
+            if intermediate_visualization:
+                if debug_mode:
+                    # Only show visualization directly in debug mode (test scripts)
+                    visualizer = PointCloudVisualization()
+                    visualizer.show_point_cloud(combined_points_post_sor, combined_colors_post_sor, "After SOR Filter")
+                # Return the prepared point clouds for final reconstruction
+                return (rock_pcd, bottom_pcd, combined_points_post_sor, combined_colors_post_sor)
+
             # Combine points and normals
             combined_points = np.vstack((
                 np.asarray(rock_pcd.points),
@@ -112,37 +303,36 @@ class MeshProcessor:
                 np.asarray(rock_pcd.normals),
                 np.asarray(bottom_pcd.normals)
             ))
-            
+
             # Create final point cloud
             new_pcd = o3d.geometry.PointCloud()
             new_pcd.points = o3d.utility.Vector3dVector(combined_points)
             new_pcd.normals = o3d.utility.Vector3dVector(combined_normals)
-            
-            # Orient normals consistently
-            new_pcd.orient_normals_consistent_tangent_plane(100)
-            
-            # Ensure normals point outward
-            center = new_pcd.get_center()
-            new_pcd.orient_normals_towards_camera_location(center)
-            new_pcd.normals = o3d.utility.Vector3dVector(-np.asarray(new_pcd.normals))
-            
+
             # Color the points
             new_pcd.paint_uniform_color([1, 0, 0])
-            # Reconstruct mesh with improved parameters
+
+            logging.info("Using Open3D Poisson reconstruction...")
             self.reconstructed_mesh = self.poisson_reconstruction(
                 new_pcd,
-                depth=9,        # Increased depth for better detail
-                width=0.05,     # Added density filtering
-                scale=1.1,      # Slightly larger scale
-                linear_fit=True # Enable linear fit for better results
+                depth=depth,        # Use the provided depth parameter
+                width=0.0,          # Added density filtering
+                scale=1.5,          # Slightly larger scale
+                linear_fit=False    # Use False as in the test file
             )
             
+            # Post-process the mesh (only if using Open3D, PyMeshLab method already does this)
+            self.reconstructed_mesh.remove_degenerate_triangles()
+            self.reconstructed_mesh.remove_duplicated_triangles()
+            self.reconstructed_mesh.remove_duplicated_vertices()
+            self.reconstructed_mesh.remove_non_manifold_edges()
+        
             # Save temporary mesh for visualization
             with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as temp_file:
                 self.temp_mesh_path = temp_file.name
             o3d.io.write_triangle_mesh(self.temp_mesh_path, self.reconstructed_mesh)
 
-            return self.reconstructed_mesh
+            return self.reconstructed_mesh, new_pcd
 
         except Exception as e:
             logging.error(f"Error in mesh reconstruction: {str(e)}")
@@ -155,33 +345,28 @@ class MeshProcessor:
                              scale: float = 1.1,
                              linear_fit: bool = False) -> o3d.geometry.TriangleMesh:
         """
-        Performs Poisson surface reconstruction on the point cloud with improved robustness.
-        
-        Args:
-            pcd: Open3D PointCloud object
-            depth: Octree depth, controls the resolution. Higher values give finer details but more noise
-            width: Width parameter for density filtering
-            scale: Scale factor for reconstruction
-            linear_fit: Whether to use linear fit
-            
-        Returns:
-            o3d.geometry.TriangleMesh: Reconstructed mesh
+        Performs Poisson surface reconstruction with improved edge handling.
         """
         try:
-            # cleaned_pcd, _ = pcd.remove_statistical_outlier(
-            #     nb_neighbors=20,
-            #     std_ratio=2.0
-            # )
-            
-            mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-               pcd, depth=8, linear_fit=False)
+            # Ensure we have enough points for reconstruction
+            if len(pcd.points) < 100:
+                raise ValueError("Not enough points for reconstruction")
 
-            
-            # # Clean up the mesh
-            # mesh.remove_degenerate_triangles()
-            # mesh.remove_duplicated_triangles()
-            # mesh.remove_duplicated_vertices()
-            # mesh.remove_non_manifold_edges()
+            # Perform Poisson reconstruction with optimized parameters
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd,
+                depth=depth,          # Keep depth high for detail
+                width=width,          
+                scale=scale,          # Slightly larger scale to ensure closure
+                linear_fit=linear_fit
+            )
+
+            # Clean up mesh
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_duplicated_vertices()
+            mesh.remove_non_manifold_edges()
+
             return mesh
 
         except Exception as e:
@@ -191,6 +376,7 @@ class MeshProcessor:
     def generate_bottom_face_points(self, pcd: o3d.geometry.PointCloud, 
                                   basal_indices: np.ndarray,
                                   dense_basal_parts: list = None,
+                                  dense_basal_parts_is_lateral: list = None,
                                   degree_u: int = 3, 
                                   degree_v: int = 3,
                                   control_points_u: int = 10,
@@ -201,9 +387,10 @@ class MeshProcessor:
         Args:
             pcd: Open3D PointCloud object
             basal_indices: Array of indices for basal points
+            dense_basal_parts: List of dense basal parts
+            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral
             degree_u, degree_v: Degrees for NURBS surface
             control_points_u, control_points_v: Number of control points
-            multi_part_data: Dictionary containing data for multiple parts
             
         Returns:
             np.ndarray: Generated bottom face points
@@ -216,6 +403,7 @@ class MeshProcessor:
                 return self._generate_multi_part_faces(
                     pcd, 
                     dense_basal_parts,
+                    dense_basal_parts_is_lateral,
                     degree_u, 
                     degree_v,
                     control_points_u,
@@ -237,6 +425,7 @@ class MeshProcessor:
 
     def _generate_multi_part_faces(self, pcd: o3d.geometry.PointCloud,
                                  dense_basal_parts: list,
+                                 dense_basal_parts_is_lateral: list,
                                  degree_u: int,
                                  degree_v: int,
                                  control_points_u: int,
@@ -247,6 +436,7 @@ class MeshProcessor:
         Args:
             pcd: Open3D PointCloud object
             dense_basal_parts: List of dense basal points for each part
+            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral
             degree_u, degree_v: Degrees for NURBS surface
             control_points_u, control_points_v: Number of control points
             
@@ -273,7 +463,9 @@ class MeshProcessor:
             ]
             
             for i, dense_points in enumerate(dense_basal_parts):
-                logging.info(f"Processing dense part {i+1}/{len(dense_basal_parts)}")
+                is_lateral = dense_basal_parts_is_lateral[i] if dense_basal_parts_is_lateral and i < len(dense_basal_parts_is_lateral) else False
+                part_type = "lateral" if is_lateral else "basal"
+                logging.info(f"Processing dense part {i+1}/{len(dense_basal_parts)} ({part_type})")
                 try:
                     # Adjust control points based on part size
                     part_size = len(dense_points)
@@ -467,28 +659,7 @@ class MeshProcessor:
                 # Transform points back to original coordinate system
                 surface_points = surface_points + center
                 
-                # Ensure connection with basal points
-                surface_points = self._ensure_boundary_connection(surface_points, basal_points)
-                
-                # Add additional points near the boundary
-                tree = cKDTree(basal_points)
-                boundary_points = []
-                
-                for basal_point in basal_points:
-                    # Add points slightly inward from each basal point
-                    inward_vector = center - basal_point
-                    inward_vector = inward_vector / np.linalg.norm(inward_vector)
-                    
-                    # Add multiple points at different distances
-                    for d in [0.02, 0.1]:  # Adjust these distances as needed
-                        new_point = basal_point + inward_vector * d
-                        boundary_points.append(new_point)
-                
-                # Combine all points
-                all_points = np.vstack((surface_points, boundary_points))
-                
-                logging.info(f"Generated {len(all_points)} total points for the bottom face")
-                return all_points
+                return surface_points
                 
             except Exception as e:
                 logging.error(f"Error in surface generation: {str(e)}")
@@ -527,8 +698,7 @@ class MeshProcessor:
             logging.error(f"Error saving mesh: {str(e)}")
             raise
 
-    @staticmethod
-    def _ensure_boundary_connection(surface_points: np.ndarray,
+    def _ensure_boundary_connection(self, surface_points: np.ndarray,
                                   basal_points: np.ndarray,
                                   connection_threshold: float = 0.1) -> np.ndarray:
         """
@@ -549,36 +719,31 @@ class MeshProcessor:
             surface_tree = cKDTree(surface_points)
             
             # Find nearest surface points for each basal point
-            distances, indices = surface_tree.query(basal_points, k=1)
+            distances, indices = surface_tree.query(basal_points, k=5)  # Increased k for smoother transition
             
-            # Identify gaps where surface points are too far from basal points
-            gaps = distances > connection_threshold
-            
-            if np.any(gaps):
-                logging.debug(f"Found {np.sum(gaps)} gaps to fill")
-                gap_points = []
+            # Create transition points
+            transition_points = []
+            for i, basal_point in enumerate(basal_points):
+                # Get nearest surface points
+                nearest_points = surface_points[indices[i]]
+                weights = 1.0 / (distances[i] + 1e-6)
+                weights = weights / np.sum(weights)
                 
-                for basal_point, surface_idx, has_gap in zip(basal_points, indices, gaps):
-                    if has_gap:
-                        surface_point = surface_points[surface_idx]
-                        
-                        # Create intermediate points to fill the gap
-                        num_intermediate = 3  # Number of intermediate points
-                        for t in np.linspace(0, 1, num_intermediate + 2)[1:-1]:
-                            intermediate_point = basal_point * (1 - t) + surface_point * t
-                            gap_points.append(intermediate_point)
-                
-                # Add gap-filling points to surface points
-                if gap_points:
-                    surface_points = np.vstack((surface_points, gap_points))
-                    logging.debug(f"Added {len(gap_points)} connection points")
-            
-            # Ensure all basal points are included
-            surface_points = np.vstack((surface_points, basal_points))
-            logging.debug("Successfully connected surface to basal points")
-            
+                # Create gradient of points from basal to surface
+                for t in np.linspace(0, 1, 5):
+                    # Weighted interpolation
+                    weighted_surface_point = np.sum(nearest_points * weights[:, np.newaxis], axis=0)
+                    interpolated = basal_point * (1 - t) + weighted_surface_point * t
+                    transition_points.append(interpolated)
+
+            # Combine all points
+            if transition_points:
+                surface_points = np.vstack((surface_points, transition_points, basal_points))
+            else:
+                surface_points = np.vstack((surface_points, basal_points))
+
             return surface_points
+
         except Exception as e:
-            logging.error(f"Error in boundary connection: {str(e)}\n{traceback.format_exc()}")
-            # If there's an error, return the original surface points
-            return surface_points
+            logging.error(f"Error in boundary connection: {str(e)}")
+            return np.vstack((surface_points, basal_points))
