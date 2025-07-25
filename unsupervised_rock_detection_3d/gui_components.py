@@ -29,6 +29,7 @@ class GUIComponents:
         
     def initialize_components(self):
         """Initialize all GUI components but keep them hidden initially."""
+        logging.debug("Initializing GUI components")
 
         # Instructions label
         self.instructions_label = QLabel("")
@@ -64,12 +65,23 @@ class GUIComponents:
         self.run_button = self._create_button("Run Region Growing", visible=False)
         self.rerun_region_growing_button = self._create_button("Rerun Region Growing with Different Parameters", visible=False)
         self.save_pcd_button = self._create_button("Save Point Cloud", visible=False)
+        self.remove_noise_button = self._create_button("Remove Noise", visible=False)
+        self.undo_remove_noise_button = self._create_button("Undo Remove Noise", visible=False)  # Add new button
         self.reconstruct_mesh_button = self._create_button("Reconstruct Mesh", visible=False)
         self.save_mesh_button = self._create_button("Save Mesh", visible=False)
         self.compute_geometric_analysis_button = self._create_button("Compute Geometric Properties", visible=False)
         self.jump_to_basal_button = self._create_button("Jump to Basal Line Selection", visible=False)
         self.restart_button = self._create_button("Restart", visible=False)
 
+        # Add database-related buttons
+        self.load_database_button = self._create_button("Load Database")
+        self.next_pbr_button = self._create_button("Process Next PBR", visible=False)
+        
+        # Modify layout to show initial options
+        self.load_button.setText("Load Single LAS File")
+        self.load_button.setEnabled(True)  # Ensure the button is enabled
+        self.load_database_button.setEnabled(True)  # Ensure the button is enabled
+        self.show_buttons(['load_database_button', 'load_button'])
         
         # Set the layout for the parent widget
         self.parent.setLayout(self.layout)
@@ -81,7 +93,7 @@ class GUIComponents:
         button.setEnabled(enabled)
         self.layout.addWidget(button)
         return button
-        
+
     def _setup_sliders(self):
         """Set up the parameter adjustment sliders."""
         # Slider descriptions
@@ -173,6 +185,7 @@ class GUIComponents:
     def connect_button(self, button_name: str, callback):
         """Connect a button to its callback function."""
         if hasattr(self, button_name):
-            getattr(self, button_name).clicked.connect(callback)
+            button = getattr(self, button_name)
+            button.clicked.connect(callback)
         else:
             logging.warning(f"Button {button_name} not found")

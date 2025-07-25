@@ -411,6 +411,7 @@ class RegionGrowingSegmentation:
         # Perform label propagation until no more points are labeled
         unchanged_iterations = 0
         prev_unlabeled_count = len(unlabeled_indices)
+        points_processed = 0
 
         while len(unlabeled_indices) > 0:
             for index in unlabeled_indices:
@@ -424,6 +425,12 @@ class RegionGrowingSegmentation:
                 if len(labeled_neighbors) > 0:
                     # Assign the most common label among the neighbors
                     self.labels[index] = np.bincount(labeled_neighbors).argmax()
+                    points_processed += 1
+
+                    if self.stepwise_visualize and points_processed % 10 == 0:
+                        print(f"Label propagation: processed {points_processed} points")
+                        colored_pcd = self.color_point_cloud()
+                        o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
 
             unlabeled_indices = np.where(self.labels == -1)[0]
             current_unlabeled_count = len(unlabeled_indices)
@@ -441,6 +448,11 @@ class RegionGrowingSegmentation:
                 break
 
             prev_unlabeled_count = current_unlabeled_count
+
+            if self.stepwise_visualize:
+                print(f"Label propagation iteration complete. {current_unlabeled_count} unlabeled points remaining.")
+                colored_pcd = self.color_point_cloud()
+                o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
 
         return self.labels
 
@@ -573,9 +585,9 @@ def main():
     sparse_pcd, sparse_labels = segmenter.segment()
 
     print("Postprocessing the segmentation...")
-    segmenter.conditional_label_propagation()
+    segmenter.conditional_label_propagation(args.distance_threshold)
 
-    sparse_labels[sparse_labels == -1] = 1
+    sparse_labels[sparse_labels == -1] = 0
 
     colored_sparse_pcd = segmenter.color_point_cloud()
 

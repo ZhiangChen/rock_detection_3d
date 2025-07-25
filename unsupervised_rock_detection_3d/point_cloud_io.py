@@ -17,8 +17,23 @@ class PointCloudFileHandler:
         self.y_mean = 0
         self.z_mean = 0
 
+    def get_epsg_code(self, las_file_path: Union[str, Path]) -> Optional[int]:
+        """Get EPSG code from LAS/LAZ file."""
+        try:
+            pc = laspy.read(las_file_path)
+            crs = pc.header.parse_crs()
+            if crs is None:
+                # logging.warning(f"No CRS information found in {las_file_path}")
+                return None
+            epsg = crs.to_epsg()
+            logging.info(f"Found EPSG code: {epsg}")
+            return epsg
+        except Exception as e:
+            logging.error(f"Error getting EPSG code: {e}")
+            return None
+
     def load_las_as_open3d_point_cloud(self, las_file_path: Union[str, Path], 
-                                     evaluate: bool = False) -> Tuple[o3d.geometry.PointCloud, Optional[np.ndarray]]:
+                                     evaluate: bool = False) -> Tuple[o3d.geometry.PointCloud, Optional[np.ndarray], Optional[int]]:
         """
         Load a LAS/LAZ file and convert it to an Open3D point cloud.
         
@@ -27,7 +42,7 @@ class PointCloudFileHandler:
             evaluate: Boolean indicating if ground truth labels should be loaded
             
         Returns:
-            tuple: (Open3D PointCloud object, ground truth labels if available)
+            tuple: (Open3D PointCloud object, ground truth labels if available, EPSG code if available)
         """
         try:
             # Read LAS/LAZ file using laspy
@@ -49,9 +64,25 @@ class PointCloudFileHandler:
 
             # Check if RGB color information is available in the LAS file
             if all(dim in pc.point_format.dimension_names for dim in ["red", "green", "blue"]):
-                r = np.uint8(pc.red / 65535.0 * 255)
-                g = np.uint8(pc.green / 65535.0 * 255)
-                b = np.uint8(pc.blue / 65535.0 * 255)
+                # Auto-detect color range: 16-bit (0-65535) or 8-bit (0-255)
+                red_max = pc.red.max()
+                green_max = pc.green.max()
+                blue_max = pc.blue.max()
+                color_max = max(red_max, green_max, blue_max)
+                
+                if color_max <= 255:
+                    # 8-bit colors (0-255 range)
+                    r = np.uint8(pc.red)
+                    g = np.uint8(pc.green)
+                    b = np.uint8(pc.blue)
+                    logging.info(f"Detected 8-bit color range (max={color_max})")
+                else:
+                    # 16-bit colors (0-65535 range) - normalize to 8-bit
+                    r = np.uint8(pc.red / 65535.0 * 255)
+                    g = np.uint8(pc.green / 65535.0 * 255)
+                    b = np.uint8(pc.blue / 65535.0 * 255)
+                    logging.info(f"Detected 16-bit color range (max={color_max}), normalizing to 8-bit")
+                
                 rgb = np.vstack((r, g, b)).transpose() / 255.0
             else:
                 rgb = np.zeros((len(x), 3))
@@ -61,7 +92,8 @@ class PointCloudFileHandler:
             pcd.points = o3d.utility.Vector3dVector(xyz)
             pcd.colors = o3d.utility.Vector3dVector(rgb)
 
-            return pcd, ground_truth_labels
+            epsg_code = self.get_epsg_code(las_file_path)
+            return pcd, ground_truth_labels, epsg_code
             
         except laspy.errors.LaspyException as e:
             if "No LazBackend selected" in str(e):
