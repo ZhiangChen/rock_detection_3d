@@ -4,15 +4,31 @@ import logging
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, List, Union
+from dataclasses import dataclass
 from geomdl import BSpline
 from geomdl import utilities
 from scipy.spatial import cKDTree
 import traceback
 import os
 from sklearn.cluster import DBSCAN
-# import pymeshlab
+
+# Try to import PyMeshLab
+try:
+    import pymeshlab
+    PYMESHLAB_AVAILABLE = True
+    logging.info("PyMeshLab is available for enhanced normal computation")
+except ImportError:
+    PYMESHLAB_AVAILABLE = False
+    logging.warning("PyMeshLab not available. Using fallback normal computation methods.")
 
 from visualization import PointCloudVisualization
+
+@dataclass
+class BottomFacePreparationResult:
+    """Clean data structure for bottom face preparation results"""
+    rock_points: np.ndarray
+    bottom_points: np.ndarray
+    basal_indices: np.ndarray
 
 class MeshProcessor:
     """
@@ -107,35 +123,29 @@ class MeshProcessor:
                 return pcd, np.arange(len(points))
             return pcd
 
-    def reconstruct_mesh(self, pcd: o3d.geometry.PointCloud, labels: np.ndarray, 
-                        basal_points: np.ndarray, dense_basal_parts: list = None, 
-                        dense_basal_parts_is_lateral: list = None, degree_u: int = 4, degree_v: int = 4,
-                        control_points_u: int = 5, control_points_v: int = 5, use_dbscan_cleaning: bool = False,
-                        depth: int = 8, debug_mode: bool = False, 
-                        intermediate_visualization: bool = False) -> o3d.geometry.TriangleMesh:
+    def prepare_bottom_face(self, pcd: o3d.geometry.PointCloud, labels: np.ndarray, 
+                           basal_points: np.ndarray, dense_basal_parts: list = None, 
+                           dense_basal_parts_is_lateral: list = None, degree_u: int = 4, degree_v: int = 4,
+                           control_points_u: int = 5, control_points_v: int = 5, 
+                           use_dbscan_cleaning: bool = False, 
+                           basal_parts_metadata: dict = None) -> BottomFacePreparationResult:
         """
-        Reconstructs a 3D mesh from the segmented point cloud.
-        Process:
-        1. Filters points to keep rock and basal points
-        2. Optionally removes outliers using DBSCAN
-        3. Generates bottom face using NURBS interpolation
-        4. Performs Poisson reconstruction (Open3D or PyMeshLab)
+        Prepares rock and bottom face points for mesh reconstruction.
+        This is the first stage of the pipeline - it filters points and generates the bottom face.
         
         Args:
             pcd: Open3D PointCloud object
             labels: Array of point labels (0 for pedestal, 1 for rock)
-            basal_points: Array of basal point indices or boolean mask
-            dense_basal_parts: List of dense basal parts
-            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral
+            basal_points: Array of basal point indices or boolean mask (legacy format)
+            dense_basal_parts: List of dense basal parts (legacy format)
+            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral (legacy format)
             degree_u, degree_v: Degrees for NURBS surface
             control_points_u, control_points_v: Number of control points for NURBS surface
             use_dbscan_cleaning: Whether to use DBSCAN for outlier removal
-            depth: The maximum depth of the octree used for Poisson reconstruction
-            debug_mode: Whether to show debug visualizations (for test scripts)
-            intermediate_visualization: Whether to show intermediate visualization and return early
+            basal_parts_metadata: Enhanced basal parts metadata structure (preferred format)
             
         Returns:
-            o3d.geometry.TriangleMesh: Reconstructed mesh, or tuple if intermediate_visualization is True
+            BottomFacePreparationResult: Clean data structure containing rock points, bottom points, and basal indices
         """
         try:
             # Get the points and labels
@@ -152,6 +162,21 @@ class MeshProcessor:
             else:
                 # If basal_points is already a boolean mask
                 basal_mask = basal_points
+
+            # Extract dense basal parts from enhanced metadata if available
+            if basal_parts_metadata is not None and 'parts' in basal_parts_metadata:
+                # Extract from enhanced metadata
+                dense_basal_parts = [part['dense_points'] for part in basal_parts_metadata['parts']]
+                dense_basal_parts_is_lateral = [part['is_lateral'] for part in basal_parts_metadata['parts']]
+                logging.info(f"Using enhanced basal metadata with {len(dense_basal_parts)} parts")
+            elif dense_basal_parts is None:
+                # Fallback: no dense parts available
+                dense_basal_parts = []
+                dense_basal_parts_is_lateral = []
+                logging.info("No dense basal parts available (neither enhanced metadata nor legacy format)")
+            else:
+                # Use legacy format
+                logging.info(f"Using legacy basal parts format with {len(dense_basal_parts)} parts")
 
             # Combine masks
             filtered_indices = np.logical_or(rock_points, basal_mask)
@@ -208,92 +233,140 @@ class MeshProcessor:
                 degree_u=degree_u,
                 degree_v=degree_v,
                 control_points_u=control_points_u,
-                control_points_v=control_points_v
+                control_points_v=control_points_v,
+                basal_parts_metadata=basal_parts_metadata
             )
             
             if bottom_points is None:
                 logging.error("Failed to generate bottom face points")
+                raise ValueError("Failed to generate bottom face points")
             
             # Process rock points
-            rock_points = np.asarray(filtered_pcd.points)[rock_indices]
-            rock_pcd = o3d.geometry.PointCloud()
-            rock_pcd.points = o3d.utility.Vector3dVector(rock_points)
+            rock_points_array = np.asarray(filtered_pcd.points)[rock_indices]
             
-            # Estimate normals with better parameters for rock points
-            rock_pcd.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+            return BottomFacePreparationResult(
+                rock_points=rock_points_array,
+                bottom_points=bottom_points,
+                basal_indices=basal_indices
             )
-            rock_pcd.orient_normals_consistent_tangent_plane(100, 10)
+
+        except Exception as e:
+            logging.error(f"Error in prepare_bottom_face: {str(e)}")
+            raise
+
+    def compute_normals_for_visualization(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> tuple:
+        """
+        Computes normals for rock and bottom points, preparing them for visualization.
+        
+        Args:
+            rock_points: Array of rock point coordinates
+            bottom_points: Array of bottom face point coordinates
             
-            # Process bottom points
-            bottom_pcd = o3d.geometry.PointCloud()
-            bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points)
-
-            # # Add a small gap by moving bottom points down
-            # bottom_points_array = np.asarray(bottom_pcd.points)
-            # gap_size = 0.02  # Adjust gap size (meters)
-            # bottom_points_array[:, 2] -= gap_size  # Shift Z coordinates down
-            # bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points_array)
+        Returns:
+            tuple: (rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
+        """
+        try:
+            # Use PyMeshLab for enhanced normal computation (with fallback to separate orientation)
+            rock_pcd, bottom_pcd = self.compute_normals_pymeshlab(rock_points, bottom_points)
             
-            bottom_pcd.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-            )
-            
-            # Reorient normals for rock_pcd
-            logging.info("Reorienting normals for rock_pcd...")
-            rock_center = rock_pcd.get_center()
-            rock_points = np.asarray(rock_pcd.points)
-            rock_normals = np.asarray(rock_pcd.normals)
-            rock_directions = rock_points - rock_center
-            rock_directions = rock_directions / np.linalg.norm(rock_directions, axis=1)[:, np.newaxis]
-            rock_dots = np.sum(rock_directions * rock_normals, axis=1)
-            rock_normals[rock_dots < 0] = -rock_normals[rock_dots < 0]
-            rock_pcd.normals = o3d.utility.Vector3dVector(rock_normals)
-
-            # Reorient normals for bottom_pcd
-            logging.info("Reorienting normals for bottom_pcd...")
-            bottom_center = bottom_pcd.get_center()
-            bottom_points = np.asarray(bottom_pcd.points)
-            bottom_normals = np.asarray(bottom_pcd.normals)
-            bottom_directions = bottom_points - bottom_center
-            bottom_directions = bottom_directions / np.linalg.norm(bottom_directions, axis=1)[:, np.newaxis]
-            bottom_dots = np.sum(bottom_directions * bottom_normals, axis=1)
-            bottom_normals[bottom_dots < 0] = -bottom_normals[bottom_dots < 0]
-            bottom_pcd.normals = o3d.utility.Vector3dVector(bottom_normals)
-            bottom_pcd.orient_normals_consistent_tangent_plane(100, 10)
-
-            # Visualize the rock points with bottom face points before SOR filter (only in debug mode)
-            if debug_mode:
-                logging.info("Visualizing rock points with bottom face points before SOR filter...")
-                visualizer = PointCloudVisualization()
-                combined_points_pre_sor = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
-                combined_colors_pre_sor = np.vstack((
-                    np.full((len(np.asarray(rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
-                    np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
-                ))
-                visualizer.show_point_cloud(combined_points_pre_sor, combined_colors_pre_sor, "Before SOR Filter")
-
-            # Apply SOR filter to the rock points
-            logging.info("Applying SOR filter to rock points...")
-            rock_pcd, inlier_indices = rock_pcd.remove_statistical_outlier(nb_neighbors=100, std_ratio=2.0)
-
-            # Visualize the rock points with bottom face points after SOR filter
-            logging.info("Visualizing rock points with bottom face points after SOR filter...")
-            combined_points_post_sor = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
-            combined_colors_post_sor = np.vstack((
+            # Prepare visualization data
+            combined_points = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
+            combined_colors = np.vstack((
                 np.full((len(np.asarray(rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
                 np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
             ))
             
-            # If intermediate visualization is requested, show it and return the prepared data
-            if intermediate_visualization:
-                if debug_mode:
-                    # Only show visualization directly in debug mode (test scripts)
-                    visualizer = PointCloudVisualization()
-                    visualizer.show_point_cloud(combined_points_post_sor, combined_colors_post_sor, "After SOR Filter")
-                # Return the prepared point clouds for final reconstruction
-                return (rock_pcd, bottom_pcd, combined_points_post_sor, combined_colors_post_sor)
+            # Combine normals from both point clouds
+            combined_normals = np.vstack((np.asarray(rock_pcd.normals), np.asarray(bottom_pcd.normals)))
+            
+            return rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals
 
+        except Exception as e:
+            logging.error(f"Error in compute_normals_for_visualization: {str(e)}")
+            raise
+
+    def compute_normals_for_visualization_separate(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> tuple:
+        """
+        Computes normals using separate orientation method (fallback) for visualization.
+        
+        Args:
+            rock_points: Array of rock point coordinates
+            bottom_points: Array of bottom face point coordinates
+            
+        Returns:
+            tuple: (rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
+        """
+        try:
+            # Use separate orientation method for normal computation
+            rock_pcd, bottom_pcd = self._compute_normals_separate_orientation(rock_points, bottom_points)
+           
+            # Prepare visualization data
+            combined_points = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
+            combined_colors = np.vstack((
+                np.full((len(np.asarray(rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
+                np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
+            ))
+            
+            # Combine normals from both point clouds
+            combined_normals = np.vstack((np.asarray(rock_pcd.normals), np.asarray(bottom_pcd.normals)))
+            
+            return rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals
+
+        except Exception as e:
+            logging.error(f"Error in compute_normals_for_visualization_separate: {str(e)}")
+            raise
+
+    def apply_noise_removal(self, rock_pcd: o3d.geometry.PointCloud, 
+                           bottom_pcd: o3d.geometry.PointCloud) -> tuple:
+        """
+        Applies noise removal to rock points while preserving bottom face points.
+        
+        Args:
+            rock_pcd: Rock point cloud with normals
+            bottom_pcd: Bottom face point cloud with normals
+            
+        Returns:
+            tuple: (filtered_rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
+        """
+        try:
+            # Apply SOR filter to rock points
+            logging.info("Applying SOR filter to rock points...")
+            filtered_rock_pcd, inlier_indices = rock_pcd.remove_statistical_outlier(
+                nb_neighbors=100, 
+                std_ratio=2.0
+            )
+            
+            # Prepare updated visualization data
+            combined_points = np.vstack((np.asarray(filtered_rock_pcd.points), np.asarray(bottom_pcd.points)))
+            combined_colors = np.vstack((
+                np.full((len(np.asarray(filtered_rock_pcd.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
+                np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
+            ))
+            
+            # Update combined normals
+            combined_normals = np.vstack((np.asarray(filtered_rock_pcd.normals), np.asarray(bottom_pcd.normals)))
+            
+            return filtered_rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals
+
+        except Exception as e:
+            logging.error(f"Error in apply_noise_removal: {str(e)}")
+            raise
+
+    def complete_mesh_reconstruction(self, rock_pcd: o3d.geometry.PointCloud, 
+                                   bottom_pcd: o3d.geometry.PointCloud, 
+                                   depth: int = 8) -> o3d.geometry.TriangleMesh:
+        """
+        Completes the mesh reconstruction using Poisson reconstruction.
+        
+        Args:
+            rock_pcd: Final rock point cloud with normals
+            bottom_pcd: Bottom face point cloud with normals
+            depth: Depth parameter for Poisson reconstruction
+            
+        Returns:
+            o3d.geometry.TriangleMesh: Reconstructed mesh
+        """
+        try:
             # Combine points and normals
             combined_points = np.vstack((
                 np.asarray(rock_pcd.points),
@@ -321,7 +394,7 @@ class MeshProcessor:
                 linear_fit=False    # Use False as in the test file
             )
             
-            # Post-process the mesh (only if using Open3D, PyMeshLab method already does this)
+            # Post-process the mesh
             self.reconstructed_mesh.remove_degenerate_triangles()
             self.reconstructed_mesh.remove_duplicated_triangles()
             self.reconstructed_mesh.remove_duplicated_vertices()
@@ -332,10 +405,10 @@ class MeshProcessor:
                 self.temp_mesh_path = temp_file.name
             o3d.io.write_triangle_mesh(self.temp_mesh_path, self.reconstructed_mesh)
 
-            return self.reconstructed_mesh, new_pcd
+            return self.reconstructed_mesh
 
         except Exception as e:
-            logging.error(f"Error in mesh reconstruction: {str(e)}")
+            logging.error(f"Error in complete_mesh_reconstruction: {str(e)}")
             raise
 
     @staticmethod
@@ -380,27 +453,34 @@ class MeshProcessor:
                                   degree_u: int = 3, 
                                   degree_v: int = 3,
                                   control_points_u: int = 10,
-                                  control_points_v: int = 10 ) -> np.ndarray:
+                                  control_points_v: int = 10,
+                                  basal_parts_metadata: dict = None) -> np.ndarray:
         """
         Generate bottom face points with support for multiple parts
         
         Args:
             pcd: Open3D PointCloud object
-            basal_indices: Array of indices for basal points
-            dense_basal_parts: List of dense basal parts
-            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral
+            basal_indices: Array of indices for basal points (legacy format)
+            dense_basal_parts: List of dense basal parts (legacy format)
+            dense_basal_parts_is_lateral: List of boolean flags indicating which parts are lateral (legacy format)
             degree_u, degree_v: Degrees for NURBS surface
             control_points_u, control_points_v: Number of control points
+            basal_parts_metadata: Enhanced basal parts metadata structure (preferred format)
             
         Returns:
             np.ndarray: Generated bottom face points
         """
         try:
+            # Extract dense basal parts from enhanced metadata if available
+            if basal_parts_metadata is not None and 'parts' in basal_parts_metadata:
+                dense_basal_parts = [part['dense_points'] for part in basal_parts_metadata['parts']]
+                dense_basal_parts_is_lateral = [part['is_lateral'] for part in basal_parts_metadata['parts']]
+                logging.info(f"Using enhanced basal metadata for bottom face generation with {len(dense_basal_parts)} parts")
             logging.info("Starting bottom face generation")
             
             # Check if we're dealing with multiple parts
             if dense_basal_parts:
-                return self._generate_multi_part_faces(
+                bottom_points = self._generate_multi_part_faces(
                     pcd, 
                     dense_basal_parts,
                     dense_basal_parts_is_lateral,
@@ -410,7 +490,7 @@ class MeshProcessor:
                     control_points_v
                 )
             else:
-                return self._generate_single_face(
+                bottom_points = self._generate_single_face(
                     pcd,
                     basal_indices,
                     degree_u,
@@ -418,6 +498,12 @@ class MeshProcessor:
                     control_points_u,
                     control_points_v
                 )
+            
+            # Apply downsampling to match rock point density and improve uniformity
+            if bottom_points is not None:
+                bottom_points = self._downsample_bottom_face(pcd, bottom_points, basal_indices)
+            
+            return bottom_points
                 
         except Exception as e:
             logging.error(f"Error in bottom face generation: {str(e)}")
@@ -652,7 +738,7 @@ class MeshProcessor:
             # Generate surface points
             logging.info("Generating surface points...")
             try:
-                surf.delta = 0.02  # Finer sampling
+                surf.delta = 0.04  # Finer sampling
                 surf.evaluate()
                 surface_points = np.array(surf.evalpts)
                 
@@ -696,6 +782,147 @@ class MeshProcessor:
             
         except Exception as e:
             logging.error(f"Error saving mesh: {str(e)}")
+            raise
+
+    def compute_normals_pymeshlab(self, rock_points: np.ndarray, bottom_points: np.ndarray,
+                                  k_neighbors: int = 200, smooth_iter: int = 0) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+        """
+        Compute normals using PyMeshLab for enhanced normal estimation
+        
+        Args:
+            rock_points: Array of rock points
+            bottom_points: Array of bottom face points
+            k_neighbors: Number of neighbors for normal computation
+            smooth_iter: Number of smoothing iterations
+            
+        Returns:
+            Tuple of (rock_pcd, bottom_pcd) with computed normals
+        """
+        try:
+            if not PYMESHLAB_AVAILABLE:
+                logging.warning("PyMeshLab not available. Falling back to separate orientation method.")
+                return self._compute_normals_separate_orientation(rock_points, bottom_points)
+            
+            logging.info("Computing normals using PyMeshLab...")
+            
+            # Combine all points
+            combined_points = np.vstack([rock_points, bottom_points])
+            
+            # Create MeshSet
+            ms = pymeshlab.MeshSet()
+            
+            # Create mesh from points
+            mesh = pymeshlab.Mesh(vertex_matrix=combined_points)
+            ms.add_mesh(mesh)
+            
+            logging.info(f"Computing normals with k={k_neighbors}, smooth_iter={smooth_iter}")
+            
+            # Compute normals using PyMeshLab
+            ms.compute_normal_for_point_clouds(k=k_neighbors, smoothiter=smooth_iter)
+            
+            # Get the mesh with computed normals
+            processed_mesh = ms.current_mesh()
+            
+            # Extract vertices and normals
+            vertices = processed_mesh.vertex_matrix()
+            normals = processed_mesh.vertex_normal_matrix()
+            
+            # Check normal orientation and flip if majority point towards center
+            logging.info("Checking normal orientation...")
+            center = np.mean(vertices, axis=0)
+            directions = vertices - center
+            directions = directions / np.linalg.norm(directions, axis=1)[:, np.newaxis]
+            
+            # Compute dot products to check orientation
+            dots = np.sum(directions * normals, axis=1)
+            inward_pointing = np.sum(dots < 0)
+            outward_pointing = np.sum(dots >= 0)
+            
+            logging.info(f"Normals pointing inward: {inward_pointing}, outward: {outward_pointing}")
+            
+            # If majority of normals point inward (towards center), flip them all
+            if inward_pointing > outward_pointing:
+                logging.info("Majority of normals point inward, flipping all normals to point outward")
+                normals = -normals
+            else:
+                logging.info("Majority of normals already point outward, keeping orientation")
+            
+            # Split back into rock and bottom point clouds
+            rock_pcd = o3d.geometry.PointCloud()
+            rock_pcd.points = o3d.utility.Vector3dVector(vertices[:len(rock_points)])
+            rock_pcd.normals = o3d.utility.Vector3dVector(normals[:len(rock_points)])
+            
+            bottom_pcd = o3d.geometry.PointCloud()
+            bottom_pcd.points = o3d.utility.Vector3dVector(vertices[len(rock_points):])
+            bottom_pcd.normals = o3d.utility.Vector3dVector(normals[len(rock_points):])
+            
+            logging.info(f"PyMeshLab normal computation completed for {len(combined_points)} points")
+            return rock_pcd, bottom_pcd
+            
+        except Exception as e:
+            logging.error(f"Error in PyMeshLab normal computation: {str(e)}")
+            logging.info("Falling back to separate orientation method...")
+            return self._compute_normals_separate_orientation(rock_points, bottom_points)
+
+    def _compute_normals_separate_orientation(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+        """
+        Fallback method: Compute normals using separate orientation (current method)
+        
+        Args:
+            rock_points: Array of rock points
+            bottom_points: Array of bottom face points
+            
+        Returns:
+            Tuple of (rock_pcd, bottom_pcd) with computed normals
+        """
+        try:
+            logging.info("Using separate orientation method for normal computation...")
+            
+            # Create separate point clouds
+            rock_pcd = o3d.geometry.PointCloud()
+            rock_pcd.points = o3d.utility.Vector3dVector(rock_points)
+            
+            bottom_pcd = o3d.geometry.PointCloud()
+            bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points)
+            
+            # Estimate normals with better parameters for rock points
+            rock_pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=200)
+            )
+            rock_pcd.orient_normals_consistent_tangent_plane(100, 10)
+            
+            # Estimate normals for bottom points
+            bottom_pcd.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=200)
+            )
+            
+            # Reorient normals for rock_pcd
+            logging.info("Reorienting normals for rock_pcd...")
+            rock_center = rock_pcd.get_center()
+            rock_points_array = np.asarray(rock_pcd.points)
+            rock_normals = np.asarray(rock_pcd.normals)
+            rock_directions = rock_points_array - rock_center
+            rock_directions = rock_directions / np.linalg.norm(rock_directions, axis=1)[:, np.newaxis]
+            rock_dots = np.sum(rock_directions * rock_normals, axis=1)
+            rock_normals[rock_dots < 0] = -rock_normals[rock_dots < 0]
+            rock_pcd.normals = o3d.utility.Vector3dVector(rock_normals)
+
+            # Reorient normals for bottom_pcd
+            logging.info("Reorienting normals for bottom_pcd...")
+            bottom_center = bottom_pcd.get_center()
+            bottom_points_array = np.asarray(bottom_pcd.points)
+            bottom_normals = np.asarray(bottom_pcd.normals)
+            bottom_directions = bottom_points_array - bottom_center
+            bottom_directions = bottom_directions / np.linalg.norm(bottom_directions, axis=1)[:, np.newaxis]
+            bottom_dots = np.sum(bottom_directions * bottom_normals, axis=1)
+            bottom_normals[bottom_dots < 0] = -bottom_normals[bottom_dots < 0]
+            bottom_pcd.normals = o3d.utility.Vector3dVector(bottom_normals)
+            bottom_pcd.orient_normals_consistent_tangent_plane(100, 10)
+            
+            return rock_pcd, bottom_pcd
+            
+        except Exception as e:
+            logging.error(f"Error in separate orientation normal computation: {str(e)}")
             raise
 
     def _ensure_boundary_connection(self, surface_points: np.ndarray,
@@ -747,3 +974,85 @@ class MeshProcessor:
         except Exception as e:
             logging.error(f"Error in boundary connection: {str(e)}")
             return np.vstack((surface_points, basal_points))
+
+    def _downsample_bottom_face(self, pcd: o3d.geometry.PointCloud, 
+                              bottom_points: np.ndarray, 
+                              basal_indices: np.ndarray) -> np.ndarray:
+        """
+        Downsample the bottom face points to match rock point density and improve uniformity.
+        
+        Args:
+            pcd: Original point cloud (for rock density reference)
+            bottom_points: Dense NURBS-generated bottom face points
+            basal_indices: Indices of basal points (to preserve boundary)
+            
+        Returns:
+            np.ndarray: Downsampled bottom face points
+        """
+        try:
+            # Get rock points for density analysis
+            points = np.asarray(pcd.points)
+            rock_mask = np.ones(len(points), dtype=bool)
+            if len(basal_indices) > 0:
+                rock_mask[basal_indices] = False
+            rock_points = points[rock_mask]
+            
+            # Calculate target density based on rock points
+            if len(rock_points) > 1:
+                # Use nearest neighbor distances to estimate density
+                rock_pcd = o3d.geometry.PointCloud()
+                rock_pcd.points = o3d.utility.Vector3dVector(rock_points)
+                
+                # Calculate average nearest neighbor distance in rock points
+                distances = rock_pcd.compute_nearest_neighbor_distance()
+                avg_distance = np.mean(distances)
+                target_voxel_size = avg_distance * 0.8  # Slightly denser to ensure good coverage
+                
+                logging.info(f"Rock point avg distance: {avg_distance:.4f}, target voxel size: {target_voxel_size:.4f}")
+            else:
+                # Fallback if no rock points
+                target_voxel_size = 0.05
+                logging.warning("No rock points found, using default voxel size")
+            
+            # Create point cloud from bottom points
+            bottom_pcd = o3d.geometry.PointCloud()
+            bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points)
+            
+            logging.info(f"Bottom face points before downsampling: {len(bottom_points)}")
+            
+            # Apply voxel downsampling
+            downsampled_pcd = bottom_pcd.voxel_down_sample(voxel_size=target_voxel_size)
+            downsampled_points = np.asarray(downsampled_pcd.points)
+            
+            logging.info(f"Bottom face points after voxel downsampling: {len(downsampled_points)}")
+            
+            # If we have basal points, ensure they're preserved in the downsampled set
+            if len(basal_indices) > 0:
+                basal_points = points[basal_indices]
+                
+                # Find which basal points might have been removed during downsampling
+                tree = cKDTree(downsampled_points)
+                distances, _ = tree.query(basal_points)
+                
+                # Add back basal points that are too far from downsampled points
+                missing_basal = basal_points[distances > target_voxel_size]
+                if len(missing_basal) > 0:
+                    logging.info(f"Adding back {len(missing_basal)} basal points that were lost during downsampling")
+                    downsampled_points = np.vstack([downsampled_points, missing_basal])
+            
+            # Optional: Apply uniform downsampling if still too dense
+            if len(downsampled_points) > len(rock_points) * 1.5:  # If still 50% denser than rock
+                # Use random downsampling to match rock density
+                target_count = int(len(rock_points) * 1.2)  # 20% denser than rock
+                if target_count < len(downsampled_points):
+                    indices = np.random.choice(len(downsampled_points), target_count, replace=False)
+                    downsampled_points = downsampled_points[indices]
+                    logging.info(f"Applied random downsampling to {len(downsampled_points)} points")
+            
+            logging.info(f"Final bottom face points after downsampling: {len(downsampled_points)}")
+            return downsampled_points
+            
+        except Exception as e:
+            logging.error(f"Error in bottom face downsampling: {str(e)}")
+            logging.warning("Returning original bottom points without downsampling")
+            return bottom_points

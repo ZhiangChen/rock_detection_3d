@@ -436,19 +436,7 @@ class PointCloudExtractor:
 # Main Pipeline
 # ----------------------------
 
-# Configuration
-CONFIG = {
-    "model_config": "GroundingDINO_files/GroundingDINO_SwinT_OGC.py",
-    "model_weights": "GroundingDINO_files/groundingdino_swint_ogc.pth",
-    "text_prompt": "rock.",
-    "box_thresh": 0.10,
-    "text_thresh": 0.25,
-    "output_geojson": "pond1_lidar_temp.geojson",
-    "output_dir": "pond1_lidar_temp",
-    "padding": 0.2,
-    "max_tiles": 15000,  # To limit processing; for checking
-    "validate_tiles": False
-}
+
 
 def validate_epsg_compatibility(tif_path, laz_path):
     """Validate that TIFF and LAS files have the same EPSG code."""
@@ -523,6 +511,20 @@ def run_pipeline(config):
         
     log_time("Total pipeline execution", pipeline_start)
     print(f"\nPipeline completed successfully. Outputs in {config['output_dir']}")
+
+# Configuration
+CONFIG = {
+    "model_config": "GroundingDINO_files/GroundingDINO_SwinT_OGC.py",
+    "model_weights": "GroundingDINO_files/groundingdino_swint_ogc.pth",
+    "text_prompt": "isolated rock.",
+    "box_thresh": 0.20,
+    "text_thresh": 0.25,
+    "output_geojson": "pond1_lidar_new_thresholds.geojson",
+    "output_dir": "pond1_lidar_new_thresholds",
+    "padding": 0.2,
+    "max_tiles": 150000,  # To limit processing; for checking
+    "validate_tiles": False
+}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Rock Detection Pipeline")

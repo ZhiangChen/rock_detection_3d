@@ -65,6 +65,8 @@ class GUIComponents:
         self.run_button = self._create_button("Run Region Growing", visible=False)
         self.rerun_region_growing_button = self._create_button("Rerun Region Growing with Different Parameters", visible=False)
         self.save_pcd_button = self._create_button("Save Point Cloud", visible=False)
+        self.fallback_normals_button = self._create_button("Fallback to Separate Normal Reorientation", visible=False)
+        self.redo_pymeshlab_normals_button = self._create_button("Redo PyMeshLab Normal Reorientation", visible=False)
         self.remove_noise_button = self._create_button("Remove Noise", visible=False)
         self.undo_remove_noise_button = self._create_button("Undo Remove Noise", visible=False)  # Add new button
         self.reconstruct_mesh_button = self._create_button("Reconstruct Mesh", visible=False)

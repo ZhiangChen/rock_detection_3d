@@ -290,11 +290,19 @@ class GeometricAnalyzer:
                 csv_path = Path(output_csv)
             else:
                 csv_path = input_path.parent / f"{str(input_path.parent).split('/')[-1]}_geometric_analysis_results.csv"
-                
-            if not csv_path.exists():
-                pd.DataFrame([data]).to_csv(csv_path, index=False)
+            
+            # Create DataFrame from the data
+            df = pd.DataFrame([data])
+            
+            # Check if file exists to determine if we need headers
+            file_exists = csv_path.exists()
+            
+            if file_exists:
+                # Append to existing file without headers
+                df.to_csv(csv_path, mode='a', header=False, index=False)
             else:
-                pd.DataFrame([data]).to_csv(csv_path, mode='a', header=False, index=False)
+                # Create new file with headers
+                df.to_csv(csv_path, mode='w', header=True, index=False)
 
             return str(csv_path)
                 

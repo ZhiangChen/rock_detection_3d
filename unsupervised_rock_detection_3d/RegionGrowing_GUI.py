@@ -122,10 +122,19 @@ class MainWindow(QMainWindow):
         self.close_picking_event = None
         self.epsg_code = None  # Add EPSG code storage
         
+        # Enhanced basal parts metadata structure for external mesh reconstruction
+        self.basal_parts_metadata = {
+            'parts': [],  # List of part dictionaries
+            'close_loop': False,  # Whether parts should form closed loops
+            'num_parts': 0,  # Total number of parts
+            'has_lateral_parts': False  # Whether any parts are lateral
+        }
+        
         # Add mesh reconstruction state tracking
         self.mesh_reconstruction_stage = 0  # 0: not started, 1: intermediate, 2: complete
         self.prepared_mesh_data = None  # Store intermediate mesh data
         self.noise_removal_history = []  # Track history of noise removal steps for undo functionality
+        self.current_normal_method = 'pymeshlab'  # Track current normal computation method: 'pymeshlab' or 'separate'
         
         # Initialize threshold values
         self.smoothness_threshold = 0.9
@@ -233,6 +242,8 @@ class MainWindow(QMainWindow):
             'reconstruct_mesh_button': self.reconstruct_mesh,
             'remove_noise_button': self.remove_noise_iterative,
             'undo_remove_noise_button': self.undo_remove_noise,  # Add new signal mapping
+            'fallback_normals_button': self.fallback_to_separate_normals,
+            'redo_pymeshlab_normals_button': self.redo_pymeshlab_normals,
             'save_mesh_button': self.save_mesh,
             'compute_geometric_analysis_button': self.perform_geometric_analysis,
             'jump_to_basal_button': self.show_basal_estimation_options,
@@ -257,55 +268,59 @@ class MainWindow(QMainWindow):
         self.basal_proximity_threshold = value / 100.0
 
     def remove_noise_iterative(self):
-        """Remove noise iteratively from the prepared mesh data."""
+        """Remove noise iteratively from the prepared mesh data using the clean pipeline."""
         if self.mesh_reconstruction_stage == 1 and self.prepared_mesh_data:
             try:
                 self.gui.set_instructions("Removing additional noise...")
                 
                 # Store current state in history before making changes
-                self.noise_removal_history.append(self.prepared_mesh_data)
+                self.noise_removal_history.append(self.prepared_mesh_data.copy())
                 
-                # Unpack the prepared data
-                rock_pcd, bottom_pcd, _, _ = self.prepared_mesh_data
+                # Get current rock and bottom point clouds from our clean data structure
+                rock_pcd = self.prepared_mesh_data['rock_pcd']
+                bottom_pcd = self.prepared_mesh_data['bottom_pcd']
                 
-                # Apply SOR filter to rock points again
-                logging.info("Applying additional SOR filter to rock points...")
-                rock_pcd_filtered, inlier_indices = rock_pcd.remove_statistical_outlier(
-                    nb_neighbors=100, 
-                    std_ratio=2.0
-                )
+                # Apply noise removal using the clean pipeline
+                filtered_rock_pcd, bottom_pcd, combined_points_updated, combined_colors_updated, combined_normals_updated = \
+                    self.mesh_processor.apply_noise_removal(rock_pcd, bottom_pcd)
                 
-                # Update the prepared data with filtered rock points
-                combined_points_updated = np.vstack((
-                    np.asarray(rock_pcd_filtered.points), 
-                    np.asarray(bottom_pcd.points)
-                ))
-                combined_colors_updated = np.vstack((
-                    np.full((len(np.asarray(rock_pcd_filtered.points)), 3), [1.0, 0.0, 0.0]),  # Red for rock points
-                    np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])  # Green for bottom face points
-                ))
+                # Update the prepared mesh data with new clean structure
+                self.prepared_mesh_data.update({
+                    'rock_pcd': filtered_rock_pcd,
+                    'bottom_pcd': bottom_pcd,
+                    'combined_points': combined_points_updated,
+                    'combined_colors': combined_colors_updated,
+                    'combined_normals': combined_normals_updated
+                })
                 
-                # Update prepared mesh data
-                self.prepared_mesh_data = (rock_pcd_filtered, bottom_pcd, combined_points_updated, combined_colors_updated)
-                
-                # Update visualization
+                # Update visualization with normals to preserve PyMeshLab orientation
                 self.start_visualization_process(
                     target=self.visualizer.show_point_cloud,
-                    args=(combined_points_updated, combined_colors_updated, "After Additional Noise Removal")
+                    args=(combined_points_updated, combined_colors_updated, "After Additional Noise Removal", False, None, True, combined_normals_updated)
                 )
                 
-                # Show the buttons again (now including undo button)
-                self.gui.set_instructions("New bottom face generated, and noise removed.\nPlease use below \"Remove Noise\" button to further remove the noise\nor \"Undo Remove Noise\" to revert last step\nor else \"Reconstruct Mesh\" to complete reconstruction.")
-                self.gui.show_buttons(['reconstruct_mesh_button', 'remove_noise_button', 'undo_remove_noise_button'])
+                # Show buttons based on current normal method and undo availability
+                buttons_to_show = ['reconstruct_mesh_button', 'remove_noise_button']
+                if self.noise_removal_history:  # Only show undo button if there's history to undo
+                    buttons_to_show.append('undo_remove_noise_button')
                 
-                logging.info(f"Additional noise removal completed. Kept {len(rock_pcd_filtered.points)} rock points.")
+                # Add normal method toggle button based on current method
+                if self.current_normal_method == 'pymeshlab':
+                    buttons_to_show.append('fallback_normals_button')
+                else:
+                    buttons_to_show.append('redo_pymeshlab_normals_button')
+                
+                self.gui.show_buttons(buttons_to_show)
+                self.gui.set_instructions("Noise removed. Choose normal method, remove more noise, undo, or proceed with mesh reconstruction.")
+                
+                logging.info(f"Additional noise removal completed. Kept {len(filtered_rock_pcd.points)} rock points.")
                 
             except Exception as e:
                 logging.error(f"Error in iterative noise removal: {str(e)}")
                 self.gui.set_instructions("Error removing noise. Please try again.")
 
     def undo_remove_noise(self):
-        """Undo the last noise removal step."""
+        """Undo the last noise removal step using the clean pipeline."""
         if self.mesh_reconstruction_stage == 1 and self.noise_removal_history:
             try:
                 self.gui.set_instructions("Undoing last noise removal step...")
@@ -313,25 +328,32 @@ class MainWindow(QMainWindow):
                 # Restore the previous state from history
                 self.prepared_mesh_data = self.noise_removal_history.pop()
                 
-                # Unpack the restored data for visualization
-                rock_pcd, bottom_pcd, combined_points, combined_colors = self.prepared_mesh_data
+                # Get the visualization data from our clean structure
+                combined_points = self.prepared_mesh_data['combined_points']
+                combined_colors = self.prepared_mesh_data['combined_colors']
+                combined_normals = self.prepared_mesh_data['combined_normals']
                 
-                # Update visualization with restored data
+                # Update visualization with normals to preserve PyMeshLab orientation
                 self.start_visualization_process(
                     target=self.visualizer.show_point_cloud,
-                    args=(combined_points, combined_colors, "After Undo Noise Removal")
+                    args=(combined_points, combined_colors, "After Undo Noise Removal", False, None, True, combined_normals)
                 )
                 
-                # Update button visibility based on remaining history
+                # Update button visibility based on remaining history and current normal method
                 buttons_to_show = ['reconstruct_mesh_button', 'remove_noise_button']
                 if self.noise_removal_history:  # Only show undo button if there's history to undo
                     buttons_to_show.append('undo_remove_noise_button')
                 
-                self.gui.set_instructions("New bottom face generated, and noise removed.\nPlease use below \"Remove Noise\" button to further remove the noise" + 
-                                         ("\nor \"Undo Remove Noise\" to revert last step" if self.noise_removal_history else "") +
-                                         "\nor else \"Reconstruct Mesh\" to complete reconstruction.")
-                self.gui.show_buttons(buttons_to_show)
+                # Add normal method toggle button based on current method
+                if self.current_normal_method == 'pymeshlab':
+                    buttons_to_show.append('fallback_normals_button')
+                else:
+                    buttons_to_show.append('redo_pymeshlab_normals_button')
                 
+                self.gui.show_buttons(buttons_to_show)
+                self.gui.set_instructions("Noise removal undone. Choose normal method, remove noise again, or proceed with mesh reconstruction.")
+                
+                rock_pcd = self.prepared_mesh_data['rock_pcd']
                 logging.info(f"Undo noise removal completed. Restored {len(np.asarray(rock_pcd.points))} rock points.")
                 
             except Exception as e:
@@ -858,8 +880,14 @@ class MainWindow(QMainWindow):
             options=options,
         )
         if file_name:
+            # Pass structured basal parts metadata instead of just flattened basal_points
+            basal_metadata = getattr(self, 'basal_parts_metadata', None)
+            if basal_metadata is None:
+                # Fallback for single-part or legacy cases
+                basal_metadata = self.basal_points
+            
             self.segmented_pcd_file_path = self.file_handler.save_point_cloud(
-                self.pcd, file_name, np.asarray(self.segmenter.labels), self.basal_points, plain)
+                self.pcd, file_name, np.asarray(self.segmenter.labels), basal_metadata, plain)
             
             
             # Update the instructions label to show success
@@ -881,11 +909,11 @@ class MainWindow(QMainWindow):
         return basal_points
 
     def reconstruct_mesh(self):
-        """Reconstruct a 3D mesh from the segmented point cloud."""
+        """Reconstruct a 3D mesh from the segmented point cloud using the clean pipeline."""
         self.gui.hide_all_buttons()
         
         if self.mesh_reconstruction_stage == 0:
-            # First stage: Show intermediate visualization
+            # First stage: Prepare bottom face and show intermediate visualization
             if self.basal_points is None:
                 # Use optimized method to detect basal points
                 self.basal_points = self.detect_basal_points_optimized(
@@ -893,41 +921,56 @@ class MainWindow(QMainWindow):
                 )
 
             try:
-                # # Check if DBSCAN cleaning option exists and is checked
-                # use_dbscan = hasattr(self, 'dbscan_checkbox') and self.dbscan_checkbox.isChecked()
-                
-                self.gui.set_instructions("Preparing mesh reconstruction..." 
-                                        #   +(" (with DBSCAN outlier removal)" if use_dbscan else "")
-                                         )
+                self.gui.set_instructions("Preparing mesh reconstruction...")
                 
                 # Reset noise removal history when starting new reconstruction
                 self.noise_removal_history = []
                 
-                # Get intermediate visualization data
-                self.prepared_mesh_data = self.mesh_processor.reconstruct_mesh(
+                # Reset normal method to default
+                self.current_normal_method = 'pymeshlab'
+                
+                # Step 1: Prepare bottom face using the clean pipeline
+                preparation_result = self.mesh_processor.prepare_bottom_face(
                     self.pcd,
                     labels=np.asarray(self.segmenter.labels),
                     basal_points=self.basal_points,
                     dense_basal_parts=self.dense_basal_parts if hasattr(self, 'dense_basal_parts') else None,
                     dense_basal_parts_is_lateral=self.dense_basal_parts_is_lateral if hasattr(self, 'dense_basal_parts_is_lateral') else None,
-                    # use_dbscan_cleaning=use_dbscan,
-                    debug_mode=False,  # No debug visualizations in GUI
-                    intermediate_visualization=True  # Show intermediate and return early
+                    use_dbscan_cleaning=False,  # Can be made configurable
+                    basal_parts_metadata=getattr(self, 'basal_parts_metadata', None)  # Pass enhanced metadata
                 )
                 
-                # Handle visualization using separate process
-                if self.prepared_mesh_data and len(self.prepared_mesh_data) == 4:
-                    rock_pcd, bottom_pcd, combined_points, combined_colors = self.prepared_mesh_data
-                    
-                    # Start visualization in separate process
-                    self.start_visualization_process(
-                        target=self.visualizer.show_point_cloud,
-                        args=(combined_points, combined_colors, "After SOR Filter")
+                # Step 2: Compute normals and prepare visualization
+                rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = \
+                    self.mesh_processor.compute_normals_for_visualization(
+                        preparation_result.rock_points, 
+                        preparation_result.bottom_points
                     )
                 
+                # Store the prepared data in the new clean format
+                self.prepared_mesh_data = {
+                    'rock_pcd': rock_pcd,
+                    'bottom_pcd': bottom_pcd,
+                    'combined_points': combined_points,
+                    'combined_colors': combined_colors,
+                    'combined_normals': combined_normals,
+                    'preparation_result': preparation_result
+                }
+                
+                # Start visualization in separate process - passing normals to preserve PyMeshLab orientation
+                self.start_visualization_process(
+                    target=self.visualizer.show_point_cloud,
+                    args=(combined_points, combined_colors, "Visualizing point cloud with normals", False, None, True, combined_normals)
+                )
+                
                 self.mesh_reconstruction_stage = 1
-                self.gui.set_instructions("New bottom face generated, and noise removed.\nPlease use below \"Remove Noise\" button to further remove the noise\nor else \"Reconstruct Mesh\" to complete reconstruction.")
-                self.gui.show_buttons(['remove_noise_button', 'reconstruct_mesh_button'])
+                self.gui.set_instructions("New bottom face generated.\nChoose normal orientation method or proceed with mesh reconstruction.")
+                
+                # Show buttons based on current normal method
+                if self.current_normal_method == 'pymeshlab':
+                    self.gui.show_buttons(['fallback_normals_button', 'remove_noise_button', 'reconstruct_mesh_button'])
+                else:  # separate method
+                    self.gui.show_buttons(['redo_pymeshlab_normals_button', 'remove_noise_button', 'reconstruct_mesh_button'])
 
             except Exception as e:
                 logging.error(f"Error in mesh reconstruction preparation: {str(e)}")
@@ -939,45 +982,15 @@ class MainWindow(QMainWindow):
             try:
                 self.gui.set_instructions("Completing mesh reconstruction...")
                 
-                # Unpack the prepared data
-                rock_pcd, bottom_pcd, combined_points, combined_colors = self.prepared_mesh_data
+                # Get the current data from our clean structure
+                rock_pcd = self.prepared_mesh_data['rock_pcd']
+                bottom_pcd = self.prepared_mesh_data['bottom_pcd']
                 
-                # Continue with mesh reconstruction
-                combined_normals = np.vstack((
-                    np.asarray(rock_pcd.normals),
-                    np.asarray(bottom_pcd.normals)
-                ))
-
-                # Create final point cloud
-                new_pcd = o3d.geometry.PointCloud()
-                new_pcd.points = o3d.utility.Vector3dVector(combined_points)
-                new_pcd.normals = o3d.utility.Vector3dVector(combined_normals)
-                new_pcd.paint_uniform_color([1, 0, 0])
-
-                # Perform Poisson reconstruction
-                logging.info("Using Open3D Poisson reconstruction...")
-                self.reconstructed_mesh = self.mesh_processor.poisson_reconstruction(
-                    new_pcd,
-                    depth=8,
-                    width=0.0,
-                    scale=1.5,
-                    linear_fit=False
+                # Step 3: Complete mesh reconstruction using the clean pipeline
+                self.reconstructed_mesh = self.mesh_processor.complete_mesh_reconstruction(
+                    rock_pcd, bottom_pcd, depth=8
                 )
                 
-                # Post-process the mesh
-                self.reconstructed_mesh.remove_degenerate_triangles()
-                self.reconstructed_mesh.remove_duplicated_triangles()
-                self.reconstructed_mesh.remove_duplicated_vertices()
-                self.reconstructed_mesh.remove_non_manifold_edges()
-                
-                # Store the mesh in mesh_processor for saving
-                self.mesh_processor.reconstructed_mesh = self.reconstructed_mesh
-                
-                # Save temporary mesh for visualization
-                with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as temp_file:
-                    self.mesh_processor.temp_mesh_path = temp_file.name
-                o3d.io.write_triangle_mesh(self.mesh_processor.temp_mesh_path, self.reconstructed_mesh)
-
                 self.mesh_reconstruction_stage = 2
                 self.gui.set_instructions("Mesh reconstruction completed.")
                 self.gui.show_buttons(['save_mesh_button', 'compute_geometric_analysis_button', 'restart_button'])
@@ -991,6 +1004,94 @@ class MainWindow(QMainWindow):
                 logging.error(f"Error completing mesh reconstruction: {str(e)}")
                 self.gui.set_instructions("Error completing mesh reconstruction. Please try again.")
                 self.mesh_reconstruction_stage = 0
+
+    def fallback_to_separate_normals(self):
+        """Fallback to separate normal reorientation method and update visualization."""
+        if self.mesh_reconstruction_stage == 1 and self.prepared_mesh_data:
+            try:
+                self.gui.set_instructions("Switching to separate normal reorientation method...")
+                
+                # Get the preparation result from our stored data
+                preparation_result = self.prepared_mesh_data['preparation_result']
+                
+                # Use the separate orientation method for normal computation
+                rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = \
+                    self.mesh_processor.compute_normals_for_visualization_separate(
+                        preparation_result.rock_points, 
+                        preparation_result.bottom_points
+                    )
+                
+                # Update the prepared data with new normals
+                self.prepared_mesh_data.update({
+                    'rock_pcd': rock_pcd,
+                    'bottom_pcd': bottom_pcd,
+                    'combined_points': combined_points,
+                    'combined_colors': combined_colors,
+                    'combined_normals': combined_normals
+                })
+                
+                # Update current method tracking
+                self.current_normal_method = 'separate'
+                
+                # Update visualization with new normals
+                self.start_visualization_process(
+                    target=self.visualizer.show_point_cloud,
+                    args=(combined_points, combined_colors, "Separate Normal Reorientation Method", False, None, True, combined_normals)
+                )
+                
+                # Update instructions and buttons
+                self.gui.set_instructions("Switched to separate normal reorientation method.\nYou can now compare or switch back to PyMeshLab method.")
+                self.gui.show_buttons(['remove_noise_button', 'reconstruct_mesh_button', 'redo_pymeshlab_normals_button'])
+                
+                logging.info("Successfully switched to separate normal reorientation method")
+                
+            except Exception as e:
+                logging.error(f"Error switching to separate normals: {str(e)}")
+                self.gui.set_instructions("Error switching normal method. Please try again.")
+
+    def redo_pymeshlab_normals(self):
+        """Redo PyMeshLab normal reorientation and update visualization."""
+        if self.mesh_reconstruction_stage == 1 and self.prepared_mesh_data:
+            try:
+                self.gui.set_instructions("Switching back to PyMeshLab normal reorientation...")
+                
+                # Get the preparation result from our stored data
+                preparation_result = self.prepared_mesh_data['preparation_result']
+                
+                # Use PyMeshLab method for normal computation
+                rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = \
+                    self.mesh_processor.compute_normals_for_visualization(
+                        preparation_result.rock_points, 
+                        preparation_result.bottom_points
+                    )
+                
+                # Update the prepared data with new normals
+                self.prepared_mesh_data.update({
+                    'rock_pcd': rock_pcd,
+                    'bottom_pcd': bottom_pcd,
+                    'combined_points': combined_points,
+                    'combined_colors': combined_colors,
+                    'combined_normals': combined_normals
+                })
+                
+                # Update current method tracking
+                self.current_normal_method = 'pymeshlab'
+                
+                # Update visualization with new normals
+                self.start_visualization_process(
+                    target=self.visualizer.show_point_cloud,
+                    args=(combined_points, combined_colors, "PyMeshLab Normal Reorientation Method", False, None, True, combined_normals)
+                )
+                
+                # Update instructions and buttons
+                self.gui.set_instructions("Switched back to PyMeshLab normal reorientation method.\nYou can now compare or switch to separate method.")
+                self.gui.show_buttons(['remove_noise_button', 'reconstruct_mesh_button', 'fallback_normals_button'])
+                
+                logging.info("Successfully switched back to PyMeshLab normal reorientation method")
+                
+            except Exception as e:
+                logging.error(f"Error switching to PyMeshLab normals: {str(e)}")
+                self.gui.set_instructions("Error switching normal method. Please try again.")
                 
     def save_mesh(self):
         """
@@ -1185,16 +1286,20 @@ class MainWindow(QMainWindow):
                     logging.info("Moving to next part")
                     self.continue_multi_part_input()
                 else:
-                    logging.info("All parts collected, combining points")
+                    logging.info("All parts collected, building metadata structure")
                     # Store the loop closure preference
                     self.close_loop = self.close_loop_checkbox.isChecked()
                     # Remove the checkbox as it's no longer needed
                     if hasattr(self, 'close_loop_checkbox') and self.close_loop_checkbox.parent():
                         self.close_loop_checkbox.setParent(None)
                     
-                    # Process each part separately with loop closure set to False
-                    self.dense_basal_parts = []
-                    self.dense_basal_parts_is_lateral = []  # Track which dense parts are lateral
+                    # Initialize the basal parts metadata structure
+                    self.basal_parts_metadata = {
+                        'parts': [],
+                        'close_loop': self.close_loop,
+                        'num_parts': len(self.basal_parts),
+                        'has_lateral_parts': any(self.part_is_lateral)
+                    }
                     
                     # Define distinct colors for different parts
                     part_colors = [
@@ -1210,6 +1315,7 @@ class MainWindow(QMainWindow):
                     base_colors = np.full((len(points), 3), [0.5, 0.5, 0.5])
                     all_basal_indices = []
                     
+                    # Process each part and build structured metadata
                     for i, (part_points, is_lateral) in enumerate(zip(self.basal_parts, self.part_is_lateral)):
                         # Create a temporary point cloud for this part
                         temp_pcd = o3d.geometry.PointCloud()
@@ -1217,32 +1323,46 @@ class MainWindow(QMainWindow):
                         
                         # Run basal point estimation for this part
                         algorithm = BasalPointAlgorithm(temp_pcd)
-                        # Pass False to prevent individual parts from closing loops, and enable visualization
                         part_type = "lateral" if is_lateral else "basal"
                         self.gui.set_instructions(f"Processing {part_type} part {i+1}/{len(self.basal_parts)}...")
                         dense_part = algorithm.run(part_points, show_progress=False, close_loop=False)
+                        
                         if dense_part is not None and len(dense_part) > 0:
-                            self.dense_basal_parts.append(dense_part)
-                            self.dense_basal_parts_is_lateral.append(is_lateral)
-                            
                             # Find indices for this part's points
                             tree = cKDTree(points)
                             _, part_indices = tree.query(dense_part)
                             all_basal_indices.extend(part_indices)
                             
+                            # Build part metadata structure
+                            part_metadata = {
+                                'id': i + 1,  # 1-based part ID
+                                'is_lateral': is_lateral,
+                                'original_points': part_points,  # Original selected points
+                                'dense_points': dense_part,      # Dense generated points
+                                'point_indices': part_indices,   # Indices in point cloud
+                                'num_points': len(part_indices),
+                                'color': part_colors[i % len(part_colors)]
+                            }
+                            
+                            # Add to metadata structure
+                            self.basal_parts_metadata['parts'].append(part_metadata)
+                            
                             # Color this part's points with its designated color
-                            # Use lighter color for lateral points
-                            color = part_colors[i % len(part_colors)]  # Cycle through colors if more parts than colors
+                            color = part_colors[i % len(part_colors)]
                             if is_lateral:
                                 # Make lateral points lighter (add 0.3 to each channel, capped at 1.0)
                                 color = [min(1.0, c + 0.3) for c in color]
                             base_colors[part_indices] = color
                     
-                    # Combine all parts for region growing
-                    if self.dense_basal_parts:
-                        self.poc_points = np.concatenate(self.dense_basal_parts)
+                    # Maintain backward compatibility: still populate legacy arrays
+                    if self.basal_parts_metadata['parts']:
+                        # Flatten for legacy compatibility
+                        self.dense_basal_parts = [part['dense_points'] for part in self.basal_parts_metadata['parts']]
+                        self.dense_basal_parts_is_lateral = [part['is_lateral'] for part in self.basal_parts_metadata['parts']]
+                        self.poc_points = np.concatenate([part['dense_points'] for part in self.basal_parts_metadata['parts']])
                         self.basal_points = np.array(all_basal_indices)
-                        logging.info(f"Combined {len(self.poc_points)} total points")
+                        
+                        logging.info(f"Built metadata for {len(self.basal_parts_metadata['parts'])} parts with {len(self.poc_points)} total points")
                         
                         # Update point cloud colors
                         self.pcd.colors = o3d.utility.Vector3dVector(base_colors)
@@ -1290,10 +1410,18 @@ class MainWindow(QMainWindow):
             # Prepare basal points and lateral flags for geometric analysis
             basal_points_coords = np.asarray(self.pcd.points)[self.basal_points]
             
-            # Create lateral flags for each basal point
+            # Create lateral flags for each basal point using enhanced metadata if available
             lateral_flags = None
-            if hasattr(self, 'dense_basal_parts_is_lateral') and hasattr(self, 'dense_basal_parts'):
-                # Create a flag array for each basal point
+            if hasattr(self, 'basal_parts_metadata') and self.basal_parts_metadata and 'parts' in self.basal_parts_metadata:
+                # Use enhanced metadata structure
+                lateral_flags = []
+                for part in self.basal_parts_metadata['parts']:
+                    part_size = len(part['dense_points'])
+                    lateral_flags.extend([part['is_lateral']] * part_size)
+                lateral_flags = np.array(lateral_flags)
+                logging.info(f"Created lateral flags from enhanced metadata: {len(lateral_flags)} flags, {sum(lateral_flags)} lateral points")
+            elif hasattr(self, 'dense_basal_parts_is_lateral') and hasattr(self, 'dense_basal_parts'):
+                # Fallback to legacy format
                 lateral_flags = []
                 current_idx = 0
                 
@@ -1304,7 +1432,7 @@ class MainWindow(QMainWindow):
                     current_idx += part_size
                 
                 lateral_flags = np.array(lateral_flags)
-                logging.info(f"Created lateral flags: {len(lateral_flags)} flags, {sum(lateral_flags)} lateral points")
+                logging.info(f"Created lateral flags from legacy format: {len(lateral_flags)} flags, {sum(lateral_flags)} lateral points")
 
             # Compute geometric properties using the geometric analyzer
             results = self.geometric_analyzer.compute_geometric_properties(
@@ -1348,17 +1476,69 @@ class MainWindow(QMainWindow):
             )
             
             # Show alpha view visualization
+            mesh_file_path = None
+            
+            # Try to use existing temp mesh path first
             if hasattr(self.mesh_processor, 'temp_mesh_path') and self.mesh_processor.temp_mesh_path:
-                self.start_visualization_process(
-                    target=self.visualizer.show_mesh_with_alpha_view,
-                    args=(
-                        self.mesh_processor.temp_mesh_path,
-                        results['center_of_mass'],
-                        results['alpha_plane_normal'],
-                        f"Alpha View - {self.current_pbr_file} (α={results['alpha_angle']:.1f}°)",
-                        pedestal_points,  # Pass pedestal points
-                        results['min_alpha_basal_point']  # Pass the alpha angle point
+                import os
+                if os.path.exists(self.mesh_processor.temp_mesh_path):
+                    mesh_file_path = self.mesh_processor.temp_mesh_path
+                    logging.info(f"Using existing temp mesh file: {mesh_file_path}")
+                else:
+                    logging.warning(f"Temp mesh file does not exist: {self.mesh_processor.temp_mesh_path}")
+            
+            # If temp mesh doesn't exist, try to use saved mesh file
+            if mesh_file_path is None and hasattr(self, 'mesh_path') and self.mesh_path != "Reconstructed Mesh was not saved":
+                import os
+                if os.path.exists(self.mesh_path):
+                    mesh_file_path = self.mesh_path
+                    logging.info(f"Using saved mesh file: {mesh_file_path}")
+                else:
+                    logging.warning(f"Saved mesh file does not exist: {self.mesh_path}")
+            
+            # If neither exists, create a new temporary mesh file
+            if mesh_file_path is None and hasattr(self.mesh_processor, 'reconstructed_mesh') and self.mesh_processor.reconstructed_mesh is not None:
+                import tempfile
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as temp_file:
+                        temp_mesh_path = temp_file.name
+                    
+                    # Write the mesh to the temporary file
+                    o3d.io.write_triangle_mesh(temp_mesh_path, self.mesh_processor.reconstructed_mesh)
+                    
+                    # Verify the file was written successfully
+                    if os.path.exists(temp_mesh_path):
+                        mesh_file_path = temp_mesh_path
+                        self.mesh_processor.temp_mesh_path = temp_mesh_path  # Update the reference
+                        logging.info(f"Created new temp mesh file: {mesh_file_path}")
+                    else:
+                        logging.error("Failed to create temporary mesh file")
+                except Exception as temp_error:
+                    logging.error(f"Error creating temporary mesh file: {temp_error}")
+            
+            # Show alpha view if we have a valid mesh file
+            if mesh_file_path:
+                try:
+                    self.start_visualization_process(
+                        target=self.visualizer.show_mesh_with_alpha_view,
+                        args=(
+                            mesh_file_path,
+                            results['center_of_mass'],
+                            results['alpha_plane_normal'],
+                            f"Alpha View - {self.current_pbr_file} (α={results['alpha_angle']:.1f}°)",
+                            pedestal_points,  # Pass pedestal points
+                            results['min_alpha_basal_point']  # Pass the alpha angle point
+                        )
                     )
+                except Exception as viz_error:
+                    logging.error(f"Error starting alpha view visualization: {viz_error}")
+                    self.gui.set_instructions(
+                        f"Geometric analysis completed.\nResults saved to: {csv_path}\n\nWarning: Could not show alpha view due to visualization error."
+                    )
+            else:
+                logging.warning("No valid mesh file available for alpha view visualization")
+                self.gui.set_instructions(
+                    f"Geometric analysis completed.\nResults saved to: {csv_path}\n\nWarning: Alpha view not available - no valid mesh file found."
                 )
             
             # Show next PBR button
