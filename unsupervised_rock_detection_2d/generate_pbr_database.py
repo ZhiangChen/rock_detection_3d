@@ -18,8 +18,24 @@ o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
 stats = FilterStats()
 
-def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=False):
+def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=False, 
+                 filter_params=None):
     """Process a single rock with filtering and dimension calculation."""
+    # Set default filter parameters if not provided
+    if filter_params is None:
+        filter_params = {
+            'vertical_std': 1.5,
+            'sor_k_neighbors': 100,
+            'sor_std_ratio': 1.0,
+            'max_height_width_ratio': 1.5,
+            'max_volume': 10,
+            'min_density': 19,
+            'max_clusters': 5,
+            'max_normal_consistency': 0.7,
+            'normal_search_radius': 0.1,
+            'normal_max_nn': 30
+        }
+    
     try:
         # print(f"\nProcessing rock: {os.path.basename(file_path)}")
         
@@ -36,12 +52,15 @@ def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=Fals
         try:
             # 1. Vertical filter
             pcd_before = copy.deepcopy(pcd)  # Use deepcopy instead of clone
-            pcd, _ = filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=True, vertical_std=1.5)
+            pcd, _ = filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=True, 
+                                      vertical_std=filter_params['vertical_std'])
             stats.log_filter('vertical_filter', len(pcd_before.points), len(pcd.points), pcd_before, pcd, debug_viz)
 
             # 2. Statistical Outlier Removal (SOR) filter
             pcd_before = copy.deepcopy(pcd)  # Use deepcopy instead of clone
-            pcd, _ = filter_point_cloud(pcd, filter_type='sor', k_neighbors=100, std_ratio=1.0)
+            pcd, _ = filter_point_cloud(pcd, filter_type='sor', 
+                                      k_neighbors=filter_params['sor_k_neighbors'], 
+                                      std_ratio=filter_params['sor_std_ratio'])
             stats.log_filter('sor_filter', len(pcd_before.points), len(pcd.points), pcd_before, pcd, debug_viz)
 
             # 3. Height filter
@@ -57,26 +76,26 @@ def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=Fals
             x_size = max_bounds[0] - min_bounds[0] - (2 * padding)
             y_size = max_bounds[1] - min_bounds[1] - (2 * padding)
             width = max(x_size, y_size)
-            if width <= 0 or height / width > 1.5:
+            if width <= 0 or height / width > filter_params['max_height_width_ratio']:
                 stats.log_rejection('extreme_height_width_ratio', os.path.basename(file_path))
                 return None
 
             # 5. Volume filter
             volume = estimate_volume(pcd)
-            if volume > 10:
+            if volume > filter_params['max_volume']:
                 stats.log_rejection('volume_too_large', os.path.basename(file_path))
                 return None
 
             # 6. Density filter
             density = compute_point_density(pcd)
-            if density <= 19:
+            if density <= filter_params['min_density']:
                 stats.log_rejection('low_density', os.path.basename(file_path))
                 return None
 
             # 7. Cluster check
             labels = cluster_points(np.asarray(pcd.points))
             unique_labels, counts = np.unique(labels, return_counts=True)
-            if len(unique_labels) >= 5:
+            if len(unique_labels) >= filter_params['max_clusters']:
                 stats.log_rejection('too_many_clusters', os.path.basename(file_path))
                 return None
 
@@ -88,7 +107,9 @@ def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=Fals
             #     return None
 
             # 9. Normal consistency filter
-            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=filter_params['normal_search_radius'], 
+                max_nn=filter_params['normal_max_nn']))
             normals = np.asarray(pcd.normals)
             consistencies = []
             sample_size = min(1000, len(filtered_points))
@@ -98,7 +119,7 @@ def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=Fals
                     dot_product = np.abs(np.dot(normals[indices[i]], normals[indices[j]]))
                     consistencies.append(dot_product)
             avg_consistency = np.mean(consistencies)
-            if avg_consistency >= 0.7:
+            if avg_consistency >= filter_params['max_normal_consistency']:
                 stats.log_rejection('high_normal_consistency', os.path.basename(file_path))
                 return None
 
@@ -192,7 +213,7 @@ def estimate_volume(pcd, alpha=0.5):
 
 
 def generate_pbr_database(input_dir, output_file, max_rocks=100, height_range=(0.3, 5.0), 
-                         padding=0.2, debug_viz=False):
+                         padding=0.2, debug_viz=False, filter_params=None):
     """Generate PBR database after filtering and selecting most fragile rocks."""
     print(f"Analyzing rocks in: {input_dir}")
     
@@ -211,7 +232,7 @@ def generate_pbr_database(input_dir, output_file, max_rocks=100, height_range=(0
     print("Processing rocks with filtering and calculating ratios...")
     num_cores = os.cpu_count()-1  # Use appropriate number of cores
     rock_data = Parallel(n_jobs=num_cores)(
-        delayed(process_rock)(os.path.join(input_dir, las_file), padding, height_range, debug_viz)
+        delayed(process_rock)(os.path.join(input_dir, las_file), padding, height_range, debug_viz, filter_params)
         for las_file in tqdm(las_files, desc="Processing rocks")
     )
     
@@ -272,7 +293,43 @@ if __name__ == "__main__":
     parser.add_argument('--debug-viz', action='store_true',
                        help='Enable visualization of filter steps')
     
+    # Filter parameters
+    parser.add_argument('--vertical-std', type=float, default=1.5,
+                       help='Standard deviation threshold for vertical filter (default: 1.5)')
+    parser.add_argument('--sor-k-neighbors', type=int, default=100,
+                       help='Number of neighbors for SOR filter (default: 100)')
+    parser.add_argument('--sor-std-ratio', type=float, default=1.0,
+                       help='Standard deviation ratio for SOR filter (default: 1.0)')
+    parser.add_argument('--max-height-width-ratio', type=float, default=1.3,
+                       help='Maximum height/width ratio threshold (default: 1.3)')
+    parser.add_argument('--max-volume', type=float, default=10,
+                       help='Maximum volume threshold (default: 10)')
+    parser.add_argument('--min-density', type=float, default=19,
+                       help='Minimum point density threshold (default: 19)')
+    parser.add_argument('--max-clusters', type=int, default=5,
+                       help='Maximum number of clusters allowed (default: 5)')
+    parser.add_argument('--max-normal-consistency', type=float, default=0.7,
+                       help='Maximum normal consistency threshold (default: 0.7)')
+    parser.add_argument('--normal-search-radius', type=float, default=0.1,
+                       help='Search radius for normal estimation (default: 0.1)')
+    parser.add_argument('--normal-max-nn', type=int, default=30,
+                       help='Maximum nearest neighbors for normal estimation (default: 30)')
+    
     args = parser.parse_args()
+    
+    # Create filter parameters dictionary
+    filter_params = {
+        'vertical_std': args.vertical_std,
+        'sor_k_neighbors': args.sor_k_neighbors,
+        'sor_std_ratio': args.sor_std_ratio,
+        'max_height_width_ratio': args.max_height_width_ratio,
+        'max_volume': args.max_volume,
+        'min_density': args.min_density,
+        'max_clusters': args.max_clusters,
+        'max_normal_consistency': args.max_normal_consistency,
+        'normal_search_radius': args.normal_search_radius,
+        'normal_max_nn': args.normal_max_nn
+    }
     
     generate_pbr_database(
         args.input,
@@ -280,5 +337,6 @@ if __name__ == "__main__":
         max_rocks=args.max_rocks,
         height_range=(args.min_height, args.max_height),
         padding=args.padding,
-        debug_viz=args.debug_viz
+        debug_viz=args.debug_viz,
+        filter_params=filter_params
     )

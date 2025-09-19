@@ -221,3 +221,8 @@ unsupervised_rock_detection_3d/Data
 unsupervised_rock_detection_3d/Experimental Scripts
 unsupervised_rock_detection_2d/Data
 unsupervised_rock_detection_2d/Data/*
+unsupervised_rock_detection_2d/candidate_rocks/*
+unsupervised_rock_detection_2d/pond1_lidar_new_thresholds/*
+unsupervised_rock_detection_3d/rock_583.laz
+unsupervised_rock_detection_3d/PYMESHLAB_README.md
+unsupervised_rock_detection_3d/LAS_CLASSIFICATION_UPDATE.md

@@ -44,7 +44,7 @@ class PointCloudVisualization:
             # Add spheres for seed points if provided
             if seed_points is not None:
                 for point, color in seed_points:
-                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+                    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.04)
                     sphere.translate(point)
                     sphere.paint_uniform_color(color)
                     geometries.append(sphere)
@@ -197,6 +197,10 @@ class PointCloudVisualization:
                 pedestal_pcd.points = o3d.utility.Vector3dVector(pedestal_points)
                 # Color pedestal points blue
                 pedestal_pcd.paint_uniform_color([0.0, 0.0, 1.0])  # Blue
+                # estimate normals for better visualization
+                pedestal_pcd.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=50)
+                )
                 geometries.append(pedestal_pcd)
                 print(f"Added {len(pedestal_points)} pedestal points (blue)")
             
