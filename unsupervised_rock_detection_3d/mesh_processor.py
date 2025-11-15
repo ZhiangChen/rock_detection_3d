@@ -11,6 +11,7 @@ from scipy.spatial import cKDTree
 import traceback
 import os
 from sklearn.cluster import DBSCAN
+from multiprocessing.connection import Connection
 
 # Try to import PyMeshLab
 try:
@@ -39,6 +40,7 @@ class MeshProcessor:
     def __init__(self):
         self.temp_mesh_path = None
         self.reconstructed_mesh = None
+        self.last_error_message: str = ""
 
     def clean_outliers_dbscan(self, pcd: o3d.geometry.PointCloud, 
                              eps: float = 0.05, 
@@ -166,8 +168,11 @@ class MeshProcessor:
             # Extract dense basal parts from enhanced metadata if available
             if basal_parts_metadata is not None and 'parts' in basal_parts_metadata:
                 # Extract from enhanced metadata
-                dense_basal_parts = [part['dense_points'] for part in basal_parts_metadata['parts']]
-                dense_basal_parts_is_lateral = [part['is_lateral'] for part in basal_parts_metadata['parts']]
+                dense_basal_parts = [
+                    np.asarray(part.get('dense_points', []), dtype=float)
+                    for part in basal_parts_metadata['parts']
+                ]
+                dense_basal_parts_is_lateral = [part.get('is_lateral', False) for part in basal_parts_metadata['parts']]
                 logging.info(f"Using enhanced basal metadata with {len(dense_basal_parts)} parts")
             elif dense_basal_parts is None:
                 # Fallback: no dense parts available
@@ -254,7 +259,13 @@ class MeshProcessor:
             logging.error(f"Error in prepare_bottom_face: {str(e)}")
             raise
 
-    def compute_normals_for_visualization(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> tuple:
+    def compute_normals_for_visualization(
+        self,
+        rock_points: np.ndarray,
+        bottom_points: np.ndarray,
+        k: Optional[int] = None,
+        smooth_iter: int = 0,
+    ) -> tuple:
         """
         Computes normals for rock and bottom points, preparing them for visualization.
         
@@ -266,8 +277,15 @@ class MeshProcessor:
             tuple: (rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
         """
         try:
+            neighbor_count = max(3, int(k) if k else 200)
+
             # Use PyMeshLab for enhanced normal computation (with fallback to separate orientation)
-            rock_pcd, bottom_pcd = self.compute_normals_pymeshlab(rock_points, bottom_points)
+            rock_pcd, bottom_pcd = self.compute_normals_pymeshlab(
+                rock_points,
+                bottom_points,
+                k_neighbors=neighbor_count,
+                smooth_iter=smooth_iter,
+            )
             
             # Prepare visualization data
             combined_points = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
@@ -285,7 +303,12 @@ class MeshProcessor:
             logging.error(f"Error in compute_normals_for_visualization: {str(e)}")
             raise
 
-    def compute_normals_for_visualization_separate(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> tuple:
+    def compute_normals_for_visualization_separate(
+        self,
+        rock_points: np.ndarray,
+        bottom_points: np.ndarray,
+        k: Optional[int] = None,
+    ) -> tuple:
         """
         Computes normals using separate orientation method (fallback) for visualization.
         
@@ -297,8 +320,14 @@ class MeshProcessor:
             tuple: (rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
         """
         try:
+            neighbor_count = max(3, int(k) if k else 200)
+
             # Use separate orientation method for normal computation
-            rock_pcd, bottom_pcd = self._compute_normals_separate_orientation(rock_points, bottom_points)
+            rock_pcd, bottom_pcd = self._compute_normals_separate_orientation(
+                rock_points,
+                bottom_points,
+                max_nn=neighbor_count,
+            )
            
             # Prepare visualization data
             combined_points = np.vstack((np.asarray(rock_pcd.points), np.asarray(bottom_pcd.points)))
@@ -386,20 +415,26 @@ class MeshProcessor:
             new_pcd.paint_uniform_color([1, 0, 0])
 
             logging.info("Using Open3D Poisson reconstruction...")
+            self.last_error_message = ""
             self.reconstructed_mesh = self.poisson_reconstruction(
                 new_pcd,
-                depth=depth,        # Use the provided depth parameter
-                width=0.0,          # Added density filtering
-                scale=1.5,          # Slightly larger scale
-                linear_fit=False    # Use False as in the test file
+                depth=depth,
+                width=0.0,
+                scale=1.5,
+                linear_fit=False,
             )
-            
+
+            if self.reconstructed_mesh is None:
+                if not self.last_error_message:
+                    self.last_error_message = "Poisson reconstruction returned no mesh."
+                return None
+
             # Post-process the mesh
             self.reconstructed_mesh.remove_degenerate_triangles()
             self.reconstructed_mesh.remove_duplicated_triangles()
             self.reconstructed_mesh.remove_duplicated_vertices()
             self.reconstructed_mesh.remove_non_manifold_edges()
-        
+
             # Save temporary mesh for visualization
             with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as temp_file:
                 self.temp_mesh_path = temp_file.name
@@ -407,12 +442,77 @@ class MeshProcessor:
 
             return self.reconstructed_mesh
 
-        except Exception as e:
-            logging.error(f"Error in complete_mesh_reconstruction: {str(e)}")
-            raise
+        except BaseException as e:
+            self.last_error_message = str(e)
+            logging.error("Error in complete_mesh_reconstruction: %s", e, exc_info=True)
+            self.reconstructed_mesh = None
+            self.temp_mesh_path = None
+            return None
 
     @staticmethod
-    def poisson_reconstruction(pcd: o3d.geometry.PointCloud, 
+    def poisson_worker_entrypoint(conn: Connection, payload: dict) -> None:
+        """Run Poisson reconstruction in an isolated process and stream back results."""
+        try:
+            processor = MeshProcessor()
+
+            rock_points = payload.get('rock_points')
+            rock_normals = payload.get('rock_normals')
+            bottom_points = payload.get('bottom_points')
+            bottom_normals = payload.get('bottom_normals')
+            depth = int(payload.get('depth', 8))
+
+            if rock_points is None or rock_normals is None or bottom_points is None or bottom_normals is None:
+                conn.send({
+                    'success': False,
+                    'message': 'Worker payload missing required arrays.',
+                })
+                return
+
+            rock_points = np.asarray(rock_points)
+            rock_normals = np.asarray(rock_normals)
+            bottom_points = np.asarray(bottom_points)
+            bottom_normals = np.asarray(bottom_normals)
+
+            if rock_points.size == 0 or bottom_points.size == 0:
+                conn.send({
+                    'success': False,
+                    'message': 'Rock or bottom point arrays are empty. Cannot run Poisson.',
+                })
+                return
+
+            rock_pcd = o3d.geometry.PointCloud()
+            rock_pcd.points = o3d.utility.Vector3dVector(rock_points)
+            rock_pcd.normals = o3d.utility.Vector3dVector(rock_normals)
+
+            bottom_pcd = o3d.geometry.PointCloud()
+            bottom_pcd.points = o3d.utility.Vector3dVector(bottom_points)
+            bottom_pcd.normals = o3d.utility.Vector3dVector(bottom_normals)
+
+            mesh = processor.complete_mesh_reconstruction(rock_pcd, bottom_pcd, depth=depth)
+            if mesh is None or processor.temp_mesh_path is None:
+                conn.send({
+                    'success': False,
+                    'message': processor.last_error_message or 'Poisson reconstruction failed.'
+                })
+                return
+
+            conn.send({
+                'success': True,
+                'mesh_path': processor.temp_mesh_path,
+            })
+        except BaseException as exc:  # noqa: BLE001
+            conn.send({
+                'success': False,
+                'message': str(exc),
+                'traceback': traceback.format_exc(),
+            })
+        finally:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                pass
+
+    def poisson_reconstruction(self, pcd: o3d.geometry.PointCloud, 
                              depth: int = 8, 
                              width: int = 0,
                              scale: float = 1.1,
@@ -440,11 +540,14 @@ class MeshProcessor:
             mesh.remove_duplicated_vertices()
             mesh.remove_non_manifold_edges()
 
+            self.last_error_message = ""
             return mesh
 
-        except Exception as e:
-            logging.error(f"Error in Poisson reconstruction: {str(e)}")
-            raise
+        except BaseException as e:
+            # Catch BaseException to intercept SystemExit triggered by Open3D internals
+            self.last_error_message = str(e)
+            logging.error("Error in Poisson reconstruction: %s", e, exc_info=True)
+            return None
 
     def generate_bottom_face_points(self, pcd: o3d.geometry.PointCloud, 
                                   basal_indices: np.ndarray,
@@ -473,8 +576,11 @@ class MeshProcessor:
         try:
             # Extract dense basal parts from enhanced metadata if available
             if basal_parts_metadata is not None and 'parts' in basal_parts_metadata:
-                dense_basal_parts = [part['dense_points'] for part in basal_parts_metadata['parts']]
-                dense_basal_parts_is_lateral = [part['is_lateral'] for part in basal_parts_metadata['parts']]
+                dense_basal_parts = [
+                    np.asarray(part.get('dense_points', []), dtype=float)
+                    for part in basal_parts_metadata['parts']
+                ]
+                dense_basal_parts_is_lateral = [part.get('is_lateral', False) for part in basal_parts_metadata['parts']]
                 logging.info(f"Using enhanced basal metadata for bottom face generation with {len(dense_basal_parts)} parts")
             logging.info("Starting bottom face generation")
             
@@ -617,9 +723,9 @@ class MeshProcessor:
             
             # Handle input points based on whether they're dense points or indices
             if is_dense_points:
-                basal_points = points_or_indices  # Already points
+                basal_points = np.asarray(points_or_indices, dtype=float)
             else:
-                basal_points = points[points_or_indices]  # Convert indices to points
+                basal_points = points[np.asarray(points_or_indices, dtype=int)]  # Convert indices to points
             
             # Calculate transformation matrix for 2D projection
             center = np.mean(basal_points, axis=0)
@@ -801,7 +907,7 @@ class MeshProcessor:
         try:
             if not PYMESHLAB_AVAILABLE:
                 logging.warning("PyMeshLab not available. Falling back to separate orientation method.")
-                return self._compute_normals_separate_orientation(rock_points, bottom_points)
+                return self._compute_normals_separate_orientation(rock_points, bottom_points, max_nn=k_neighbors)
             
             logging.info("Computing normals using PyMeshLab...")
             
@@ -862,9 +968,14 @@ class MeshProcessor:
         except Exception as e:
             logging.error(f"Error in PyMeshLab normal computation: {str(e)}")
             logging.info("Falling back to separate orientation method...")
-            return self._compute_normals_separate_orientation(rock_points, bottom_points)
+            return self._compute_normals_separate_orientation(rock_points, bottom_points, max_nn=k_neighbors)
 
-    def _compute_normals_separate_orientation(self, rock_points: np.ndarray, bottom_points: np.ndarray) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
+    def _compute_normals_separate_orientation(
+        self,
+        rock_points: np.ndarray,
+        bottom_points: np.ndarray,
+        max_nn: int = 200,
+    ) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud]:
         """
         Fallback method: Compute normals using separate orientation (current method)
         
@@ -887,13 +998,14 @@ class MeshProcessor:
             
             # Estimate normals with better parameters for rock points
             rock_pcd.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=200)
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=max_nn)
             )
-            rock_pcd.orient_normals_consistent_tangent_plane(100, 10)
+            rock_consistency = max(3, min(max_nn, len(rock_points)))
+            rock_pcd.orient_normals_consistent_tangent_plane(rock_consistency)
             
             # Estimate normals for bottom points
             bottom_pcd.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=200)
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=max_nn)
             )
             
             # Reorient normals for rock_pcd
@@ -917,7 +1029,8 @@ class MeshProcessor:
             bottom_dots = np.sum(bottom_directions * bottom_normals, axis=1)
             bottom_normals[bottom_dots < 0] = -bottom_normals[bottom_dots < 0]
             bottom_pcd.normals = o3d.utility.Vector3dVector(bottom_normals)
-            bottom_pcd.orient_normals_consistent_tangent_plane(100, 10)
+            bottom_consistency = max(3, min(max_nn, len(bottom_points)))
+            bottom_pcd.orient_normals_consistent_tangent_plane(bottom_consistency)
             
             return rock_pcd, bottom_pcd
             

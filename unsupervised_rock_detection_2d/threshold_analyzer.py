@@ -31,14 +31,14 @@ class ThresholdAnalyzer:
             metrics = {
                 'rock_id': os.path.splitext(os.path.basename(file_path))[0],
                 'label': label,
-                'density': self._compute_density(pcd),
-                'eigenvalue_ratio': self._compute_eigenvalue_ratio(pcd),
-                'normal_consistency': self._compute_normal_consistency(pcd),
-                'ground_contact_ratio': self._compute_ground_contact_ratio(pcd),
-                'volume': self._compute_volume(pcd),
-                'height': self._compute_height(points),
-                'height_width_ratio': self._compute_height_width_ratio(points),
-                'cluster_count': self._compute_cluster_count(points)
+                'Density': self._compute_density(pcd),
+                'Eigenvalue Ratio': self._compute_eigenvalue_ratio(pcd),
+                'Normal Consistency': self._compute_normal_consistency(pcd),
+                'Ground Contact Ratio': self._compute_ground_contact_ratio(pcd),
+                'Volume': self._compute_volume(pcd),
+                'Height': self._compute_height(points),
+                'Height/Width Ratio': self._compute_height_width_ratio(points),
+                'Cluster Count': self._compute_cluster_count(points)
             }
             
             # # Print metrics for the current rock
@@ -127,11 +127,16 @@ class ThresholdAnalyzer:
             # Apply outlier removal
             pos_values_clean = remove_extreme_outliers(pos_values)
             neg_values_clean = remove_extreme_outliers(neg_values)
+
+            # Compute common bin edges from both datasets
+            all_values = np.concatenate([pos_values_clean, neg_values_clean])
+            bins = np.histogram_bin_edges(all_values, bins=40)
             
             # Save histogram for the metric
-            plt.figure(figsize=(12, 6))
-            plt.hist(neg_values_clean, bins=30, label='Negative', color='red', alpha=0.5)
-            plt.hist(pos_values_clean, bins=30, label='Positive', color='green', alpha=0.7)
+            plt.figure(figsize=(6, 6))
+            plt.hist(neg_values_clean, bins=bins, label='Negative', color='red', alpha=0.5)
+            plt.hist(pos_values_clean, bins=bins, label='Positive', color='green', alpha=0.7)
+            
             plt.title(f'{metric_name} Histogram (Extreme Outliers Removed)')
             plt.xlabel(metric_name)
             plt.ylabel('Frequency')
@@ -143,7 +148,8 @@ class ThresholdAnalyzer:
             
             plt.legend()
             plt.tight_layout()  # Better layout adjustment
-            histogram_path = os.path.join(self.output_dir, f'{metric_name}_histogram.png')
+            save_name = metric_name.replace(' ', "_").replace('/', "_").lower() + '_histogram.png'
+            histogram_path = os.path.join(self.output_dir, save_name)
             plt.savefig(histogram_path, dpi=150, bbox_inches='tight')
             plt.close()
             
