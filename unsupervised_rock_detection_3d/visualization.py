@@ -1,19 +1,72 @@
-import open3d as o3d
-import numpy as np
 import logging
 import multiprocessing
+import sys
 from multiprocessing import Queue, Event
-import tempfile
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+
+import numpy as np
+import open3d as o3d
 
 class PointCloudVisualization:
     """
     Handles all visualization-related operations for point clouds and meshes using Open3D.
     """
+
+    @staticmethod
+    def _get_visualizer_dimensions() -> Tuple[int, int, int, int]:
+        """Return (width, height, left, top) for Open3D windows constrained to half screen width."""
+        default_width, default_height = 960, 720
+        left, top = 0, 0
+
+        try:
+            if sys.platform == "darwin":
+                from AppKit import NSScreen  # type: ignore
+
+                screen = NSScreen.mainScreen()
+                if screen is not None:
+                    frame = screen.visibleFrame()
+                    width = max(640, int(frame.size.width / 2))
+                    height = max(480, int(frame.size.height * 0.85))
+                    # macOS origin is bottom-left; Open3D expects top-left for positioning.
+                    default_width = width
+                    default_height = height
+                    left = int(frame.origin.x)
+                    top = int(frame.origin.y + frame.size.height - height)
+            elif sys.platform.startswith("win"):
+                from ctypes import windll
+
+                user32 = windll.user32
+                user32.SetProcessDPIAware()
+                screen_width = user32.GetSystemMetrics(0)
+                screen_height = user32.GetSystemMetrics(1)
+                default_width = max(640, screen_width // 2)
+                default_height = max(480, int(screen_height * 0.85))
+            else:
+                import tkinter as tk
+
+                root = tk.Tk()
+                root.withdraw()
+                screen_width = root.winfo_screenwidth()
+                screen_height = root.winfo_screenheight()
+                default_width = max(640, screen_width // 2)
+                default_height = max(480, int(screen_height * 0.85))
+                root.destroy()
+        except Exception:
+            logging.debug("Falling back to default Open3D window size for visualization.")
+
+        return default_width, default_height, left, top
     
     @staticmethod
-    def show_point_cloud(points_or_mesh_path, colors=None,  window_name="Open3D Visualization", is_mesh=False, seed_points=None, point_show_normal=False, normals=None):
+    def show_point_cloud(
+        points_or_mesh_path,
+        colors=None,
+        window_name="Open3D Visualization",
+        is_mesh=False,
+        seed_points=None,
+        point_show_normal=False,
+        normals=None,
+        show_wireframe=None,
+    ):
         """
         Visualize the point cloud or mesh using Open3D.
         
@@ -26,7 +79,10 @@ class PointCloudVisualization:
             normals: Optional numpy array of normals for the points
         """
         geometries = []
+        render_wireframe = is_mesh if show_wireframe is None else bool(show_wireframe)
         
+        width, height, left, top = PointCloudVisualization._get_visualizer_dimensions()
+
         if not is_mesh:
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points_or_mesh_path)
@@ -47,13 +103,32 @@ class PointCloudVisualization:
                     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.04)
                     sphere.translate(point)
                     sphere.paint_uniform_color(color)
+                    sphere.compute_vertex_normals()
                     geometries.append(sphere)
         else:
             # Load the mesh from the file
             geometry = o3d.io.read_triangle_mesh(points_or_mesh_path)
+            if len(geometry.vertices) == 0:
+                logging.warning("Empty mesh encountered for visualization: %s", points_or_mesh_path)
+                return
+
+            geometry.compute_vertex_normals()
             geometries.append(geometry)
+
+            if render_wireframe and len(geometry.triangles) > 0:
+                wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(geometry)
+                wireframe.paint_uniform_color([0.0, 0.0, 0.0])
+                geometries.append(wireframe)
             
-        o3d.visualization.draw_geometries(geometries, window_name=window_name, point_show_normal=point_show_normal)
+        o3d.visualization.draw_geometries(
+            geometries,
+            window_name=window_name,
+            point_show_normal=point_show_normal,
+            width=width,
+            height=height,
+            left=left,
+            top=top,
+        )
 
 
     @staticmethod
@@ -69,9 +144,10 @@ class PointCloudVisualization:
             window_name: Title of the visualization window
         """
         try:
+            width, height, left, top = PointCloudVisualization._get_visualizer_dimensions()
             # Create visualization window
             vis = o3d.visualization.VisualizerWithEditing()
-            vis.create_window(window_name=window_name)
+            vis.create_window(window_name=window_name, width=width, height=height, left=left, top=top)
 
             # Create point cloud and add to visualizer
             pcd = o3d.geometry.PointCloud()
@@ -166,7 +242,9 @@ class PointCloudVisualization:
     def show_mesh_with_alpha_view(mesh_path: str, center_of_mass: np.ndarray, 
                                 alpha_plane_normal: np.ndarray, window_title: str = "Alpha View",
                                 pedestal_points: Optional[np.ndarray] = None,
-                                alpha_angle_point: Optional[np.ndarray] = None):
+                                alpha_angle_point: Optional[np.ndarray] = None,
+                                show_wireframe: bool = True,
+                                show_rods: bool = True):
         """
         Show mesh with camera view perpendicular to the alpha plane.
         
@@ -182,14 +260,32 @@ class PointCloudVisualization:
             import open3d as o3d
             import numpy as np
             
+            width, height, left, top = PointCloudVisualization._get_visualizer_dimensions()
+
             # Load the mesh
             mesh = o3d.io.read_triangle_mesh(mesh_path)
             if len(mesh.vertices) == 0:
                 print(f"Warning: Could not load mesh from {mesh_path}")
                 return
-            
+
+            mesh.compute_vertex_normals()
+
+            # Use mesh bounds to scale visualization helpers (center marker, rod, etc.)
+            bbox = mesh.get_axis_aligned_bounding_box()
+            bbox_extent = np.asarray(bbox.get_extent())
+            bbox_diag = float(np.linalg.norm(bbox_extent)) if bbox_extent.size else 0.0
+            if bbox_diag == 0.0:
+                bbox_diag = 1.0
+            marker_radius = max(0.02, bbox_diag * 0.015)
+            rod_half_length = max(0.1, bbox_diag * 0.45)
+
             # Create list of geometries to display
             geometries = [mesh]
+
+            if show_wireframe and len(mesh.triangles) > 0:
+                wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(mesh)
+                wireframe.paint_uniform_color([0.0, 0.0, 0.0])
+                geometries.append(wireframe)
             
             # Add pedestal points if provided
             if pedestal_points is not None and len(pedestal_points) > 0:
@@ -204,22 +300,81 @@ class PointCloudVisualization:
                 geometries.append(pedestal_pcd)
                 print(f"Added {len(pedestal_points)} pedestal points (blue)")
             
-            # Add alpha angle point as a highlighted sphere if provided
-            if alpha_angle_point is not None:
-                # Create a small sphere at the alpha angle point
-                alpha_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.03)
-                alpha_sphere.translate(alpha_angle_point)
-                # Color the sphere bright green to highlight it
-                alpha_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # Bright green
-                geometries.append(alpha_sphere)
-                print(f"Added alpha angle point sphere at {alpha_angle_point} (bright red)")
-            
-            # Calculate camera parameters for alpha view
-            # The camera should look perpendicular to the alpha plane
-            lookat = center_of_mass
-            
             # Camera front vector is the alpha plane normal (perpendicular to plane)
+            lookat = center_of_mass
             front = alpha_plane_normal / np.linalg.norm(alpha_plane_normal)
+            towards_camera = front  # Open3D front points from lookat toward the camera
+
+            # Add a visible marker at the center of mass so it stays apparent even inside the rock
+            com_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=marker_radius)
+            com_sphere.translate(center_of_mass)
+            com_sphere.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow for visibility
+            com_sphere.compute_vertex_normals()
+            geometries.append(com_sphere)
+
+            marker_tip_offset = max(marker_radius * 1.2, bbox_diag * 0.02)
+            com_tip = center_of_mass + towards_camera * marker_tip_offset
+            com_tip_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=marker_radius * 0.75)
+            com_tip_sphere.translate(com_tip)
+            com_tip_sphere.paint_uniform_color([1.0, 1.0, 0.0])
+            com_tip_sphere.compute_vertex_normals()
+            geometries.append(com_tip_sphere)
+
+            end_cap_radius = max(0.015, marker_radius * 0.6)
+
+            if show_rods:
+                rod_length = max(rod_half_length * 2.0, bbox_diag * 0.65)
+                rod_points = np.vstack([
+                    center_of_mass,
+                    center_of_mass + towards_camera * rod_length,
+                ])
+                rod = o3d.geometry.LineSet(
+                    points=o3d.utility.Vector3dVector(rod_points),
+                    lines=o3d.utility.Vector2iVector([[0, 1]]),
+                )
+                rod.paint_uniform_color([1.0, 1.0, 0.0])  # Yellow rod for contrast
+                geometries.append(rod)
+
+                # Cap only the far end so the rod exits the rock visibly
+                com_cap = o3d.geometry.TriangleMesh.create_sphere(radius=end_cap_radius)
+                com_cap.translate(rod_points[1])
+                com_cap.paint_uniform_color([1.0, 1.0, 0.0])
+                com_cap.compute_vertex_normals()
+                geometries.append(com_cap)
+
+            # Add alpha angle point as a highlighted sphere (and rod) if provided
+            if alpha_angle_point is not None:
+                alpha_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=max(0.02, marker_radius * 0.75))
+                alpha_sphere.translate(alpha_angle_point)
+                alpha_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # Bright green
+                alpha_sphere.compute_vertex_normals()
+                geometries.append(alpha_sphere)
+
+                alpha_tip = alpha_angle_point + towards_camera * marker_tip_offset
+                alpha_tip_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=max(0.015, marker_radius * 0.5))
+                alpha_tip_sphere.translate(alpha_tip)
+                alpha_tip_sphere.paint_uniform_color([0.0, 1.0, 0.0])
+                alpha_tip_sphere.compute_vertex_normals()
+                geometries.append(alpha_tip_sphere)
+
+                if show_rods:
+                    alpha_rod_points = np.vstack([
+                        alpha_angle_point,
+                        alpha_angle_point + towards_camera * rod_length,
+                    ])
+                    alpha_rod = o3d.geometry.LineSet(
+                        points=o3d.utility.Vector3dVector(alpha_rod_points),
+                        lines=o3d.utility.Vector2iVector([[0, 1]]),
+                    )
+                    alpha_rod.paint_uniform_color([0.0, 1.0, 0.0])
+                    geometries.append(alpha_rod)
+
+                    alpha_cap = o3d.geometry.TriangleMesh.create_sphere(radius=end_cap_radius)
+                    alpha_cap.translate(alpha_rod_points[1])
+                    alpha_cap.paint_uniform_color([0.0, 1.0, 0.0])
+                    alpha_cap.compute_vertex_normals()
+                    geometries.append(alpha_cap)
+                    print(f"Added alpha angle point sphere and rod at {alpha_angle_point} (bright green)")
             
             # Calculate up vector - use global Z if possible, otherwise choose perpendicular vector
             z_axis = np.array([0, 0, 1])
@@ -244,12 +399,14 @@ class PointCloudVisualization:
             # Create visualization parameters
             vis_params = {
                 "window_name": window_title,
-                "width": 1280,
-                "height": 720,
+                "width": width,
+                "height": height,
                 "lookat": lookat,
                 "up": up,
                 "front": front,
-                "zoom": zoom
+                "zoom": zoom,
+                "left": left,
+                "top": top,
             }
             
             # Show all geometries with alpha view

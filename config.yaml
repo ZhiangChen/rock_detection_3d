@@ -1,0 +1,41 @@
+# Users shown in the GUI dropdown
+users:
+  - Deep Rodge
+  - Zhiang Chen
+  - Ramon Arrowsmith
+  - Sample
+
+# Default algorithm thresholds
+thresholds:
+  smoothness: 0.9
+  curvature: 0.1
+  basal_proximity: 0.05
+
+# Default preprocessing filters
+filters:
+  sor: true
+  vertical: true
+  k_neighbors: 10
+  std_ratio: 2.0
+  vertical_std: 1.0
+
+# Normal computation defaults
+normals:
+  method: PyMeshLab   # PyMeshLab | Open3D
+  k: 200
+
+# Default save locations (placeholders: {input_dir}, {pbr}, {ts})
+paths:
+  pcd_dir: "{input_dir}/outputs/{pbr}"
+  mesh_dir: "{input_dir}/outputs/{pbr}"
+  csv_dir: "{input_dir}/outputs/{pbr}"
+
+# Visualization helpers
+visualization:
+  alpha_view_rods: true
+
+# Region growing neighbor defaults
+region_growing:
+  voxel_size: 0.02 # for Downsampling
+  neighbor_count: 50 # Number of maximum neighbors to get when doing neighbor search in region growing
+  distance_threshold: 0.05 # search radius for neighbor search

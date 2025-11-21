@@ -2,7 +2,6 @@ import open3d as o3d
 import numpy as np
 import logging
 from pathlib import Path
-import csv
 from typing import Dict, Any, Optional, Union
 import pandas as pd
 
@@ -10,6 +9,97 @@ class GeometricAnalyzer:
     """
     Handles geometric analysis operations for 3D point clouds and meshes.
     """
+
+    RESULT_COLUMNS = [
+        'pbr_name',
+        'pbr_location',
+        'segmented_pbr_location',
+        'mesh_reconstruction_location',
+        'height',
+        'width',
+        'length',
+        'center_of_mass',
+        'major_orientations',
+        'height_width_ratio',
+        'height_width_face',
+        'length_width_ratio',
+        'length_width_face',
+        'alpha_angle',
+        'alpha_rectangular',
+        'beta_angle',
+        'smoothness_threshold',
+        'curvature_threshold',
+        'proximity_threshold',
+        'epsg_code',
+        'user',
+    ]
+
+    @staticmethod
+    def _resolve_csv_path(input_path: Union[str, Path], output_csv: Optional[Union[str, Path]] = None) -> Path:
+        """Resolve the CSV output path, ensuring parent directories exist."""
+        if output_csv is not None:
+            csv_path = Path(output_csv)
+        else:
+            source = Path(input_path)
+            parent_dir = source.parent
+            csv_name = f"{parent_dir.name}_geometric_analysis_results.csv"
+            csv_path = parent_dir / csv_name
+
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        return csv_path
+
+    def ensure_results_csv(
+        self,
+        input_path: Union[str, Path],
+        output_csv: Optional[Union[str, Path]] = None,
+    ) -> str:
+        """Create an empty results CSV with headers if it does not already exist."""
+        csv_path = self._resolve_csv_path(input_path, output_csv)
+        if not csv_path.exists():
+            pd.DataFrame(columns=self.RESULT_COLUMNS).to_csv(csv_path, mode='w', header=True, index=False)
+        return str(csv_path)
+
+    def initialize_placeholder_entry(
+        self,
+        pbr_name: str,
+        input_path: Union[str, Path],
+        segmented_path: Optional[Union[str, Path]] = None,
+        mesh_path: Optional[Union[str, Path]] = None,
+        user: Optional[str] = None,
+        output_csv: Optional[Union[str, Path]] = None,
+    ) -> str:
+        """Ensure a placeholder row exists for the current PBR before analysis."""
+        csv_path = self._resolve_csv_path(input_path, output_csv)
+        if not csv_path.exists():
+            pd.DataFrame(columns=self.RESULT_COLUMNS).to_csv(csv_path, mode='w', header=True, index=False)
+
+        placeholder = {column: "" for column in self.RESULT_COLUMNS}
+        placeholder.update({
+            'pbr_name': pbr_name,
+            'pbr_location': str(input_path),
+            'segmented_pbr_location': str(segmented_path) if segmented_path not in (None, "--") else "",
+            'mesh_reconstruction_location': str(mesh_path) if mesh_path not in (None, "--") else "",
+            'user': user or "",
+        })
+
+        try:
+            existing = pd.read_csv(csv_path)
+        except Exception as exc:
+            logging.warning("Failed to read analysis CSV for placeholder entry: %s", exc)
+            existing = pd.DataFrame(columns=self.RESULT_COLUMNS)
+
+        if {'pbr_name', 'pbr_location'}.issubset(existing.columns):
+            mask = (
+                existing['pbr_name'].astype(str) == placeholder['pbr_name']
+            ) & (
+                existing['pbr_location'].astype(str) == placeholder['pbr_location']
+            )
+            if mask.any():
+                return str(csv_path)
+
+        updated = pd.concat([existing, pd.DataFrame([placeholder])], ignore_index=True)
+        updated.to_csv(csv_path, index=False)
+        return str(csv_path)
 
     def compute_geometric_properties(self, mesh: o3d.geometry.TriangleMesh, 
                                   basal_points: np.ndarray,
@@ -261,6 +351,8 @@ class GeometricAnalyzer:
             output_csv: Optional path to output CSV file (if provided, results will be appended to this file)
         """
         try:
+            csv_path = self._resolve_csv_path(input_path, output_csv)
+
             data = {
                 'pbr_name': pbr_name,
                 'pbr_location': str(input_path),
@@ -285,24 +377,28 @@ class GeometricAnalyzer:
                 'user': user,  # Add user to the data dictionary
             }
             
-            # Use provided CSV path if available, otherwise use default path
-            if output_csv is not None:
-                csv_path = Path(output_csv)
-            else:
-                csv_path = input_path.parent / f"{str(input_path.parent).split('/')[-1]}_geometric_analysis_results.csv"
-            
-            # Create DataFrame from the data
             df = pd.DataFrame([data])
-            
-            # Check if file exists to determine if we need headers
-            file_exists = csv_path.exists()
-            
-            if file_exists:
-                # Append to existing file without headers
-                df.to_csv(csv_path, mode='a', header=False, index=False)
+
+            existing = None
+            if csv_path.exists():
+                try:
+                    existing = pd.read_csv(csv_path)
+                except Exception as exc:
+                    logging.warning("Failed to read existing analysis CSV: %s", exc)
+                    existing = None
+
+            if existing is not None and not existing.empty and {'pbr_name', 'pbr_location'}.issubset(existing.columns):
+                mask = (
+                    existing['pbr_name'].astype(str) == data['pbr_name']
+                ) & (
+                    existing['pbr_location'].astype(str) == data['pbr_location']
+                )
+                existing = existing[~mask]
+                combined = pd.concat([existing, df], ignore_index=True)
             else:
-                # Create new file with headers
-                df.to_csv(csv_path, mode='w', header=True, index=False)
+                combined = df
+
+            combined.to_csv(csv_path, index=False)
 
             return str(csv_path)
                 
