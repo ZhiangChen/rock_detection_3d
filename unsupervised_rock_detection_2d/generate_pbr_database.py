@@ -19,7 +19,7 @@ o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 stats = FilterStats()
 
 def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=False, 
-                 filter_params=None):
+                 filter_params=None, no_filter=False):
     """Process a single rock with filtering and dimension calculation."""
     # Set default filter parameters if not provided
     if filter_params is None:
@@ -47,6 +47,25 @@ def process_rock(file_path, padding=0.2, height_range=(0.3, 5.0), debug_viz=Fals
         # Convert to Open3D point cloud
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
+        
+        # Skip filtering if no_filter flag is set
+        if no_filter:
+            filtered_points = points
+            min_bounds = np.min(filtered_points, axis=0)
+            max_bounds = np.max(filtered_points, axis=0)
+            height = max_bounds[2] - min_bounds[2]
+            x_size = max_bounds[0] - min_bounds[0] - (2 * padding)
+            y_size = max_bounds[1] - min_bounds[1] - (2 * padding)
+            width = max(x_size, y_size)
+            
+            return {
+                'pbr_name': os.path.splitext(os.path.basename(file_path))[0],
+                'pbr_location': file_path,
+                'height': height,
+                'width': width,
+                'length': min(x_size, y_size),
+                'height_width_ratio': height / width if width > 0 else 0,
+            }
         
         # Apply filters
         try:
@@ -213,26 +232,34 @@ def estimate_volume(pcd, alpha=0.5):
 
 
 def generate_pbr_database(input_dir, output_file, max_rocks=100, height_range=(0.3, 5.0), 
-                         padding=0.2, debug_viz=False, filter_params=None):
+                         padding=0.2, debug_viz=False, filter_params=None, no_filter=False):
     """Generate PBR database after filtering and selecting most fragile rocks."""
     print(f"Analyzing rocks in: {input_dir}")
+    if no_filter:
+        print("No-filter mode: Processing all rocks without filtering")
     
     # Ensure output_file is a valid file path
     if os.path.isdir(output_file):
         output_file = os.path.join(output_file, "pbr_database.csv")
         print(f"Output file path adjusted to: {output_file}")
     
-    # Get all LAZ files
-    las_files = [f for f in os.listdir(input_dir) if f.endswith('.laz')]
+    # Get all LAS/LAZ files
+    las_files = [
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith('.laz') or f.lower().endswith('.las')
+    ]
     if not las_files:
-        print("No .laz files found!")
+        print("No .las or .laz files found!")
         return
     
     # Process rocks with filtering in parallel
-    print("Processing rocks with filtering and calculating ratios...")
+    if no_filter:
+        print("Processing all rocks without filtering...")
+    else:
+        print("Processing rocks with filtering and calculating ratios...")
     num_cores = os.cpu_count()-1  # Use appropriate number of cores
     rock_data = Parallel(n_jobs=num_cores)(
-        delayed(process_rock)(os.path.join(input_dir, las_file), padding, height_range, debug_viz, filter_params)
+        delayed(process_rock)(os.path.join(input_dir, las_file), padding, height_range, debug_viz, filter_params, no_filter)
         for las_file in tqdm(las_files, desc="Processing rocks")
     )
     
@@ -247,21 +274,64 @@ def generate_pbr_database(input_dir, output_file, max_rocks=100, height_range=(0
     df = pd.DataFrame(rock_data)
     df = df.sort_values('height_width_ratio', ascending=False)
     
-    # Select top N most fragile rocks
-    df = df.head(max_rocks)
+    # Select top N most fragile rocks (unless no_filter mode)
+    if not no_filter:
+        df = df.head(max_rocks)
+    else:
+        print(f"No-filter mode: Including all {len(df)} rocks in database")
+    
+    # Reorder columns to match geometric_analyzer format and add empty columns
+    # Standard format: pbr_name, pbr_location, segmented_pbr_location, mesh_reconstruction_location,
+    #                  height, width, length, center_of_mass, major_orientations, height_width_ratio,
+    #                  height_width_face, length_width_ratio, length_width_face, alpha_angle,
+    #                  alpha_rectangular, beta_angle, smoothness_threshold, curvature_threshold,
+    #                  proximity_threshold, epsg_code, user
     
     # Add empty columns for future use
-    empty_columns = [
-        'segmented_pbr_location', 'mesh_reconstruction_location',
-        'false_positive', 'processed', 'center_of_mass',
-        'major_orientations', 'height_width_face', 'length_width_ratio',
-        'length_width_face', 'alpha_angle', 'alpha_rectangular',
-        'beta_angle', 'smoothness_threshold', 'curvature_threshold',
-        'proximity_threshold'
-    ]
+    df['segmented_pbr_location'] = ''
+    df['mesh_reconstruction_location'] = ''
+    df['center_of_mass'] = ''
+    df['major_orientations'] = ''
+    df['height_width_face'] = ''
+    df['length_width_face'] = ''
+    df['alpha_angle'] = ''
+    df['alpha_rectangular'] = ''
+    df['beta_angle'] = ''
+    df['smoothness_threshold'] = ''
+    df['curvature_threshold'] = ''
+    df['proximity_threshold'] = ''
+    df['epsg_code'] = ''
+    df['user'] = ''
+    df['false_positive'] = False
+    df['processed'] = False
     
-    for col in empty_columns:
-        df[col] = ''
+    # Reorder columns to match GeometricAnalyzer.RESULT_COLUMNS format
+    column_order = [
+        'pbr_name',
+        'pbr_location',
+        'segmented_pbr_location',
+        'mesh_reconstruction_location',
+        'height',
+        'width',
+        'length',
+        'center_of_mass',
+        'major_orientations',
+        'height_width_ratio',
+        'height_width_face',
+        'length_width_ratio',
+        'length_width_face',
+        'alpha_angle',
+        'alpha_rectangular',
+        'beta_angle',
+        'smoothness_threshold',
+        'curvature_threshold',
+        'proximity_threshold',
+        'epsg_code',
+        'user',
+        'false_positive',
+        'processed'
+    ]
+    df = df[column_order]
     
     # Save database
     df.to_csv(output_file, index=False)
@@ -273,8 +343,9 @@ def generate_pbr_database(input_dir, output_file, max_rocks=100, height_range=(0
     print(f"Database saved to: {output_file}")
 
     # After processing all rocks, generate analysis report
-    stats.generate_report()
-    print("\nFilter analysis report generated in 'filter_analysis' directory")
+    if not no_filter:
+        stats.generate_report()
+        print("\nFilter analysis report generated in 'filter_analysis' directory")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate PBR database from point cloud files')
@@ -292,6 +363,8 @@ if __name__ == "__main__":
                         help='Padding value used in rock extraction')
     parser.add_argument('--debug-viz', action='store_true',
                        help='Enable visualization of filter steps')
+    parser.add_argument('--no-filter', action='store_true',
+                       help='Skip all filtering and process all rocks in directory (for pre-filtered data)')
     
     # Filter parameters
     parser.add_argument('--vertical-std', type=float, default=1.5,
@@ -338,5 +411,6 @@ if __name__ == "__main__":
         height_range=(args.min_height, args.max_height),
         padding=args.padding,
         debug_viz=args.debug_viz,
-        filter_params=filter_params
+        filter_params=filter_params,
+        no_filter=args.no_filter
     )

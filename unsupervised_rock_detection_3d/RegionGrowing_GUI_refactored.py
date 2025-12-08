@@ -70,6 +70,11 @@ DEFAULT_CONFIG = {
         "k_neighbors": 10,
         "std_ratio": 2.0,
         "vertical_std": 1.0,
+        "cluster_cleanup": True,
+        "adaptive_dbscan_eps": False,
+        "cluster_eps": 0.02,
+        "cluster_dbscan_min_points": 20,
+        "cluster_min_pct": 0.01,
     },
     "normals": {
         "method": "PyMeshLab",  # PyMeshLab | Open3D
@@ -82,7 +87,9 @@ DEFAULT_CONFIG = {
         "csv_dir": "{input_dir}",
     },
     "visualization": {
-        "alpha_view_rods": True,
+        "alpha_view_rods": True,  # legacy fallback for rod toggles
+        "com_point_rod": True,
+        "alpha_point_rod": True,
     },
     "region_growing": {
         "voxel_size": 0.02,
@@ -412,6 +419,7 @@ class RefactoredMainWindow(QMainWindow):
         self.close_picking_event = None
         self.epsg_code = None
         self.noise_removal_history: List[dict] = []
+        self.floating_noise_history: List[dict] = []
         self.mesh_reconstruction_stage = 0
         self.prepared_mesh_data = None
         self.current_normal_method = 'pymeshlab'
@@ -451,11 +459,24 @@ class RefactoredMainWindow(QMainWindow):
         self.filter_k_neighbors = int(self.config.get("filters.k_neighbors", DEFAULT_CONFIG["filters"]["k_neighbors"]))
         self.filter_std_ratio = float(self.config.get("filters.std_ratio", DEFAULT_CONFIG["filters"]["std_ratio"]))
         self.filter_vertical_std = float(self.config.get("filters.vertical_std", DEFAULT_CONFIG["filters"]["vertical_std"]))
+        self.filter_cluster_cleanup = bool(self.config.get("filters.cluster_cleanup", DEFAULT_CONFIG["filters"]["cluster_cleanup"]))
+        self.filter_cluster_eps = float(self.config.get("filters.cluster_eps", DEFAULT_CONFIG["filters"]["cluster_eps"]))
+        self.filter_cluster_dbscan_min_points = int(self.config.get("filters.cluster_dbscan_min_points", DEFAULT_CONFIG["filters"]["cluster_dbscan_min_points"]))
 
         # Services
         self.visualizer = PointCloudVisualization()
         self.file_handler = PointCloudFileHandler()
-        self.mesh_processor = MeshProcessor()
+        noise_settings = {
+            "sor_neighbors": self.filter_k_neighbors,
+            "sor_std_ratio": self.filter_std_ratio,
+            "cluster_cleanup": self.filter_cluster_cleanup,
+            "cluster_eps": self.filter_cluster_eps,
+            "cluster_dbscan_min_points": self.filter_cluster_dbscan_min_points,
+            "cluster_min_pct": self.config.get("filters.cluster_min_pct", DEFAULT_CONFIG["filters"]["cluster_min_pct"]),
+            "basal_clipping": self.config.get("filters.basal_clipping", DEFAULT_CONFIG["filters"]["basal_clipping"]),
+            "basal_clip_threshold": self.config.get("filters.basal_clip_threshold", DEFAULT_CONFIG["filters"]["basal_clip_threshold"]),
+        }
+        self.mesh_processor = MeshProcessor(noise_settings=noise_settings)
         self.geometric_analyzer = GeometricAnalyzer()
         self.db_manager = DatabaseManager()
 
@@ -551,18 +572,57 @@ class RefactoredMainWindow(QMainWindow):
             dialog.setModal(False)
             layout = QVBoxLayout(dialog)
             layout.addWidget(self.prepare_bottom_button)
-            normal_row = QHBoxLayout()
-            normal_row.addWidget(self.normal_k_label)
-            normal_row.addWidget(self.normal_k_spin)
-            normal_row.addWidget(self.normal_method_combo)
-            normal_row.addWidget(self.compute_normals_button)
-            layout.addLayout(normal_row)
+            
+            # Floating noise removal - Row 1: DBSCAN eps input
+            eps_row = QHBoxLayout()
+            eps_label = QLabel("DBSCAN eps (m):")
+            self.floating_noise_eps_spin = QDoubleSpinBox()
+            self.floating_noise_eps_spin.setRange(0.001, 0.5)
+            self.floating_noise_eps_spin.setDecimals(3)
+            self.floating_noise_eps_spin.setSingleStep(0.005)
+            self.floating_noise_eps_spin.setValue(float(self.config.get("filters.cluster_eps", 0.02)))
+            self.floating_noise_eps_spin.setFixedWidth(100)
+            eps_row.addWidget(eps_label)
+            eps_row.addWidget(self.floating_noise_eps_spin)
+            eps_row.addStretch(1)
+            layout.addLayout(eps_row)
+            
+            # Floating noise removal - Row 2: Remove and Undo buttons
+            floating_noise_buttons_row = QHBoxLayout()
+            self.remove_floating_noise_button = QPushButton("Remove Floating Noise")
+            self.undo_floating_noise_button = QPushButton("Undo Floating Noise")
+            self.remove_floating_noise_button.setEnabled(False)
+            self.undo_floating_noise_button.setEnabled(False)
+            self._style_buttons(self.remove_floating_noise_button, self.undo_floating_noise_button)
+            self.remove_floating_noise_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            self.undo_floating_noise_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            floating_noise_buttons_row.addWidget(self.remove_floating_noise_button, 1)
+            floating_noise_buttons_row.addWidget(self.undo_floating_noise_button, 1)
+            layout.addLayout(floating_noise_buttons_row)
+            
+            # Connect floating noise removal signals
+            self.remove_floating_noise_button.clicked.connect(self.remove_floating_noise)
+            self.undo_floating_noise_button.clicked.connect(self.undo_floating_noise)
+            
+            # SOR Filter label row
+            sor_label_row = QHBoxLayout()
+            sor_label = QLabel("SOR Filter:")
+            sor_label_row.addWidget(sor_label)
+            sor_label_row.addStretch(1)
+            layout.addLayout(sor_label_row)
+            
             noise_row = QHBoxLayout()
             self.mesh_remove_noise_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             self.mesh_undo_noise_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             noise_row.addWidget(self.mesh_remove_noise_button, 1)
             noise_row.addWidget(self.mesh_undo_noise_button, 1)
             layout.addLayout(noise_row)
+            normal_row = QHBoxLayout()
+            normal_row.addWidget(self.normal_k_label)
+            normal_row.addWidget(self.normal_k_spin)
+            normal_row.addWidget(self.normal_method_combo)
+            normal_row.addWidget(self.compute_normals_button)
+            layout.addLayout(normal_row)
             layout.addWidget(self.complete_reconstruction_button)
             layout.addWidget(self.save_mesh_button)
             layout.addStretch(1)
@@ -785,7 +845,7 @@ class RefactoredMainWindow(QMainWindow):
         layout.setSpacing(self.style.grid_spacing)
 
         self.mesh_workflow_button = QPushButton("Mesh Workflow...")
-        self.prepare_bottom_button = QPushButton("Prepare Bottom Face")
+        self.prepare_bottom_button = QPushButton("Interpolate missing faces")
         self.normal_k_label = QLabel("k")
         self.normal_k_spin = QSpinBox()
         self.normal_k_spin.setRange(3, 200)
@@ -1040,18 +1100,25 @@ class RefactoredMainWindow(QMainWindow):
             return
 
         try:
-            csv_dir = self._resolve_output_dir('paths.csv_dir')
-            parent_name = self.input_path.parent.name or self.input_path.stem
-            csv_path = csv_dir / f"{parent_name}_geometric_analysis_results.csv"
-            self.analysis_csv_path = self.geometric_analyzer.initialize_placeholder_entry(
-                pbr_name=self.current_pbr_file or self.input_path.stem,
-                input_path=self.input_path,
-                segmented_path=self.segmented_pcd_file_path,
-                mesh_path=self.mesh_path,
-                user=self.current_user,
-                output_csv=csv_path,
-            )
-            self.log(f"Initialized analysis CSV: {self.analysis_csv_path}")
+            # If a database is loaded, use that as the CSV path
+            if self.db_manager.df is not None and self.db_manager.current_file:
+                csv_path = Path(self.db_manager.current_file)
+                self.analysis_csv_path = str(csv_path)
+                self.log(f"Using loaded database for analysis: {self.analysis_csv_path}")
+            else:
+                # Otherwise create a new CSV in the parent directory
+                parent_dir = self.input_path.parent if self.input_path.parent else Path.cwd()
+                parent_name = parent_dir.name or self.input_path.stem
+                csv_path = parent_dir / f"{parent_name}_geometric_analysis_results.csv"
+                self.analysis_csv_path = self.geometric_analyzer.initialize_placeholder_entry(
+                    pbr_name=self.current_pbr_file or self.input_path.stem,
+                    input_path=self.input_path,
+                    segmented_path=self.segmented_pcd_file_path,
+                    mesh_path=self.mesh_path,
+                    user=self.current_user,
+                    output_csv=csv_path,
+                )
+                self.log(f"Initialized analysis CSV: {self.analysis_csv_path}")
         except Exception as exc:
             logging.error("Failed to prepare analysis CSV", exc_info=True)
             self.analysis_csv_path = "--"
@@ -1194,10 +1261,42 @@ class RefactoredMainWindow(QMainWindow):
         try:
             self.db_manager.load_database(file_name)
             self.log(f"Database loaded: {file_name}")
+            # Set the analysis CSV path to the loaded database
+            self.analysis_csv_path = file_name
+            self._update_export_summary()
             self.analysis_next_pbr_button.setEnabled(True)
+            next_entry = self.db_manager.get_next_unprocessed()
+            if next_entry is not None:
+                try:
+                    self._load_pbr_entry(next_entry)
+                except Exception as exc:
+                    logging.error("Error auto-loading first PBR", exc_info=True)
+                    QMessageBox.warning(self, "Auto Load Error", str(exc))
+            else:
+                QMessageBox.information(self, "Database", "No unprocessed PBRs remain.")
         except Exception as exc:
             logging.error("Error loading database", exc_info=True)
             QMessageBox.critical(self, "Database Error", str(exc))
+
+    def _load_pbr_entry(self, entry: dict):
+        path_candidates = ("las_path", "pbr_location", "segmented_pbr_location")
+        resolved_candidate = None
+        for key in path_candidates:
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                resolved_candidate = value.strip()
+                break
+        if not resolved_candidate:
+            raise KeyError(
+                "Database entry is missing a usable path (expected 'las_path', 'pbr_location', or 'segmented_pbr_location')."
+            )
+
+        full_path = self.db_manager.get_full_file_path(resolved_candidate)
+        if not Path(full_path).exists():
+            raise FileNotFoundError(f"Point cloud file not found: {full_path}")
+
+        self.load_las_file(full_path)
+        self.log(f"Loaded next PBR: {full_path}")
 
     def load_next_pbr(self):
         try:
@@ -1206,9 +1305,7 @@ class RefactoredMainWindow(QMainWindow):
                 QMessageBox.information(self, "Database", "No unprocessed PBRs remain.")
                 return
 
-            file_path = next_entry['las_path']
-            self.load_las_file(file_path)
-            self.log(f"Loaded next PBR: {file_path}")
+            self._load_pbr_entry(next_entry)
         except Exception as exc:
             logging.error("Error getting next PBR", exc_info=True)
             QMessageBox.critical(self, "Next PBR Error", str(exc))
@@ -1252,6 +1349,7 @@ class RefactoredMainWindow(QMainWindow):
             k_neighbors=self.filter_k_neighbors,
             std_ratio=self.filter_std_ratio,
             vertical_std=self.filter_vertical_std,
+            adaptive_k=self.config.get("filters.adaptive_k_neighbors", True),
         )
         self.pcd = filtered_pcd
         self.log("Applied SOR + vertical filtering using configured defaults")
@@ -1267,6 +1365,7 @@ class RefactoredMainWindow(QMainWindow):
         self.rock_seeds = [highest_point_index]
         self.pedestal_seeds = [bottommost_point_index]
 
+        # Set uniform gray color for better visibility (avoid dark shadows from original colors)
         colors = np.full(points.shape, [0.5, 0.5, 0.5])
         self.pcd.colors = o3d.utility.Vector3dVector(colors)
 
@@ -1291,6 +1390,11 @@ class RefactoredMainWindow(QMainWindow):
         if self.pcd is None:
             QMessageBox.warning(self, "No Point Cloud", "Load a point cloud first.")
             return
+
+        # Set uniform gray color for better visibility during manual selection
+        points = np.asarray(self.pcd.points)
+        colors = np.full(points.shape, [0.5, 0.5, 0.5])
+        self.pcd.colors = o3d.utility.Vector3dVector(colors)
 
         dialog = ManualSeedDialog(self, self.style)
 
@@ -1755,6 +1859,9 @@ class RefactoredMainWindow(QMainWindow):
             self.remove_noise_button.setEnabled(True)
             self.mesh_remove_noise_button.setEnabled(True)
             self.mesh_undo_noise_button.setEnabled(False)
+            if hasattr(self, 'remove_floating_noise_button'):
+                self.remove_floating_noise_button.setEnabled(True)
+                self.undo_floating_noise_button.setEnabled(False)
             self.compute_normals_button.setEnabled(True)
             self.complete_reconstruction_button.setEnabled(True)
             self.save_mesh_button.setEnabled(True)
@@ -1777,14 +1884,30 @@ class RefactoredMainWindow(QMainWindow):
             self.set_instruction(f"Computing normals using {method} (k={k})...")
 
             prep = self.prepared_mesh_data['preparation_result']
+            current_rock_pcd = self.prepared_mesh_data.get('rock_pcd')
+            current_bottom_pcd = self.prepared_mesh_data.get('bottom_pcd')
+
+            rock_points = None
+            bottom_points = None
+
+            if current_rock_pcd is not None and len(current_rock_pcd.points) > 0:
+                rock_points = np.asarray(current_rock_pcd.points).copy()
+            if current_bottom_pcd is not None and len(current_bottom_pcd.points) > 0:
+                bottom_points = np.asarray(current_bottom_pcd.points).copy()
+
+            if rock_points is None:
+                rock_points = np.asarray(prep.rock_points)
+            if bottom_points is None:
+                bottom_points = np.asarray(prep.bottom_points)
+
             if method == 'pymeshlab':
                 compute_fn = self.mesh_processor.compute_normals_for_visualization
             else:
                 compute_fn = self.mesh_processor.compute_normals_for_visualization_separate
 
             rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = compute_fn(
-                prep.rock_points,
-                prep.bottom_points,
+                rock_points,
+                bottom_points,
                 k=k,
             )
 
@@ -1865,7 +1988,8 @@ class RefactoredMainWindow(QMainWindow):
                 if traceback_txt:
                     logging.error("Poisson worker traceback:\n%s", traceback_txt)
                 self.mesh_processor.last_error_message = message
-                QMessageBox.warning(self, "Mesh Reconstruction", message)
+                recovery_hint = "\n\nThe point cloud has complications. Please fix normals or remove noise and try again."
+                QMessageBox.warning(self, "Mesh Reconstruction", f"{message}{recovery_hint}")
                 return
 
             mesh_path = worker_result.get('mesh_path')
@@ -1949,6 +2073,7 @@ class RefactoredMainWindow(QMainWindow):
             filtered_rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = self.mesh_processor.apply_noise_removal(
                 rock_pcd,
                 bottom_pcd,
+                adaptive_k=self.config.get("filters.adaptive_k_neighbors", True),
             )
 
             self.prepared_mesh_data.update({
@@ -1993,6 +2118,90 @@ class RefactoredMainWindow(QMainWindow):
             self.undo_noise_button.setEnabled(False)
             self.mesh_undo_noise_button.setEnabled(False)
         self.set_instruction("Noise removal undone.")
+
+    def remove_floating_noise(self):
+        """Remove floating noise using DBSCAN clustering."""
+        if self.mesh_reconstruction_stage != 1 or not self.prepared_mesh_data:
+            QMessageBox.warning(self, "Mesh Not Prepared", "Prepare bottom face before removing floating noise.")
+            return
+
+        try:
+            self._set_busy(True)
+            self.set_instruction("Removing floating noise using DBSCAN...")
+            
+            # Save current state for undo
+            self.floating_noise_history.append(dict(self.prepared_mesh_data))
+            
+            rock_pcd = self.prepared_mesh_data['rock_pcd']
+            bottom_pcd = self.prepared_mesh_data['bottom_pcd']
+            
+            # Get eps value from the spin box
+            eps_value = self.floating_noise_eps_spin.value()
+            dbscan_min_points = int(self.config.get("filters.cluster_dbscan_min_points", 20))
+            
+            logging.info(f"Running DBSCAN floating noise removal with eps={eps_value:.3f}m, min_points={dbscan_min_points}")
+            
+            # Apply DBSCAN to remove floating noise
+            filtered_rock_pcd = self.mesh_processor.clean_outliers_dbscan(
+                rock_pcd,
+                eps=eps_value,
+                min_samples=dbscan_min_points,
+                return_inlier_indices=False
+            )
+            
+            # Update prepared mesh data
+            self.prepared_mesh_data['rock_pcd'] = filtered_rock_pcd
+            combined_points = np.vstack((np.asarray(filtered_rock_pcd.points), np.asarray(bottom_pcd.points)))
+            combined_colors = np.vstack((
+                np.full((len(np.asarray(filtered_rock_pcd.points)), 3), [1.0, 0.0, 0.0]),
+                np.full((len(np.asarray(bottom_pcd.points)), 3), [0.0, 1.0, 0.0])
+            ))
+            combined_normals = np.vstack((np.asarray(filtered_rock_pcd.normals), np.asarray(bottom_pcd.normals)))
+            
+            self.prepared_mesh_data['combined_points'] = combined_points
+            self.prepared_mesh_data['combined_colors'] = combined_colors
+            self.prepared_mesh_data['combined_normals'] = combined_normals
+            
+            # Visualize
+            self.start_visualization_process(
+                target=self.visualizer.show_point_cloud,
+                args=(combined_points, combined_colors, "After Floating Noise Removal", False, None, True, combined_normals),
+            )
+            
+            if hasattr(self, 'undo_floating_noise_button'):
+                self.undo_floating_noise_button.setEnabled(True)
+            self.set_instruction("Floating noise removed. You can undo or proceed.")
+            
+        except Exception as exc:
+            logging.error("Floating noise removal failed", exc_info=True)
+            QMessageBox.critical(self, "Floating Noise Removal", str(exc))
+        finally:
+            self._set_busy(False)
+
+    def undo_floating_noise(self):
+        """Undo the last floating noise removal operation."""
+        if not self.floating_noise_history:
+            QMessageBox.information(self, "Undo", "No floating noise removal steps to undo.")
+            return
+
+        self.prepared_mesh_data = self.floating_noise_history.pop()
+        self.start_visualization_process(
+            target=self.visualizer.show_point_cloud,
+            args=(
+                self.prepared_mesh_data['combined_points'],
+                self.prepared_mesh_data['combined_colors'],
+                "Undo Floating Noise Removal",
+                False,
+                None,
+                True,
+                self.prepared_mesh_data['combined_normals'],
+            ),
+        )
+        if not self.floating_noise_history:
+            if hasattr(self, 'undo_floating_noise_button'):
+                self.undo_floating_noise_button.setEnabled(False)
+        self.set_instruction("Floating noise removal undone.")
+
 
     # ------------------------------------------------------------------
     # Analysis
@@ -2112,6 +2321,14 @@ class RefactoredMainWindow(QMainWindow):
 
         title = f"Alpha View - {self.current_pbr_file or ''} (α={results.get('alpha_angle', 0.0):.1f}°)"
 
+        rods_default = bool(self.config.get("visualization.alpha_view_rods", True))
+        show_com_rod = self.config.get("visualization.com_point_rod", None)
+        if show_com_rod is None:
+            show_com_rod = rods_default
+        show_alpha_point_rod = self.config.get("visualization.alpha_point_rod", None)
+        if show_alpha_point_rod is None:
+            show_alpha_point_rod = rods_default
+
         try:
             self.start_visualization_process(
                 target=self.visualizer.show_mesh_with_alpha_view,
@@ -2123,7 +2340,8 @@ class RefactoredMainWindow(QMainWindow):
                     pedestal,
                     np.asarray(alpha_point) if alpha_point is not None else None,
                     True,
-                    bool(self.config.get("visualization.alpha_view_rods", True)),
+                    bool(show_com_rod),
+                    bool(show_alpha_point_rod),
                 ),
             )
         except Exception as exc:  # pragma: no cover
@@ -2174,6 +2392,37 @@ class RefactoredMainWindow(QMainWindow):
 
             self.analysis_csv_path = csv_path
             self._update_export_summary()
+            
+            # If using a database, mark the entry as processed and update geometric results
+            if self.db_manager.df is not None and self.current_pbr_file:
+                self.db_manager.update_entry(
+                    self.current_pbr_file,
+                    processed=True,
+                    segmented_pbr_location=str(self.segmented_pcd_file_path) if self.segmented_pcd_file_path and self.segmented_pcd_file_path != "--" else None,
+                    mesh_reconstruction_location=str(self.mesh_path) if self.mesh_path and self.mesh_path != "--" else None,
+                    user=self.current_user,
+                    # Add geometric analysis results
+                    height=results['height'],
+                    width=results['width'],
+                    length=results['length'],
+                    center_of_mass=str(results['center_of_mass'].tolist()),
+                    major_orientations=str(results['major_orientations'].tolist()),
+                    height_width_ratio=results['height_width_ratio'],
+                    height_width_face=str(results['height_width_face'].tolist()),
+                    length_width_ratio=results['length_width_ratio'],
+                    length_width_face=str(results['length_width_face'].tolist()),
+                    alpha_angle=results['alpha_angle'],
+                    alpha_rectangular=results['alpha_rectangular'],
+                    beta_angle=results['beta_angle'],
+                    smoothness_threshold=self.smoothness_threshold,
+                    curvature_threshold=self.curvature_threshold,
+                    proximity_threshold=self.basal_proximity_threshold,
+                    epsg_code=self.epsg_code,
+                )
+                self.log(f"Updated database entry for {self.current_pbr_file} with geometric analysis results")
+                # Keep Load Next PBR button enabled
+                self.analysis_next_pbr_button.setEnabled(True)
+            
             self.state.analysis_completed = True
             self._update_status_indicators()
             self.set_instruction(f"Geometric analysis complete. Results saved to {csv_path}.")
@@ -2199,7 +2448,14 @@ class RefactoredMainWindow(QMainWindow):
             self.process.join(timeout=1.0)
             self.process = None
 
+        # Preserve database state
+        has_database = self.db_manager.df is not None
+
         self.__init__()
+        
+        # Re-enable Load Next PBR if database was loaded
+        if has_database:
+            self.analysis_next_pbr_button.setEnabled(True)
 
     @staticmethod
     def detect_basal_points_optimized(points, labels, k=30, threshold=0.35):

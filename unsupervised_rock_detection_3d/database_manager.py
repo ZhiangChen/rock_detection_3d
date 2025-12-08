@@ -25,6 +25,11 @@ class DatabaseManager:
                     else:
                         self.df[col] = pd.Series(dtype=bool)
 
+            # Remove las_path column if it exists (deprecated - use pbr_location instead)
+            if 'las_path' in self.df.columns:
+                self.df = self.df.drop(columns=['las_path'])
+                logging.info("Removed deprecated 'las_path' column from database")
+
             # Convert string values to proper boolean
             bool_columns = ['processed', 'false_positive']
             for col in bool_columns:
