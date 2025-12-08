@@ -88,6 +88,11 @@ class GeometricAnalyzer:
             logging.warning("Failed to read analysis CSV for placeholder entry: %s", exc)
             existing = pd.DataFrame(columns=self.RESULT_COLUMNS)
 
+        for column in self.RESULT_COLUMNS:
+            if column not in existing.columns:
+                existing[column] = ""
+        existing = existing[self.RESULT_COLUMNS]
+
         if {'pbr_name', 'pbr_location'}.issubset(existing.columns):
             mask = (
                 existing['pbr_name'].astype(str) == placeholder['pbr_name']
@@ -95,6 +100,10 @@ class GeometricAnalyzer:
                 existing['pbr_location'].astype(str) == placeholder['pbr_location']
             )
             if mask.any():
+                for column, value in placeholder.items():
+                    if column in existing.columns:
+                        existing.loc[mask, column] = value
+                existing.to_csv(csv_path, index=False)
                 return str(csv_path)
 
         updated = pd.concat([existing, pd.DataFrame([placeholder])], ignore_index=True)

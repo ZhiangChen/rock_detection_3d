@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from geomdl import BSpline
 from geomdl import utilities
 from scipy.spatial import cKDTree
+import numpy as np
+import open3d as o3d
+import logging
+from sklearn.cluster import DBSCAN
+from multiprocessing.connection import Connection
 import traceback
 import os
 from sklearn.cluster import DBSCAN
@@ -37,28 +42,158 @@ class MeshProcessor:
     bottom face generation, and mesh saving.
     """
     
-    def __init__(self):
+    def __init__(self, noise_settings: Optional[dict] = None):
         self.temp_mesh_path = None
         self.reconstructed_mesh = None
         self.last_error_message: str = ""
+        default_noise_settings = {
+            "sor_neighbors": 100,
+            "sor_std_ratio": 2.0,
+            "cluster_cleanup": True,
+            "cluster_eps": 0.02,  # Fixed at 2cm for stability
+            "cluster_dbscan_min_points": 10,
+            "cluster_min_pct": 0.01,  # 1% of total points
+            "basal_clipping": True,  # Enable clipping against basal surface
+            "basal_clip_threshold": 0.0,  # Exact surface by default
+        }
+        self.noise_settings = {**default_noise_settings, **(noise_settings or {})}
 
     def clean_outliers_dbscan(self, pcd: o3d.geometry.PointCloud, 
-                             eps: float = 0.05, 
-                             min_samples: int = 50,
+                             eps: float = 0.02, 
+                             min_samples: int = 10,
                              return_inlier_indices: bool = False) -> Union[o3d.geometry.PointCloud, Tuple[o3d.geometry.PointCloud, np.ndarray]]:
         """
-        Remove outliers using DBSCAN clustering algorithm.
+        Remove outliers using DBSCAN clustering algorithm with improved multi-cluster preservation.
         
         Args:
             pcd: Input point cloud
-            eps: Maximum distance between points in the same cluster
-            min_samples: Minimum number of points to form a dense region
+            eps: Maximum distance between points in the same cluster (default 0.02m = 2cm)
+            min_samples: Minimum number of points to form a dense region (default 10)
             return_inlier_indices: Whether to return indices of inlier points
             
         Returns:
             Cleaned point cloud and optionally indices of inlier points
         """
         try:
+            points = np.asarray(pcd.points)
+            initial_count = len(points)
+            
+            if initial_count == 0:
+                logging.warning("Empty point cloud provided to DBSCAN")
+                if return_inlier_indices:
+                    return pcd, np.array([], dtype=int)
+                return pcd
+            
+            # Run DBSCAN clustering
+            labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_samples, print_progress=False))
+            
+            # Count clusters (excluding noise labeled as -1)
+            max_label = labels.max()
+            if max_label < 0:
+                logging.warning("No clusters found by DBSCAN, keeping all points")
+                if return_inlier_indices:
+                    return pcd, np.arange(initial_count)
+                return pcd
+            
+            # Count points in each cluster
+            cluster_counts = np.bincount(labels[labels >= 0])
+            
+            # Get cluster_min_pct from settings, default to 1%
+            settings = getattr(self, "noise_settings", {})
+            cluster_min_pct = float(settings.get("cluster_min_pct", 0.01))
+            min_cluster_size = int(cluster_min_pct * initial_count)
+            
+            # Keep all clusters above the threshold (preserves split rock surfaces)
+            valid_clusters = np.where(cluster_counts >= min_cluster_size)[0]
+            
+            logging.info(f"DBSCAN found {max_label + 1} clusters")
+            logging.info(f"Minimum cluster size: {min_cluster_size} points (1% of {initial_count})")
+            logging.info(f"Keeping {len(valid_clusters)} clusters above threshold")
+            
+            # Create mask for all valid clusters
+            keep_mask = np.isin(labels, valid_clusters)
+            inlier_indices = np.where(keep_mask)[0]
+            
+            cleaned_pcd = pcd.select_by_index(inlier_indices)
+            removed_count = initial_count - len(inlier_indices)
+            
+            logging.info(f"Removed {removed_count} points ({100*removed_count/initial_count:.1f}%) via DBSCAN")
+            
+            if return_inlier_indices:
+                return cleaned_pcd, inlier_indices
+            return cleaned_pcd
+            
+        except Exception as e:
+            logging.error(f"Error in DBSCAN clustering: {e}")
+            if return_inlier_indices:
+                return pcd, np.arange(len(np.asarray(pcd.points)))
+            return pcd
+
+    def clip_points_against_basal_surface(self, rock_points: np.ndarray, bottom_points: np.ndarray,
+                                         trim_threshold: float = 0.0) -> Tuple[np.ndarray, dict]:
+        """
+        Clip rock points that extend below the basal surface using signed distance.
+        
+        Args:
+            rock_points: Array of rock point coordinates (N, 3)
+            bottom_points: Array of bottom face point coordinates (M, 3)
+            trim_threshold: Distance threshold in meters (points with d >= -trim_threshold are kept)
+                          0.0 = exact surface, 0.02 = allow 2cm penetration
+            
+        Returns:
+            tuple: (clipped_rock_points, stats_dict)
+        """
+        try:
+            if len(rock_points) == 0 or len(bottom_points) == 0:
+                logging.warning("Empty points provided to clipping, skipping")
+                return rock_points, {'kept_points': len(rock_points), 'removed_points': 0}
+            
+            # Compute surface normal using PCA
+            centered = bottom_points - np.mean(bottom_points, axis=0)
+            cov = np.cov(centered.T)
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            normal = eigenvectors[:, 0]  # Normal is eigenvector with smallest eigenvalue
+            
+            # Ensure normal points upward (positive Z component)
+            if normal[2] < 0:
+                normal = -normal
+            
+            # Build KD-tree for bottom points
+            kdtree = cKDTree(bottom_points)
+            
+            # For each rock point, find closest basal point
+            distances, closest_indices = kdtree.query(rock_points, k=1)
+            
+            # Compute signed distances
+            vectors = rock_points - bottom_points[closest_indices]
+            signed_distances = np.dot(vectors, normal)
+            
+            # Apply threshold - keep points with signed_distance >= -trim_threshold
+            keep_mask = signed_distances >= -trim_threshold
+            
+            clipped_rock_points = rock_points[keep_mask]
+            removed_count = len(rock_points) - len(clipped_rock_points)
+            
+            stats = {
+                'total_rock_points': len(rock_points),
+                'kept_points': len(clipped_rock_points),
+                'removed_points': removed_count,
+                'removal_percentage': 100 * removed_count / len(rock_points) if len(rock_points) > 0 else 0,
+                'min_signed_distance': np.min(signed_distances),
+                'max_signed_distance': np.max(signed_distances),
+                'below_surface_count': np.sum(signed_distances < 0),
+            }
+            
+            logging.info(f"Basal clipping (threshold={trim_threshold:.3f}m):")
+            logging.info(f"  Kept: {stats['kept_points']} points ({100 - stats['removal_percentage']:.1f}%)")
+            logging.info(f"  Removed: {stats['removed_points']} points ({stats['removal_percentage']:.1f}%)")
+            logging.info(f"  Points below surface: {stats['below_surface_count']}")
+            
+            return clipped_rock_points, stats
+            
+        except Exception as e:
+            logging.error(f"Error in basal clipping: {e}")
+            return rock_points, {'kept_points': len(rock_points), 'removed_points': 0}
             logging.info("Removing outliers using DBSCAN clustering...")
             points = np.asarray(pcd.points)
             
@@ -249,6 +384,13 @@ class MeshProcessor:
             # Process rock points
             rock_points_array = np.asarray(filtered_pcd.points)[rock_indices]
             
+            # Apply basal clipping if enabled
+            if self.noise_settings.get('basal_clipping', False):
+                clip_threshold = self.noise_settings.get('basal_clip_threshold', 0.0)
+                rock_points_array, clip_stats = self.clip_points_against_basal_surface(
+                    rock_points_array, bottom_points, trim_threshold=clip_threshold
+                )
+            
             return BottomFacePreparationResult(
                 rock_points=rock_points_array,
                 bottom_points=bottom_points,
@@ -346,24 +488,92 @@ class MeshProcessor:
             raise
 
     def apply_noise_removal(self, rock_pcd: o3d.geometry.PointCloud, 
-                           bottom_pcd: o3d.geometry.PointCloud) -> tuple:
+                           bottom_pcd: o3d.geometry.PointCloud,
+                           adaptive_k: bool = True) -> tuple:
         """
         Applies noise removal to rock points while preserving bottom face points.
         
         Args:
             rock_pcd: Rock point cloud with normals
             bottom_pcd: Bottom face point cloud with normals
+            adaptive_k: Whether to use adaptive k_neighbors based on CV (default True)
             
         Returns:
             tuple: (filtered_rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals)
         """
         try:
-            # Apply SOR filter to rock points
-            logging.info("Applying SOR filter to rock points...")
+            settings = getattr(self, "noise_settings", {})
+            base_k_neighbors = max(5, int(settings.get("sor_neighbors", 100)))
+            sor_std_ratio = float(settings.get("sor_std_ratio", 2.0))
+
+            # Use adaptive k_neighbors if enabled
+            if adaptive_k:
+                from utils import estimate_point_density_cv
+                points = np.asarray(rock_pcd.points)
+                density_info = estimate_point_density_cv(rock_pcd)
+                sor_neighbors = density_info['recommended_k']
+                logging.info("Adaptive k_neighbors: CV=%.3f, using k=%d", density_info['cv'], sor_neighbors)
+            else:
+                sor_neighbors = base_k_neighbors
+                logging.info("Using fixed k_neighbors=%d", sor_neighbors)
+
+            logging.info("Applying SOR filter to rock points (k=%s, std=%s)", sor_neighbors, sor_std_ratio)
             filtered_rock_pcd, inlier_indices = rock_pcd.remove_statistical_outlier(
-                nb_neighbors=100, 
-                std_ratio=2.0
+                nb_neighbors=sor_neighbors, 
+                std_ratio=sor_std_ratio
             )
+
+            # Note: DBSCAN cluster cleanup is handled separately via "Remove Floating Noise" button
+            # Optional cluster cleanup to remove floating islands
+            if False and settings.get("cluster_cleanup", False):  # Disabled - use Remove Floating Noise button instead
+                base_cluster_eps = float(settings.get("cluster_eps", 0.02))
+                dbscan_min_points = max(5, int(settings.get("cluster_dbscan_min_points", 20)))
+                cluster_min_pct = float(settings.get("cluster_min_pct", 0.01))
+                adaptive_dbscan_eps = bool(settings.get("adaptive_dbscan_eps", False))
+
+                # Compute adaptive eps based on point density if enabled
+                if adaptive_dbscan_eps and len(points) > 100:
+                    # Sample points for density estimation
+                    sample_size = min(1000, len(points))
+                    sample_indices = np.random.choice(len(points), sample_size, replace=False)
+                    sample_points = points[sample_indices]
+                    
+                    # Build KD-tree and compute mean NN distance
+                    tree = cKDTree(sample_points)
+                    distances, _ = tree.query(sample_points, k=11)
+                    nn_distances = distances[:, 1:].mean(axis=1)
+                    mean_nn = np.mean(nn_distances)
+                    cv = np.std(nn_distances) / mean_nn if mean_nn > 0 else 0
+                    
+                    # Use smaller multiplier (1.5x) for cluster cleanup to be more aggressive
+                    # This is different from initial SOR which uses 2.0-2.2x
+                    cluster_eps = mean_nn * 1.5
+                    
+                    logging.info(
+                        "Adaptive DBSCAN eps: mean_nn=%.1fmm, CV=%.3f, eps=%.3fm (%.1fmm)",
+                        mean_nn * 1000, cv, cluster_eps, cluster_eps * 1000
+                    )
+                else:
+                    cluster_eps = base_cluster_eps
+                    if adaptive_dbscan_eps:
+                        logging.info("Using fixed eps=%.3fm (too few points for adaptive)", cluster_eps)
+                    else:
+                        logging.info("Using fixed eps=%.3fm (adaptive disabled)", cluster_eps)
+
+                logging.info(
+                    "Running cluster cleanup (eps=%.3f, min_points=%d, min_pct=%.2f%%)",
+                    cluster_eps,
+                    dbscan_min_points,
+                    cluster_min_pct * 100,
+                )
+
+                # Use the new clean_outliers_dbscan method
+                filtered_rock_pcd = self.clean_outliers_dbscan(
+                    filtered_rock_pcd,
+                    eps=cluster_eps,
+                    min_samples=dbscan_min_points,
+                    return_inlier_indices=False
+                )
             
             # Prepare updated visualization data
             combined_points = np.vstack((np.asarray(filtered_rock_pcd.points), np.asarray(bottom_pcd.points)))
@@ -724,13 +934,15 @@ class MeshProcessor:
             # Handle input points based on whether they're dense points or indices
             if is_dense_points:
                 basal_points = np.asarray(points_or_indices, dtype=float)
+                logging.debug(f"Using dense points: input shape={np.asarray(points_or_indices).shape}, output shape={basal_points.shape}")
             else:
                 basal_points = points[np.asarray(points_or_indices, dtype=int)]  # Convert indices to points
+                logging.debug(f"Using indices: {len(points_or_indices)} indices, output shape={basal_points.shape}")
             
             # Calculate transformation matrix for 2D projection
             center = np.mean(basal_points, axis=0)
             centered_points = basal_points - center
-            logging.debug(f"Centered points shape: {centered_points.shape}")
+            logging.debug(f"basal_points shape: {basal_points.shape}, center shape: {center.shape}, centered_points shape: {centered_points.shape}")
             
             U, S, Vh = np.linalg.svd(centered_points)
             normal = Vh[2]

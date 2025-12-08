@@ -239,12 +239,17 @@ class PointCloudVisualization:
             return np.asarray(pcd.colors)
     
     @staticmethod
-    def show_mesh_with_alpha_view(mesh_path: str, center_of_mass: np.ndarray, 
-                                alpha_plane_normal: np.ndarray, window_title: str = "Alpha View",
-                                pedestal_points: Optional[np.ndarray] = None,
-                                alpha_angle_point: Optional[np.ndarray] = None,
-                                show_wireframe: bool = True,
-                                show_rods: bool = True):
+    def show_mesh_with_alpha_view(
+        mesh_path: str,
+        center_of_mass: np.ndarray,
+        alpha_plane_normal: np.ndarray,
+        window_title: str = "Alpha View",
+        pedestal_points: Optional[np.ndarray] = None,
+        alpha_angle_point: Optional[np.ndarray] = None,
+        show_wireframe: bool = True,
+        show_com_rod: bool = True,
+        show_alpha_point_rod: bool = True,
+    ):
         """
         Show mesh with camera view perpendicular to the alpha plane.
         
@@ -255,6 +260,9 @@ class PointCloudVisualization:
             window_title: Title for the visualization window
             pedestal_points: Optional array of pedestal points to display
             alpha_angle_point: Optional point that produces the minimum alpha angle (to highlight)
+            show_wireframe: Render mesh wireframe overlay
+            show_com_rod: Draw the center-of-mass rod (pointing toward the camera)
+            show_alpha_point_rod: Draw the alpha-point rod (pointing toward the camera)
         """
         try:
             import open3d as o3d
@@ -300,10 +308,17 @@ class PointCloudVisualization:
                 geometries.append(pedestal_pcd)
                 print(f"Added {len(pedestal_points)} pedestal points (blue)")
             
-            # Camera front vector is the alpha plane normal (perpendicular to plane)
+            center_of_mass = np.asarray(center_of_mass, dtype=float)
             lookat = center_of_mass
-            front = alpha_plane_normal / np.linalg.norm(alpha_plane_normal)
-            towards_camera = front  # Open3D front points from lookat toward the camera
+            front = np.asarray(alpha_plane_normal, dtype=float)
+            front_norm = float(np.linalg.norm(front))
+            if not np.isfinite(front_norm) or front_norm == 0.0:
+                front = np.array([0.0, 0.0, -1.0])
+                front_norm = 1.0
+            front = front / front_norm
+            # Open3D expects `front` to describe the vector from the lookat point toward the camera.
+            # This means a helper that should extend toward the viewer must follow `front`, not its negative.
+            line_of_sight = front
 
             # Add a visible marker at the center of mass so it stays apparent even inside the rock
             com_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=marker_radius)
@@ -313,7 +328,7 @@ class PointCloudVisualization:
             geometries.append(com_sphere)
 
             marker_tip_offset = max(marker_radius * 1.2, bbox_diag * 0.02)
-            com_tip = center_of_mass + towards_camera * marker_tip_offset
+            com_tip = center_of_mass + line_of_sight * marker_tip_offset
             com_tip_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=marker_radius * 0.75)
             com_tip_sphere.translate(com_tip)
             com_tip_sphere.paint_uniform_color([1.0, 1.0, 0.0])
@@ -321,12 +336,12 @@ class PointCloudVisualization:
             geometries.append(com_tip_sphere)
 
             end_cap_radius = max(0.015, marker_radius * 0.6)
+            rod_length = max(rod_half_length * 2.0, bbox_diag * 0.65)
 
-            if show_rods:
-                rod_length = max(rod_half_length * 2.0, bbox_diag * 0.65)
+            if show_com_rod:
                 rod_points = np.vstack([
                     center_of_mass,
-                    center_of_mass + towards_camera * rod_length,
+                    center_of_mass + line_of_sight * rod_length,
                 ])
                 rod = o3d.geometry.LineSet(
                     points=o3d.utility.Vector3dVector(rod_points),
@@ -344,23 +359,24 @@ class PointCloudVisualization:
 
             # Add alpha angle point as a highlighted sphere (and rod) if provided
             if alpha_angle_point is not None:
+                alpha_angle_point = np.asarray(alpha_angle_point, dtype=float)
                 alpha_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=max(0.02, marker_radius * 0.75))
                 alpha_sphere.translate(alpha_angle_point)
                 alpha_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # Bright green
                 alpha_sphere.compute_vertex_normals()
                 geometries.append(alpha_sphere)
 
-                alpha_tip = alpha_angle_point + towards_camera * marker_tip_offset
+                alpha_tip = alpha_angle_point + line_of_sight * marker_tip_offset
                 alpha_tip_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=max(0.015, marker_radius * 0.5))
                 alpha_tip_sphere.translate(alpha_tip)
                 alpha_tip_sphere.paint_uniform_color([0.0, 1.0, 0.0])
                 alpha_tip_sphere.compute_vertex_normals()
                 geometries.append(alpha_tip_sphere)
 
-                if show_rods:
+                if show_alpha_point_rod:
                     alpha_rod_points = np.vstack([
                         alpha_angle_point,
-                        alpha_angle_point + towards_camera * rod_length,
+                        alpha_angle_point + line_of_sight * rod_length,
                     ])
                     alpha_rod = o3d.geometry.LineSet(
                         points=o3d.utility.Vector3dVector(alpha_rod_points),

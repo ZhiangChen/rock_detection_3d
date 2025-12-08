@@ -13,11 +13,22 @@ thresholds:
 
 # Default preprocessing filters
 filters:
-  sor: true
-  vertical: true
-  k_neighbors: 10
-  std_ratio: 2.0
-  vertical_std: 1.0
+  sor: true                 # Run Statistical Outlier Removal during filtering
+  vertical: true            # Apply vertical-profile filter to drop high-variance columns
+  k_neighbors: 10           # Base neighbor count for SOR (will be adaptive if adaptive_k enabled)
+  std_ratio: 2.0            # Std-dev multiplier for SOR; lower removes more points
+  adaptive_k_neighbors: true  # Enable CV-based adaptive k_neighbors selection
+  # When adaptive_k_neighbors is true:
+  # - CV < 0.22 (uniform spacing like UAV SfM): k=30 to capture subtle outliers
+  # - CV > 0.22 (variable spacing like UAV LiDAR): k=10 for local outlier detection
+  vertical_std: 1.0         # Z-score cutoff for vertical noise pruning
+  cluster_cleanup: false     # Enable DBSCAN-based cluster pruning after SOR
+  adaptive_dbscan_eps: false  # Use adaptive eps for DBSCAN (false = use fixed cluster_eps)
+  cluster_eps: 0.03         # DBSCAN radius (meters) - fixed at 2cm unless adaptive enabled
+  cluster_dbscan_min_points: 20  # Minimum points for a dense cluster in DBSCAN
+  cluster_min_pct: 0.01     # Keep clusters with at least 1% of total points
+  basal_clipping: true      # Enable clipping against basal surface
+  basal_clip_threshold: 0.0 # Trim threshold in meters (0.0 = exact surface, 0.02 = 2cm tolerance)
 
 # Normal computation defaults
 normals:
@@ -26,13 +37,15 @@ normals:
 
 # Default save locations (placeholders: {input_dir}, {pbr}, {ts})
 paths:
-  pcd_dir: "{input_dir}/outputs/{pbr}"
-  mesh_dir: "{input_dir}/outputs/{pbr}"
-  csv_dir: "{input_dir}/outputs/{pbr}"
+  pcd_dir: "{input_dir}"
+  mesh_dir: "{input_dir}"
+  csv_dir: "{input_dir}"
 
 # Visualization helpers
 visualization:
   alpha_view_rods: true
+  com_point_rod: true
+  alpha_point_rod: true
 
 # Region growing neighbor defaults
 region_growing:

@@ -3,6 +3,7 @@ import open3d as o3d
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
+from scipy.spatial import cKDTree
 
 def process_point_chunk_noise(points, normals, pcd_tree, start_idx, end_idx, k_neighbors, max_error, relative_error):
     """Helper function to process a chunk of points for noise filter"""
@@ -149,10 +150,61 @@ def compute_rough_dimensions(pcd, padding=0.2):
     hw_ratio = height / width if width > 0 else float('inf')
     return hw_ratio, height, width, padded_dimensions
 
+
+def estimate_point_density_cv(pcd, sample_size=1000):
+    """
+    Estimate point cloud density and compute Coefficient of Variation (CV).
+    
+    Args:
+        pcd: Open3D point cloud
+        sample_size: Number of points to sample for analysis
+        
+    Returns:
+        dict: Contains mean_nn_distance, cv, and adaptive k_neighbors recommendation
+    """
+    points = np.asarray(pcd.points)
+    num_points = len(points)
+    
+    # Sample points for efficiency
+    if num_points > sample_size:
+        sample_indices = np.random.choice(num_points, sample_size, replace=False)
+        sample_points = points[sample_indices]
+    else:
+        sample_points = points
+    
+    # Build KD-tree and compute nearest neighbor statistics
+    tree = cKDTree(sample_points)
+    distances, _ = tree.query(sample_points, k=min(11, len(sample_points)))
+    
+    # Get mean NN distance per point (excluding self)
+    nn_distances = distances[:, 1:]
+    mean_nn_per_point = np.mean(nn_distances, axis=1)
+    
+    # Compute global statistics
+    mean_nn_distance = np.mean(mean_nn_per_point)
+    std_nn = np.std(mean_nn_per_point)
+    cv = std_nn / mean_nn_distance if mean_nn_distance > 0 else 0.0
+    
+    # Adaptive k_neighbors based on CV
+    # Low CV (uniform) → use more neighbors to detect subtle outliers
+    # High CV (variable) → use fewer neighbors for local outlier detection
+    if cv < 0.22:
+        recommended_k = 30
+    else:
+        recommended_k = 10
+    
+    return {
+        'mean_nn_distance': mean_nn_distance,
+        'cv': cv,
+        'recommended_k': recommended_k,
+        'num_points': num_points
+    }
+
+
 def filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=False, 
                       k_neighbors=6, std_ratio=2.0, max_error=0.1, 
                       relative_error=True, vertical_std=1.0, n_threads=8,
-                      height_width_threshold=2.0):
+                      height_width_threshold=2.0, adaptive_k=False):
     """Combined filtering function that can apply multiple filters.
     
     Args:
@@ -161,6 +213,7 @@ def filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=False,
         use_vertical_filter: Whether to apply vertical outlier filtering
         vertical_std: Number of standard deviations for vertical filter
         height_width_threshold: Minimum H/W ratio to apply vertical filter
+        adaptive_k: Whether to use CV-based adaptive k_neighbors selection
         ...other filter parameters...
     
     Returns:
@@ -168,6 +221,13 @@ def filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=False,
     """
     current_pcd = pcd
     all_inliers = np.arange(len(np.asarray(pcd.points)))
+    
+    # Compute adaptive k_neighbors if enabled
+    actual_k = k_neighbors
+    if adaptive_k and filter_type == 'sor':
+        density_info = estimate_point_density_cv(current_pcd)
+        actual_k = density_info['recommended_k']
+        logging.info(f"Adaptive k_neighbors: CV={density_info['cv']:.3f}, using k={actual_k}")
     
     # Apply vertical filter only if the rock is tall enough
     if use_vertical_filter:
@@ -181,14 +241,14 @@ def filter_point_cloud(pcd, filter_type='sor', use_vertical_filter=False,
         else:
             logging.info(f"Rock is not tall enough (H/W ratio = {hw_ratio:.2f}), skipping vertical filter")
     
-    # Apply main filter
+    # Apply main filter with adaptive or fixed k
     if filter_type == 'sor':
         current_pcd, f_inliers = sor_filter(
-            current_pcd, k_neighbors=k_neighbors, std_ratio=std_ratio, n_threads=n_threads
+            current_pcd, k_neighbors=actual_k, std_ratio=std_ratio, n_threads=n_threads
         )
     else:
         current_pcd, f_inliers = noise_filter(
-            current_pcd, k_neighbors=k_neighbors, max_error=max_error, 
+            current_pcd, k_neighbors=actual_k, max_error=max_error, 
             relative_error=relative_error, n_threads=n_threads
         )
     
