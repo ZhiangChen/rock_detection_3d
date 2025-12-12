@@ -454,6 +454,33 @@ class RegionGrowingSegmentation:
                 colored_pcd = self.color_point_cloud()
                 o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
 
+        # Final step: Assign remaining unlabeled points to nearest labeled point
+        unlabeled_indices = np.where(self.labels == -1)[0]
+        if len(unlabeled_indices) > 0:
+            print(f"Final assignment: {len(unlabeled_indices)} unlabeled points remain")
+            labeled_indices = np.where(self.labels != -1)[0]
+            
+            if len(labeled_indices) > 0:
+                # Build a KNN model on ONLY labeled points for efficiency
+                # This ensures we always find a labeled neighbor
+                labeled_points = points[labeled_indices]
+                unlabeled_points = points[unlabeled_indices]
+                
+                # Use sklearn NearestNeighbors to search among labeled points only
+                # Use k=10 for majority voting (more robust than single nearest neighbor)
+                k = min(10, len(labeled_indices))
+                nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(labeled_points)
+                distances, indices = nbrs.kneighbors(unlabeled_points)
+                
+                # Assign labels based on majority vote among k nearest labeled neighbors
+                for i, unlabeled_idx in enumerate(unlabeled_indices):
+                    neighbor_labels = self.labels[labeled_indices[indices[i]]]
+                    # Majority vote
+                    self.labels[unlabeled_idx] = np.bincount(neighbor_labels).argmax()
+                
+                final_unlabeled = np.sum(self.labels == -1)
+                print(f"Final assignment complete. Assigned {len(unlabeled_indices)} points using k={k} voting. {final_unlabeled} points still unlabeled (if any)")
+
         return self.labels
 
     def transfer_labels_to_dense(self, dense_pcd, sparse_pcd, sparse_labels):
