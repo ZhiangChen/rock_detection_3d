@@ -75,6 +75,8 @@ DEFAULT_CONFIG = {
         "cluster_eps": 0.02,
         "cluster_dbscan_min_points": 20,
         "cluster_min_pct": 0.01,
+        "basal_clipping": False,
+        "basal_clip_threshold": 0.0,
     },
     "normals": {
         "method": "PyMeshLab",  # PyMeshLab | Open3D
@@ -227,7 +229,7 @@ def region_growing(controller, pcd, rock_seeds, pedestal_seeds):
 
     colored_pcd = controller.segmenter.color_point_cloud()
     labels = np.asarray(controller.segmenter.labels)
-    labels[labels == -1] = 1
+    labels[labels == -1] = 0
     return colored_pcd, labels
 
 
@@ -848,7 +850,7 @@ class RefactoredMainWindow(QMainWindow):
         self.prepare_bottom_button = QPushButton("Interpolate missing faces")
         self.normal_k_label = QLabel("k")
         self.normal_k_spin = QSpinBox()
-        self.normal_k_spin.setRange(3, 200)
+        self.normal_k_spin.setRange(3, 500)
         self.normal_k_spin.setValue(int(self.config.get("normals.k", DEFAULT_CONFIG["normals"]["k"])))
         self.normal_method_combo = QComboBox()
         self.normal_method_combo.addItems(["PyMeshLab", "Open3D"])
@@ -1988,7 +1990,7 @@ class RefactoredMainWindow(QMainWindow):
                 if traceback_txt:
                     logging.error("Poisson worker traceback:\n%s", traceback_txt)
                 self.mesh_processor.last_error_message = message
-                recovery_hint = "\n\nThe point cloud has complications. Please fix normals or remove noise and try again."
+                recovery_hint = "\n\nThe point cloud has complications. Please retry mesh reconstruction 2-3 times or fix normals or remove noise and try again."
                 QMessageBox.warning(self, "Mesh Reconstruction", f"{message}{recovery_hint}")
                 return
 
