@@ -1,87 +1,193 @@
-# 3D Rock Detection
-## Overview
-Recent studies have applied deep learning algorithms to automatically extract rock traits (position, size, eccentricity, and orientation) using 2D orthorectified images, structured from unpiloted aircraft system (UAS) imagery. This repository introduced an offline pipeline for autonomous 3D rock detection, which can improve geometric analysis of geological features such as precariously balanced rocks, rocky slopes, fluvial channels, and debris flows. We first obtain both orthomosaics and point clouds using Structure-from-Motion algorithms on UAS imagery. Using the existing deep learning algorithms for 2D rock detection, individual rocks are identified and localized within 2D bounding boxes in orthomosaics. Based on the georeferences of the 2D bounding boxes, 3D bounding boxes are generated to include individual 3D rocks in point clouds. In each 3D bounding box, we then conduct point-cloud segmentation algorithms to categorize each point, such that the rock points in 3D bounding boxes can be extracted. This offline 3D rock detection pipeline, combining 2D rock detection and 3D rock segmentation, can segment individual rocks in point clouds to obtain accurate 3D geometric properties. Additionally, because rocks and supporting surfaces are semantically categorized, rock basal contact information can also be extracted, which is critical for the fragility study of balanced rocks. Our 3D rock detection extends deep learning applications from 2D geomorphological features to 3D, which supports quantitative research in rock fragility, slope stability, and landscape evolution. 
+# Mapping, Segmentation, and Geometric Analysis of Freestanding Rocks
 
-## Requirements
-1. [torch-points3d](https://github.com/nicolas-chaulet/torch-points3d). To install torch-points3d, you need configure its [requirements](https://github.com/nicolas-chaulet/torch-points3d#requirements) first.
-2. [laspy](https://laspy.readthedocs.io/en/latest/): `pip3 install laspy`
-3. rasterio, geopandas, rioxarray, and pyproj : `pip3 install rasterio geopandas rioxarray pyproj`
+This repository contains the code for a workflow that maps, segments, and geometrically analyzes freestanding rocks from UAV Structure-from-Motion (SfM), UAV lidar, and handheld lidar point clouds. The workflow was developed with precariously balanced rocks (PBRs) as a demanding application, but the methods are broadly useful for geoscience problems that require separating a rock body from its supporting surface and reconstructing rock geometry for quantitative analysis.
 
+The core contribution is an integrated pipeline that combines:
 
-## Data
-The following data is needed to apply the 3D rock detection. The first two, orthomosaic and mesh models, are obtained from Structure-from-Motion software (e.g., Agisoft). They should have a coordinate reference system of WGS 84 with UTM projection. UTM zones can be found here: https://mangomap.com/robertyoung/maps/69585/what-utm-zone-am-i-in-#. The third data, point cloud, is subsampled from the mesh model. The subsampling can be done in CloudCompare. 
-1. Orthomosaic: .tif with WGS 84 and UTM zone
-2. Mesh (with texture): .obj with WGS 84 and UTM zone (optional)
-3. Point cloud: .las, subsampled from .obj
+1. 2D rock detection on georeferenced orthomosaics,
+2. 2D-3D rock association for extracting local rock subsets from scene-scale point clouds,
+3. interface-constrained region growing for 3D rock-support segmentation,
+4. watertight mesh reconstruction, and
+5. application-specific geometric analysis.
 
-## Workflow
-![workflow](docs/pipeline_workflow.png)
-1. 2D rock detection in orthomosaic => bounding boxes
-2. Using the detected bounding boxes to crop points in the point cloud => pbr pointcloud candidates
-3. Classifying the pbr pointcloud candidates => pbr pointclouds 
-4. Segmenting the pbr pointclouds => segmented pbr pointclouds  
+## Why This Repository Exists
 
-The objective of the third step is to reduce false detections from the first step (2D detection). 
+Freestanding rocks preserve important geometric information for geomorphic interpretation and natural-hazard analysis. For PBRs in particular, geometry and rock-support contact conditions strongly influence stability and fragility. Existing workflows often stop at 2D mapping, require manual segmentation, or rely on case-specific 3D reconstruction, which makes site-scale studies difficult to reproduce and scale.
 
-## Getting Started
-### Training models from scratch
-2D part:
-1) UAS-SfM: obtain the [required data](https://github.com/ZhiangChen/rock_detection_3d#data) from UAS-SfM and point cloud sampling.
-2) 2D annotation: annotate rocks on orthomosaics and export a shapefile including rock polygons and rock categories. Create a data folder under `rock_detection_3d/notebooks/data/`. E.g. `rock_detection_3d/notebooks/data/rocklas/`. And create a file structure as follows for your data:
-```
-rock_detection_3d/notebooks/data/rocklas/
-    annotation_shapefiles/your_annotation.shp ...
-    bbox_las/original_bbox_croped_points.las ...
-    bbox_las_annotation/annotated_bbox_cropped_points.las ...
-    your_data.tif
-    your_data.las
-```
-3) generate tiles from shapefile (2D training dataset): Use this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_0_generating_tiles_from_shapefile.ipynb), and it creates a folder with split tiles. Instances on tile boundaries are split to different tiles via our Tile Split algorithm.
-4) create training, validation, and test splits: refer to [create your own dataset readme.md](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md).
-5) train Mask R-CNN and conduct inference: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_1_training_2D_instance_segmentation.ipynb).
-6) instance registration: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_2_merging_inference_instances.ipynb) to create a shapefile of your inference results. With the shapefile, you can edit the prediction polygons as needed. 
+This repository provides a practical workflow for moving from mapped rocks in orthomosaics to segmented 3D rock geometries and derived measurements such as height, width, center of mass, and minimum contact angle.
 
-3D part:
+## Workflow Overview
 
-7) 2D bounding box extraction: from the above inference shapefile (or original annotation shapefile), georeferenced 2D bounding boxes are extracted. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/1_extract_bounding_box_from_geotiff.ipynb).  
-8) 3D rock extraction: this step uses the above georeferenced 2D bounding boxes to crop individual 3D rock point clouds. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/2_extract_pointcloud_objects.ipynb).  
-9) 3D annotation: the above rock point clouds include both pedestal and PBR points. We need to classify each point in the above rock point clouds. The objective of this step is to annotate points on the rock of interest. Here is a tutorial of using cloudcompare for point annotation: https://www.youtube.com/watch?v=B61WNd7R_w4
-10) 3D point segmentation: before you start 3D point segmentation, you should prepare torch-points3d dataset (see a [tutorial of create your own dataset](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md)). Then refer to this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/4_pbr_segmentation_kpconv.ipynb) to train your model. 
+For UAV-SfM and UAV-lidar datasets, the full workflow is:
 
-### Conducting inference with trained models
-2D part:
-1) create a folder for your data
-```commandline
-rock_detection_3d/notebooks/data/rocklas/
-    bbox_las_annotation/annotated_bbox_cropped_points.las ... (to be generated)
-    your_data.tif
-    your_data.las
-```
-2) generate tiles from shapefile (2D inference dataset): Use this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_0_generating_tiles_from_shapefile.ipynb), and it creates a folder with split tiles. Instances on tile boundaries are split to different tiles via our Tile Split algorithm.
-3) create a json with all inference images: refer to [create your own dataset readme.md](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md).
-4) conduct inference using [Mask R-CNN notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_1_training_2D_instance_segmentation.ipynb).
-5) instance registration: Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/0_2_merging_inference_instances.ipynb) to create a shapefile of your inference results. With the shapefile, you can edit the prediction polygons as needed. 
+1. Generate orthomosaics and point clouds from remote-sensing surveys.
+2. Detect candidate rocks in georeferenced orthomosaics.
+3. Use the georeferenced detections to crop individual 3D rock subsets from the scene-scale point cloud.
+4. Filter obvious false positives and non-fragile candidates using geometric criteria.
+5. Segment each subset into rock and support using interface-constrained region growing.
+6. Reconstruct a watertight mesh from the segmented rock.
+7. Compute geometric quantities for downstream analysis.
 
-3D part:
+For handheld lidar scans of individual rocks, the workflow can start directly from the 3D segmentation stage.
 
-6) 2D bounding box extraction: from the above inference shapefile (or original annotation shapefile), georeferenced 2D bounding boxes are extracted. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/1_extract_bounding_box_from_geotiff.ipynb).
-7) 3D rock extraction: this step uses the above georeferenced 2D bounding boxes to crop individual 3D rock point clouds. Refer to the [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/2_extract_pointcloud_objects.ipynb).  
-8) 3D point segmentation: before you start 3D point segmentation, you should prepare torch-points3d dataset (see a [tutorial of create your own dataset](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/data/README.md)). Then refer to this [notebook](https://github.com/ZhiangChen/rock_detection_3d/blob/main/notebooks/4_pbr_segmentation_kpconv.ipynb) to conduct inference for your model. 
+<img src="rock_detection_3d/images/workflow.png" height="360">
 
+## Repository Organization
 
+The repository has two main parts.
 
+### Part 1: Mapping, Segmentation, and Geometric Analysis
 
+This part contains the main workflow described in the manuscript.
 
+#### `rock_detection_2d`
 
+This folder contains the 2D detection and 2D-3D association support code.
 
-## Todo
-- implement weighted loss to focus on edge point segmentation
-- try different optimizers
-- synthetic rock segmentation data
-    - generate synthetic rocks -> rock point cloud
-    - generate synthetic terrains (background) -> pedestal point cloud
-    - randomize orientations of the rock point cloud and the pedestal point cloud
-    - place the rock point cloud on the pedestal point cloud 
-    - merge two point clouds
-        - iteratively remove points on the rock point cloud
-        - given a rock point (x, y, z), use (x, y) to search the pedestal point with the nearest (x_i, y_j). The nearest pedestal point has coordinates (x_i, y_j, z_j). Compare z and z_j. Remove the rock point, if z < z_j.
+- `rock_etxtraction_2d_pipeline.py` performs tiled orthomosaic processing and text-guided 2D detection for candidate rocks.
+- `generate_pbr_database.py` builds a database of cropped 3D rock candidates and computes geometric screening metrics.
+- `filter_flat_rocks.py` removes overly planar or obviously flat candidates.
+- `threshold_analyzer.py` helps evaluate geometric thresholds using positive and negative examples.
+
+In manuscript terms, this module supports the 2D rock detection and 2D-3D rock association stages. It is designed to retain likely rock candidates while allowing later geometric filtering and 3D segmentation to refine the result.
+
+#### `rock_detection_3d`
+
+This folder contains the 3D segmentation, mesh reconstruction, and geometry-analysis tools.
+
+- `RegionGrowing.py` implements the region-growing segmentation logic.
+- `RegionGrowing_GUI.py` and `RegionGrowing_GUI_refactored.py` provide an interactive GUI for segmentation and analysis.
+- `basal_line_processor.py` and `basal_points_algo.py` support user-guided interface definition and basal-contact handling.
+- `mesh_processor.py` supports bottom-surface interpolation, normal handling, filtering, and watertight mesh generation.
+- `geometric_analyzer.py` computes rock geometry metrics from segmented point clouds and meshes.
+
+This is the main implementation area for the manuscript’s Interface-Constrained Region Growing (ICRG) workflow.
+
+The `rock_detection_3d` module is not just a backend segmentation library. It also includes an interactive GUI designed for geologists and students to load point clouds, select rock and support seeds, define basal or interface points, run segmentation, inspect intermediate outputs, and continue into mesh reconstruction and geometric analysis. This GUI-centered workflow is a major part of the non-learning-based method in this repository.
+
+<img src="rock_detection_3d/images/gui.png" height="360">
+
+### Part 2: Learning-Based Methods
+
+This repository also includes a learning-based pipeline for autonomous 3D rock detection. At a high level, this branch combines learned 2D rock mapping from orthomosaics with learned 3D point-cloud segmentation on cropped rock subsets. It is the more dataset-driven alternative to the GUI-centered non-learning workflow.
+
+#### `learning_based_rock_detection_2d`
+
+This module contains the learned 2D instance-segmentation components for mapping rocks from orthomosaics, including dataset preparation, Mask R-CNN model definition, and evaluation utilities.
+
+For more detail, see:
+
+- [learning_based_README.md](/Users/zhiang/Projects/rock_detection_3d/learning_based_README.md)
+- `notebooks/0_0_generating_tiles_from_shapefile.ipynb`
+- `notebooks/0_1_training_2D_instance_segmentation.ipynb`
+- `notebooks/0_2_merging_inference_instances.ipynb`
+
+#### `learning_based_rock_detection_3d`
+
+This module contains the learned 3D segmentation data pipeline for point-wise rock labeling from LAS point clouds, including dataset loaders and utilities for `torch-points3d` style experiments.
+
+For more detail, see:
+
+- [learning_based_README.md](/Users/zhiang/Projects/rock_detection_3d/learning_based_README.md)
+- [notebooks/data/README.md](/Users/zhiang/Projects/rock_detection_3d/notebooks/data/README.md)
+- `notebooks/1_extract_bounding_box_from_geotiff.ipynb`
+- `notebooks/2_extract_pointcloud_objects.ipynb`
+- `notebooks/4_pbr_segmentation_kpconv.ipynb`
+
+#### How the learning-based branch fits this repository
+
+The learning-based workflow complements the main freestanding-rock analysis pipeline by providing scalable 2D detection and learned 3D segmentation. Compared with the interface-constrained workflow, it places more emphasis on annotated training data, dataset preparation, and notebook-based experimentation.
+
+## Main Methodological Contribution: Interface-Constrained Region Growing
+
+The central method in this repository is interface-constrained region growing for separating a target rock from its supporting surface.
+
+Standard clustering or region-growing methods can spill across the rock-support boundary when the rock and support have similar material, roughness, or local geometry. The approach implemented here addresses that problem by combining:
+
+- rock and support seed points,
+- sparse user-defined interface points near the rock-support contact,
+- interpolation of those interface points into a dense interface path,
+- adaptive neighborhood control near the interface, and
+- smoothness and curvature criteria for controlled region growth.
+
+This design keeps the workflow semi-automated: users only guide the ambiguous contact boundary, while the rest of the segmentation, mesh preparation, and measurement pipeline remains automated and reproducible.
+
+Within `rock_detection_3d`, this method is exposed through the GUI so users can iteratively refine seeds and interface constraints, visualize the segmentation results, and move directly into mesh reconstruction without leaving the workflow.
+
+## Sensing Modalities
+
+The workflow is intended for multiple data sources:
+
+- UAV-SfM point clouds and orthomosaics,
+- UAV lidar point clouds and orthomosaics,
+- handheld lidar scans of individual rocks.
+
+The manuscript shows that point-cloud completeness near the rock-support interface strongly affects downstream segmentation and geometric analysis. Close-range lidar and carefully planned multi-view UAV-SfM often produce better interface geometry than regular grid-style surveys.
+
+## Benchmarking and Assessment
+
+The manuscript evaluates the workflow on datasets from Granite Dells, Arizona, and the southern Sierra Nevada, California. The 3D segmentation method is benchmarked against:
+
+- K-means,
+- standard region growing,
+- GrowSP.
+
+Across these comparisons, the interface-constrained method performs best overall because it explicitly represents the mechanically meaningful rock-support boundary rather than relying only on feature similarity.
+
+<img src="rock_detection_3d/images/benchmark.png" height="320">
+
+## Geometric Analysis
+
+After segmentation, the workflow reconstructs a watertight rock mesh and computes geometric properties for scientific applications. Depending on the use case, this can include:
+
+- rock height, width, and length,
+- height-to-width ratio,
+- center of mass,
+- basal-contact geometry,
+- minimum contact angle for PBR analysis.
+
+For PBR applications, these measurements support geometric fragility assessment and can be used to estimate first-order overturning behavior.
+
+<img src="rock_detection_3d/images/field_study.png" height="320">
+
+## Notebooks
+
+The notebook workflow in `notebooks/` connects the main stages:
+
+- `0_0_generating_tiles_from_shapefile.ipynb`: generate tiled 2D datasets.
+- `0_1_training_2D_instance_segmentation.ipynb`: train and run 2D instance-segmentation models.
+- `0_2_merging_inference_instances.ipynb`: merge tile-level predictions into mapped instances.
+- `1_extract_bounding_box_from_geotiff.ipynb`: extract georeferenced 2D bounding boxes.
+- `2_extract_pointcloud_objects.ipynb`: crop candidate rock point clouds from the full scene.
+- `4_pbr_segmentation_kpconv.ipynb`: learning-based 3D segmentation experiments.
+
+Additional dataset-format notes are available in [notebooks/data/README.md](/Users/zhiang/Projects/rock_detection_3d/notebooks/data/README.md).
+
+## Additional Documentation
+
+- [rock_detection_3d/README.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/README.md): detailed notes on the unsupervised 3D segmentation workflow.
+- [rock_detection_3d/GUI_TUTORIAL.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/GUI_TUTORIAL.md): detailed guide to the interactive GUI.
+- [learning_based_README.md](/Users/zhiang/Projects/rock_detection_3d/learning_based_README.md): learning-based training and inference workflow.
+
+## Data Requirements
+
+Typical inputs include:
+
+- a georeferenced orthomosaic in `.tif`,
+- a scene-scale point cloud in `.las` or `.laz`,
+- optional mesh products from SfM or lidar processing,
+- shapefiles or JSON split files for training and inference workflows.
+
+The existing code and documentation assume georeferenced products, typically in WGS 84 with a UTM projection.
+
+## Summary
+
+At a high level, this repository provides a reproducible workflow for:
+
+- mapping freestanding rocks from remote-sensing data,
+- extracting individual 3D rock subsets,
+- separating rocks from their supports using interface-constrained segmentation,
+- reconstructing watertight meshes,
+- computing geometry for geomorphic and hazard applications.
+
+Although the motivating application is precariously balanced rocks, the workflow is useful more broadly for freestanding rock mapping and 3D geometric characterization in geoscience.
