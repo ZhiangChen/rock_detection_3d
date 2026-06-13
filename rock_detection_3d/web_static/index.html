@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rock Detection 3D</title>
+    <link rel="stylesheet" href="/web-static/styles.css?v=20260613-trackball1" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="mark"></div>
+          <div>
+            <h1>Rock Detection 3D</h1>
+            <p id="currentFile">No point cloud loaded</p>
+          </div>
+        </header>
+
+        <label class="upload">
+          <span>Upload LAS/LAZ</span>
+          <input id="fileInput" type="file" accept=".las,.laz" />
+        </label>
+
+        <section class="panel">
+          <h2>Workflow</h2>
+          <div id="statusList"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Views</h2>
+          <div class="view-grid">
+            <button data-view="raw" data-help-title="Raw view" data-help-body="Show the uploaded point cloud with its original colors before seed or interface edits.">Raw</button>
+            <button data-view="seeds" data-help-title="Seeds view" data-help-body="Show the seed-selection state, including saved rock and support seed markers.">Seeds</button>
+            <button data-view="interface" data-help-title="Interface view" data-help-body="Show the previewed or saved interface constraints near the contact.">Interface</button>
+            <button data-view="segmented" data-help-title="Segmented view" data-help-body="Show the latest rock/support labels after running interface-constrained region growing.">Segmented</button>
+            <button data-view="mesh_prepared" data-help-title="Mesh prep view" data-help-body="Show the prepared point set used for normal estimation and mesh reconstruction.">Mesh Prep</button>
+            <button data-view="mesh" data-help-title="Mesh view" data-help-body="Show mesh status after reconstruction; download the PLY from the Downloads panel.">Mesh</button>
+          </div>
+          <button id="toggleTips" class="tip-toggle" type="button" aria-pressed="true">Hover Tips On</button>
+        </section>
+
+        <section class="panel">
+          <h2>Downloads</h2>
+          <a id="downloadSegmented" class="disabled">Segmented LAS</a>
+          <a id="downloadMesh" class="disabled">Mesh PLY</a>
+          <a id="downloadAnalysis" class="disabled">Analysis CSV</a>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <div class="viewer-bar">
+          <div>
+            <span>Viewport</span>
+            <strong id="activeViewLabel">Raw</strong>
+          </div>
+          <div id="viewMeta"></div>
+        </div>
+        <canvas id="viewer"></canvas>
+        <canvas id="manualRemovalOverlay" class="manual-removal-overlay hidden"></canvas>
+        <div id="toast" class="toast hidden"></div>
+        <div id="infoTooltip" class="info-tooltip hidden" role="tooltip"></div>
+      </main>
+
+      <aside class="controls">
+        <section class="panel">
+          <h2>1. Seeds & Picking</h2>
+          <label>
+            <span class="label-row">
+              <span>Point size</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Point size help" data-info-title="Point size" data-info-body="Changes only the rendered point size. Increase it for sparse or distant clouds and decrease it when dense clouds look blotchy; segmentation and exports are unchanged.">i</span>
+            </span>
+            <input id="pointSize" type="range" min="1" max="12" step="0.5" value="3.5" />
+          </label>
+          <div class="segmented-control">
+            <button id="pickRock" class="active" data-help-title="Rock pick mode" data-help-body="Shift + left click adds rock seed points. Shift + right click near a selected point removes it.">Rock</button>
+            <button id="pickPedestal" data-help-title="Pedestal pick mode" data-help-body="Shift + left click adds support or pedestal seed points. Shift + right click near a selected point removes it.">Pedestal</button>
+            <button id="pickInterface" data-help-title="Interface pick mode" data-help-body="Shift + left click adds interface contact points. Shift + right click near a selected point removes it.">Interface</button>
+          </div>
+          <div class="pick-prompt">
+            <span>Shift + Left Click to add a seed.</span>
+            <span>Shift + Right Click to unselect the nearest selected point.</span>
+          </div>
+          <div class="readout">
+            <span id="rockCount">Rock 0</span>
+            <span id="pedestalCount">Pedestal 0</span>
+            <span id="interfaceCount">Interface 0</span>
+          </div>
+          <div class="button-row">
+            <button id="autoSeeds" data-help-title="Auto Seeds" data-help-body="Choose default rock and support seeds from the current point cloud geometry.">Auto Seeds</button>
+            <button id="clearCurrentPick" data-help-title="Clear Mode" data-help-body="Clear only the current pick mode: rock seeds, pedestal seeds, or current interface points.">Clear Mode</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>2. Region Growing</h2>
+          <label>
+            <span class="label-row">
+              <span>Smoothness</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Smoothness help" data-info-title="Smoothness threshold" data-info-body="Default 0.9. Higher values require more parallel normals and can reduce leakage across the rock-support contact. Lower values help rough or noisy rock surfaces grow, but can spill into support.">i</span>
+            </span>
+            <input id="smoothness" type="number" min="0" max="1" step="0.01" value="0.9" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Curvature</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Curvature help" data-info-title="Curvature threshold" data-info-body="Default 0.1. Lower values are stricter and favor smooth local continuity. Raise it when rough rock surfaces are being missed; lower it if growth crosses sharp contact changes.">i</span>
+            </span>
+            <input id="curvature" type="number" min="0" max="1" step="0.01" value="0.1" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Basal proximity</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Basal proximity help" data-info-title="Interface exclusion radius" data-info-body="The manuscript default is 0.02 m; this UI starts at 0.05 m. Increase if labels cross the contact. Decrease if too much rock near the interface stays unlabeled.">i</span>
+            </span>
+            <input id="proximity" type="number" min="0" max="1" step="0.01" value="0.05" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Voxel</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Voxel help" data-info-title="Voxel size" data-info-body="Default 0.02 m in the manuscript for faster preprocessing. Smaller values preserve contact detail but run slower; larger values smooth noisy data but can erase small interface features.">i</span>
+            </span>
+            <input id="voxel" type="number" min="0.001" max="1" step="0.001" value="0.02" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Neighbors</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Neighbors help" data-info-title="Neighbor count" data-info-body="Controls how many nearby points support local geometry tests. Increase for sparse or noisy scans to stabilize normals; decrease to keep small contact details from being blurred.">i</span>
+            </span>
+            <input id="neighbors" type="number" min="3" max="500" step="1" value="50" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Distance</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Distance help" data-info-title="Neighborhood distance" data-info-body="Default radius is 0.05 m. Increase when the cloud is sparse or growth stalls across small gaps. Decrease to avoid jumps across narrow contacts or nearby supports.">i</span>
+            </span>
+            <input id="distance" type="number" min="0.001" max="1" step="0.001" value="0.05" />
+          </label>
+          <button id="runSegment" class="wide" data-help-title="Run Region Growing" data-help-body="Segment rock and support using saved seeds, interface constraints, and the current parameter values.">Run Region Growing</button>
+        </section>
+
+        <section class="panel">
+          <h2>3. Mesh Preparation</h2>
+          <button id="prepareMesh" class="wide" data-help-title="Prepare" data-help-body="Create the prepared rock point set used for normals, reconstruction, and analysis.">Prepare Mesh</button>
+          <label>
+            <span class="label-row">
+              <span>Denoise method</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Denoise method help" data-info-title="Denoise method" data-info-body="SOR removes statistical outliers based on neighbor distance. DBSCAN removes small isolated clusters using eps and minimum points. Use both when floating noise remains after SOR.">i</span>
+            </span>
+            <select id="denoiseMethod">
+              <option value="sor">SOR filter</option>
+              <option value="dbscan">DBSCAN</option>
+              <option value="sor_dbscan">SOR + DBSCAN</option>
+            </select>
+          </label>
+          <div class="inline-fields">
+            <label>
+              <span class="label-row">
+                <span>SOR k</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="SOR k help" data-info-title="SOR neighbors" data-info-body="Number of neighbors for statistical outlier removal. Increase for sparse or noisy scans; decrease for small, detailed scans.">i</span>
+              </span>
+              <input id="sorNeighbors" type="number" min="3" max="500" step="1" value="10" />
+            </label>
+            <label>
+              <span class="label-row">
+                <span>SOR std</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="SOR std help" data-info-title="SOR std ratio" data-info-body="Lower values remove more points; higher values preserve more points. The refactored desktop default is 2.0.">i</span>
+              </span>
+              <input id="sorStdRatio" type="number" min="0.1" max="10" step="0.1" value="2.0" />
+            </label>
+          </div>
+          <div class="inline-fields">
+            <label>
+              <span class="label-row">
+                <span>DBSCAN eps (m)</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="DBSCAN eps help" data-info-title="DBSCAN eps" data-info-body="Maximum distance for DBSCAN cluster membership. The refactored desktop default is 0.02 m. Increase for sparse scans; decrease for tighter cleanup.">i</span>
+              </span>
+              <input id="dbscanEps" type="number" min="0.001" max="0.5" step="0.001" value="0.02" />
+            </label>
+            <label>
+              <span class="label-row">
+                <span>DBSCAN min</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="DBSCAN min help" data-info-title="DBSCAN min points" data-info-body="Minimum cluster size for DBSCAN core neighborhoods. The refactored desktop default is 20 points.">i</span>
+              </span>
+              <input id="dbscanMinPoints" type="number" min="1" max="1000" step="1" value="20" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="removeNoise" data-help-title="Denoise" data-help-body="Run the selected denoise method: SOR, DBSCAN, or SOR followed by DBSCAN.">Denoise</button>
+            <button id="undoNoise" data-help-title="Undo Denoise" data-help-body="Restore the prepared mesh point cloud to the state before the last denoise step.">Undo Denoise</button>
+          </div>
+          <button id="manualRemoval" class="wide" data-help-title="Manual Removal" data-help-body="Draw a screen-space polygon in Mesh Prep view and remove selected prepared rock or interpolated bottom-face points.">Manual Removal</button>
+        </section>
+
+        <section class="panel">
+          <h2>4. Normals</h2>
+          <label>
+            <span class="label-row">
+              <span>Normal method</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Normal method help" data-info-title="Normal method" data-info-body="PyMeshLab is preferred in the supplement because it estimates globally consistent normals for Poisson reconstruction. Use Open3D if PyMeshLab fails or the prepared mesh looks unstable.">i</span>
+            </span>
+            <select id="normalMethod">
+              <option value="pymeshlab">PyMeshLab</option>
+              <option value="open3d">Open3D</option>
+            </select>
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Normal k</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Normal k help" data-info-title="Normal k" data-info-body="Default 200 in the supplement for PCA normal estimation. Higher values smooth normals and help noisy surfaces; lower values preserve detail but can create unstable or flipped normals.">i</span>
+            </span>
+            <input id="normalK" type="number" min="3" max="1000" step="1" value="200" />
+          </label>
+          <label>
+            <span class="label-row">
+              <span>Normal length <output id="normalScaleValue">1.00x</output></span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Normal length help" data-info-title="Normal length" data-info-body="Changes only how long the normal vectors appear in Mesh Prep view. It does not change reconstruction or saved outputs. Increase it if computed normals are hard to see.">i</span>
+            </span>
+            <input id="normalScale" type="range" min="0.1" max="10" step="0.1" value="1" />
+          </label>
+          <button id="computeNormals" class="wide" data-help-title="Compute Normals" data-help-body="Estimate and orient normals with PyMeshLab or Open3D before Poisson mesh reconstruction.">Compute Normals</button>
+        </section>
+
+        <section class="panel">
+          <h2>5. Reconstruction</h2>
+          <label>
+            <span class="label-row">
+              <span>Depth</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Depth help" data-info-title="Poisson depth" data-info-body="Controls Poisson reconstruction resolution. Higher depth captures more detail but takes longer and may amplify noise; lower depth is faster and smoother for sparse data.">i</span>
+            </span>
+            <input id="meshDepth" type="number" min="5" max="12" step="1" value="8" />
+          </label>
+          <button id="reconstruct" class="wide" data-help-title="Reconstruct Mesh" data-help-body="Run Poisson reconstruction and create the downloadable mesh PLY.">Reconstruct Mesh</button>
+        </section>
+
+        <section class="panel">
+          <h2>6. Analysis</h2>
+          <button id="analyze" class="wide" data-help-title="Analyze" data-help-body="Compute geometric metrics and make the analysis CSV available for download.">Analyze</button>
+        </section>
+      </aside>
+
+      <div id="interfaceWindow" class="floating-window hidden" role="dialog" aria-labelledby="interfaceWindowTitle" aria-hidden="true">
+        <div id="interfaceWindowHandle" class="floating-window-header">
+          <h2 id="interfaceWindowTitle">Interface</h2>
+          <button id="closeInterfaceWindow" class="floating-window-close" type="button" aria-label="Close interface window">x</button>
+        </div>
+        <div class="floating-window-body">
+          <label class="check">
+            <input id="partLateral" type="checkbox" />
+            <span class="check-label">
+              <span>Lateral part</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Lateral part help" data-info-title="Lateral part" data-info-body="Use this when selected interface points trace contact with an adjacent rock or side support instead of the basal pedestal. Basal and lateral parts are handled separately; basal labels feed the contact-geometry analysis.">i</span>
+            </span>
+          </label>
+          <label class="check">
+            <input id="closeLoop" type="checkbox" checked />
+            <span class="check-label">
+              <span>Close loop</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Close loop help" data-info-title="Close loop" data-info-body="Keep this on when your interface points outline a closed contact boundary. Turn it off for an open contact edge or when staging separate basal and lateral interface parts.">i</span>
+            </span>
+          </label>
+          <div class="button-row">
+            <button id="stagePart" data-help-title="Stage Part" data-help-body="Store the current interface picks as one contact segment so you can pick another segment.">Stage Part</button>
+            <button id="interpolateInterface" data-help-title="Interpolate Path" data-help-body="Preview the dense interface path before saving it for segmentation.">Interpolate Path</button>
+          </div>
+          <button id="saveInterface" class="wide" data-help-title="Save Interface" data-help-body="Finalize the interpolated interface constraints for region growing.">Save Interface</button>
+          <div class="readout">
+            <span id="partsCount">Parts 0</span>
+            <button id="clearParts" class="link" data-help-title="Clear Parts" data-help-body="Remove staged interface parts and current interface picks.">Clear</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="manualRemovalWindow" class="floating-window manual-removal-window hidden" role="dialog" aria-labelledby="manualRemovalWindowTitle" aria-hidden="true">
+        <div id="manualRemovalWindowHandle" class="floating-window-header">
+          <h2 id="manualRemovalWindowTitle">Manual Removal</h2>
+          <button id="closeManualRemovalWindow" class="floating-window-close" type="button" aria-label="Close manual removal window">x</button>
+        </div>
+        <div class="floating-window-body">
+          <p class="tool-note">Draw around visible noise in Mesh Prep. Front rendered rock and interpolated bottom-face points can be removed.</p>
+          <div class="button-row">
+            <button id="manualRemovalDraw" data-help-title="Draw Polygon" data-help-body="Add polygon vertices with left clicks in the viewer. The preview updates after three vertices.">Draw Polygon</button>
+            <button id="manualRemovalUndoVertex" data-help-title="Undo Vertex" data-help-body="Remove the most recent polygon vertex and update the preview.">Undo Vertex</button>
+          </div>
+          <div class="button-row">
+            <button id="manualRemovalClear" data-help-title="Clear Manual Selection" data-help-body="Clear the polygon and selected preview points without changing the prepared mesh.">Clear</button>
+            <button id="manualRemovalApply" data-help-title="Remove Selected" data-help-body="Remove selected prepared rock or interpolated bottom-face points and add this edit to the denoise undo history.">Remove Selected</button>
+          </div>
+          <div class="readout">
+            <span id="manualRemovalCount">0 selected</span>
+          </div>
+          <button id="manualRemovalClose" class="wide" data-help-title="Close Manual Removal" data-help-body="Close the manual-removal tool without changing the prepared mesh.">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/web-static/app.js?v=20260613-trackball1"></script>
+  </body>
+</html>

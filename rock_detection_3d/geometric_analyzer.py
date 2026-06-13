@@ -342,7 +342,8 @@ class GeometricAnalyzer:
                     proximity_threshold: Optional[float] = None,
                     user: Optional[str] = None,
                     epsg_code: Optional[int] = None,
-                    output_csv: Optional[Union[str, Path]] = None) -> None:
+                    output_csv: Optional[Union[str, Path]] = None,
+                    include_user: bool = True) -> None:
         """
         Save analysis results to a CSV file.
         
@@ -358,6 +359,7 @@ class GeometricAnalyzer:
             user: Name of the user performing the analysis
             epsg_code: Optional EPSG code for the coordinate system
             output_csv: Optional path to output CSV file (if provided, results will be appended to this file)
+            include_user: Whether to include the user column in the saved row
         """
         try:
             csv_path = self._resolve_csv_path(input_path, output_csv)
@@ -383,8 +385,9 @@ class GeometricAnalyzer:
                 'curvature_threshold': curvature_threshold,
                 'proximity_threshold': proximity_threshold,
                 'epsg_code': epsg_code,  # Add EPSG code to data dictionary
-                'user': user,  # Add user to the data dictionary
             }
+            if include_user:
+                data['user'] = user  # Add user to the data dictionary
             
             df = pd.DataFrame([data])
 

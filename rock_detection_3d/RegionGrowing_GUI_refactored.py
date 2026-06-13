@@ -12,6 +12,14 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 import open3d as o3d
+
+# On Windows, importing PyMeshLab after PyQt can trigger a native access
+# violation. Preload it while still preserving the MeshProcessor fallback.
+try:
+    import pymeshlab as _pymeshlab_preload  # noqa: F401
+except ImportError:
+    _pymeshlab_preload = None
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFontMetrics
 from PyQt5.QtWidgets import (
