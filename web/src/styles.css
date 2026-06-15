@@ -351,11 +351,26 @@ a {
   z-index: 55;
 }
 
+.interface-editor-window {
+  top: 92px;
+  right: 372px;
+  z-index: 58;
+  width: min(390px, calc(100vw - 28px));
+}
+
 .tool-note {
   margin: 0 0 10px;
   color: #536059;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.source-choice {
+  margin-top: 9px;
+  padding: 9px;
+  border: 1px solid #d7ddd5;
+  border-radius: 6px;
+  background: #f1f5f0;
 }
 
 .spin {

@@ -1,4 +1,4 @@
-const REQUIRED_RUNTIME_BUILD = "20260613-trackball1";
+const REQUIRED_RUNTIME_BUILD = "20260614-interface-editor1";
 
 const state = {
   session: null,
@@ -72,6 +72,21 @@ const state = {
   manualRemovalDrawMode: false,
   manualRemovalPolygon: [],
   manualRemovalSelected: [],
+  interfaceEditorWindowDragging: false,
+  interfaceEditorWindowDragOffset: null,
+  interfaceEditorOpen: false,
+  interfaceEditorMode: "anchors",
+  interfaceEditorStroke: [],
+  interfaceEditorStrokeIndices: [],
+  interfaceEditorSelected: [],
+  interfaceEditorActiveSegment: null,
+  interfaceEditorBrushTargetSegment: null,
+  interfaceEditorBrushStartSegment: null,
+  interfaceEditorBrushEndSegment: null,
+  interfaceEditorShowOrder: false,
+  interfaceBrushRadius: 12,
+  interfaceDraft: null,
+  interfaceAnchorDrag: null,
   seedSaveTimer: null,
   seedSaveInFlight: false,
   seedSaveQueued: false,
@@ -93,8 +108,14 @@ function initElements() {
     "rockCount", "pedestalCount", "interfaceCount", "partsCount", "pointSize", "pickRock", "pickPedestal",
     "pickInterface", "autoSeeds", "clearCurrentPick",
     "interfaceWindow", "interfaceWindowHandle", "closeInterfaceWindow", "partLateral", "closeLoop", "stagePart",
-    "interpolateInterface", "saveInterface", "clearParts", "smoothness", "curvature", "proximity", "voxel",
-    "neighbors", "distance", "runSegment", "prepareMesh", "removeNoise", "undoNoise",
+    "interpolateInterface", "saveInterface", "editAutoInterface", "interfaceSourceChooser",
+    "editAutoDraft", "editManualDraft", "cancelInterfaceSource", "clearParts",
+    "interfaceEditorOverlay", "interfaceEditorWindow", "interfaceEditorWindowHandle", "closeInterfaceEditorWindow",
+    "editorAnchorMode", "editorBrushAddMode", "editorBrushRemoveMode", "editorUndo",
+    "editorSaveManual", "editorClose", "editorReadout", "editorBrushRadius", "editorBrushRadiusValue",
+    "editorShowOrder",
+    "smoothness", "curvature", "proximity", "voxel",
+    "neighbors", "distance", "runSegment", "runICRG", "prepareMesh", "removeNoise", "undoNoise",
     "manualRemoval", "manualRemovalOverlay", "manualRemovalWindow", "manualRemovalWindowHandle",
     "closeManualRemovalWindow", "manualRemovalDraw", "manualRemovalUndoVertex", "manualRemovalClear",
     "manualRemovalApply", "manualRemovalClose", "manualRemovalCount",
@@ -301,10 +322,20 @@ function updateStatus() {
   setDownload(el.downloadSegmented, "segmented", state.session.outputs.segmented);
   setDownload(el.downloadMesh, "mesh", state.session.outputs.mesh);
   setDownload(el.downloadAnalysis, "analysis", state.session.outputs.analysis);
+  if (el.runSegment) {
+    el.runSegment.disabled = !status.seeds_ready;
+  }
+  if (el.runICRG) {
+    el.runICRG.disabled = !status.seeds_ready || !status.manual_interface_ready;
+  }
   if (el.manualRemoval) {
     el.manualRemoval.disabled = !status.mesh_prepared;
   }
+  if (el.editAutoInterface) {
+    el.editAutoInterface.disabled = !status.auto_interface_ready && !status.manual_interface_ready;
+  }
   updateManualRemovalUI({ redraw: false });
+  updateInterfaceEditorUI({ redraw: false });
 }
 
 function setDownload(anchor, kind, available) {
@@ -365,7 +396,30 @@ function jobCompletionMessage(label, result) {
   if (!result || typeof result !== "object") {
     return "";
   }
-  if (!label.toLowerCase().includes("normal")) {
+  const lowerLabel = label.toLowerCase();
+  if (lowerLabel.includes("brush removing interface")) {
+    const selected = Number.isFinite(result.changed_count) ? Number(result.changed_count) : 0;
+    const pathRemoved = Number.isFinite(result.path_removed_count) ? Number(result.path_removed_count) : selected;
+    const parts = Number.isFinite(result.path_part_count) ? `, ${Number(result.path_part_count).toLocaleString()} path parts remain` : "";
+    return `Brush remove applied: ${pathRemoved.toLocaleString()} interface points removed${parts}.`;
+  }
+  if (lowerLabel.includes("brush adding interface")) {
+    const selected = Number.isFinite(result.changed_count) ? Number(result.changed_count) : 0;
+    const sampled = Number.isFinite(result.sampled_anchor_count) ? Number(result.sampled_anchor_count) : selected;
+    const inserted = Number.isFinite(result.inserted_anchor_count) ? Number(result.inserted_anchor_count) : sampled;
+    const mode = result.brush_add_mode === "splice"
+      ? "spliced path section"
+      : result.brush_add_mode === "add_bridge"
+      ? "added bridge"
+      : result.brush_add_mode === "replace"
+        ? "redrew path section"
+        : "inserted fallback segment";
+    const removed = Number.isFinite(result.removed_anchor_count) && result.removed_anchor_count > 0
+      ? `, ${Number(result.removed_anchor_count).toLocaleString()} old anchors removed`
+      : "";
+    return `Brush add ${mode}: ${sampled.toLocaleString()} sampled anchors, ${inserted.toLocaleString()} inserted${removed}.`;
+  }
+  if (!lowerLabel.includes("normal")) {
     return "";
   }
   if (Number.isFinite(result.normal_segment_count)) {
@@ -423,6 +477,7 @@ async function uploadFile(file) {
     state.interfacePoints = [];
     state.interfaceParts = [];
     clearManualRemovalSelection({ redraw: false });
+    clearInterfaceEditorLocal({ redraw: false, keepDraft: false });
     state.zoom = 1;
     state.panX = 0;
     state.panY = 0;
@@ -455,7 +510,16 @@ async function loadView(viewName) {
       state.manualRemovalSelected = [];
       state.manualRemovalPolygon = [];
     }
+    if (viewName !== "interface" && state.interfaceEditorOpen) {
+      state.interfaceEditorStroke = [];
+      state.interfaceEditorSelected = [];
+      state.interfaceEditorActiveSegment = null;
+      state.interfaceEditorBrushTargetSegment = null;
+      state.interfaceEditorBrushStartSegment = null;
+      state.interfaceEditorBrushEndSegment = null;
+    }
     updateManualRemovalUI({ redraw: false });
+    updateInterfaceEditorUI({ redraw: false });
     document.querySelectorAll("[data-view]").forEach((button) => {
       button.classList.toggle("active", button.dataset.view === viewName);
     });
@@ -1042,17 +1106,13 @@ function drawManualRemovalOverlay() {
   }
 }
 
-function collectManualRemovalSelection() {
-  state.manualRemovalSelected = [];
+function collectVisibleSelectionForPolygon(polygon, filterSourceIndex = null) {
   if (
-    !state.manualRemovalWindowOpen ||
-    state.activeView !== "mesh_prepared" ||
     !state.view ||
     state.view.kind !== "pointCloud" ||
-    state.manualRemovalPolygon.length < 3
+    polygon.length < 3
   ) {
-    updateManualRemovalUI();
-    return;
+    return [];
   }
   if (state.renderKey !== state.view) {
     uploadPointCloudToGPU();
@@ -1060,8 +1120,7 @@ function collectManualRemovalSelection() {
   const rect = el.viewer.getBoundingClientRect();
   const size = canvasSize();
   if (!renderPickBuffer(size)) {
-    updateManualRemovalUI();
-    return;
+    return [];
   }
 
   const gl = state.gl;
@@ -1085,16 +1144,258 @@ function collectManualRemovalSelection() {
       }
       const cssX = (col + 0.5) / dprX;
       const cssY = rect.height - (row + 0.5) / dprY;
-      if (!pointInPolygon(cssX, cssY, state.manualRemovalPolygon)) {
+      if (!pointInPolygon(cssX, cssY, polygon)) {
         continue;
       }
       const sourceIndex = state.sourceIndices[encoded - 1];
-      if (sourceIndex !== undefined && sourceIndex >= 0 && sourceIndex < totalPointCount) {
+      if (
+        sourceIndex !== undefined &&
+        sourceIndex >= 0 &&
+        sourceIndex < totalPointCount &&
+        (!filterSourceIndex || filterSourceIndex(sourceIndex))
+      ) {
         selected.add(sourceIndex);
       }
     }
   }
-  state.manualRemovalSelected = Array.from(selected).sort((a, b) => a - b);
+  return Array.from(selected).sort((a, b) => a - b);
+}
+
+function distancePointToSegmentSq(point, start, end) {
+  const vx = end.x - start.x;
+  const vy = end.y - start.y;
+  const wx = point.x - start.x;
+  const wy = point.y - start.y;
+  const denom = vx * vx + vy * vy;
+  if (denom <= 1e-9) {
+    const dx = point.x - start.x;
+    const dy = point.y - start.y;
+    return dx * dx + dy * dy;
+  }
+  const t = clamp((wx * vx + wy * vy) / denom, 0, 1);
+  const cx = start.x + vx * t;
+  const cy = start.y + vy * t;
+  const dx = point.x - cx;
+  const dy = point.y - cy;
+  return dx * dx + dy * dy;
+}
+
+function closestPointOnSegment(point, start, end) {
+  const vx = end.x - start.x;
+  const vy = end.y - start.y;
+  const wx = point.x - start.x;
+  const wy = point.y - start.y;
+  const denom = vx * vx + vy * vy;
+  if (denom <= 1e-9) {
+    const dx = point.x - start.x;
+    const dy = point.y - start.y;
+    return {
+      x: start.x,
+      y: start.y,
+      t: 0,
+      distanceSq: dx * dx + dy * dy
+    };
+  }
+  const t = clamp((wx * vx + wy * vy) / denom, 0, 1);
+  const x = start.x + vx * t;
+  const y = start.y + vy * t;
+  const dx = point.x - x;
+  const dy = point.y - y;
+  return { x, y, t, distanceSq: dx * dx + dy * dy };
+}
+
+function pointNearStroke(point, stroke, radius) {
+  if (!stroke.length) {
+    return false;
+  }
+  const radiusSq = radius * radius;
+  if (stroke.length === 1) {
+    const dx = point.x - stroke[0].x;
+    const dy = point.y - stroke[0].y;
+    return (dx * dx + dy * dy) <= radiusSq;
+  }
+  for (let i = 1; i < stroke.length; i += 1) {
+    if (distancePointToSegmentSq(point, stroke[i - 1], stroke[i]) <= radiusSq) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function distancePointToStrokeSq(point, stroke) {
+  if (!stroke.length) {
+    return Infinity;
+  }
+  if (stroke.length === 1) {
+    const dx = point.x - stroke[0].x;
+    const dy = point.y - stroke[0].y;
+    return dx * dx + dy * dy;
+  }
+  let best = Infinity;
+  for (let i = 1; i < stroke.length; i += 1) {
+    best = Math.min(best, distancePointToSegmentSq(point, stroke[i - 1], stroke[i]));
+  }
+  return best;
+}
+
+function sourceIndexNearStrokePoint(point, pixels, size, rect, radius, filterSourceIndex = null) {
+  const dprX = size.width / Math.max(rect.width, 1);
+  const dprY = size.height / Math.max(rect.height, 1);
+  const targetX = Math.round(point.x * dprX);
+  const targetY = Math.round((rect.height - point.y) * dprY);
+  const readRadius = Math.ceil(Math.max(2, radius * Math.max(dprX, dprY)));
+  const startX = Math.max(0, targetX - readRadius);
+  const endX = Math.min(size.width - 1, targetX + readRadius);
+  const startY = Math.max(0, targetY - readRadius);
+  const endY = Math.min(size.height - 1, targetY + readRadius);
+  let bestSourceIndex = null;
+  let bestDistance = Infinity;
+  const totalPointCount = Number.isFinite(state.view?.total_points)
+    ? Number(state.view.total_points)
+    : Infinity;
+  for (let row = startY; row <= endY; row += 1) {
+    for (let col = startX; col <= endX; col += 1) {
+      const offset = (row * size.width + col) * 4;
+      const encoded = (pixels[offset] << 16) | (pixels[offset + 1] << 8) | pixels[offset + 2];
+      if (encoded === 0) {
+        continue;
+      }
+      const sourceIndex = state.sourceIndices[encoded - 1];
+      if (
+        sourceIndex === undefined ||
+        sourceIndex < 0 ||
+        sourceIndex >= totalPointCount ||
+        (filterSourceIndex && !filterSourceIndex(sourceIndex))
+      ) {
+        continue;
+      }
+      const dx = col - targetX;
+      const dy = row - targetY;
+      const distance = dx * dx + dy * dy;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestSourceIndex = sourceIndex;
+      }
+    }
+  }
+  return bestSourceIndex;
+}
+
+function collectVisibleSelectionForStrokeDetailed(stroke, radius, filterSourceIndex = null) {
+  if (
+    !state.view ||
+    state.view.kind !== "pointCloud" ||
+    !stroke.length
+  ) {
+    return { selected: [], strokeIndices: [] };
+  }
+  if (state.renderKey !== state.view) {
+    uploadPointCloudToGPU();
+  }
+  const rect = el.viewer.getBoundingClientRect();
+  const size = canvasSize();
+  if (!renderPickBuffer(size)) {
+    return { selected: [], strokeIndices: [] };
+  }
+
+  const gl = state.gl;
+  const pixels = new Uint8Array(size.width * size.height * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.pickFramebuffer);
+  gl.readPixels(0, 0, size.width, size.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  const dprX = size.width / Math.max(rect.width, 1);
+  const dprY = size.height / Math.max(rect.height, 1);
+  const selected = new Set();
+  const totalPointCount = Number.isFinite(state.view.total_points)
+    ? Number(state.view.total_points)
+    : Infinity;
+  for (let row = 0; row < size.height; row += 1) {
+    for (let col = 0; col < size.width; col += 1) {
+      const offset = (row * size.width + col) * 4;
+      const encoded = (pixels[offset] << 16) | (pixels[offset + 1] << 8) | pixels[offset + 2];
+      if (encoded === 0) {
+        continue;
+      }
+      const cssPoint = {
+        x: (col + 0.5) / dprX,
+        y: rect.height - (row + 0.5) / dprY
+      };
+      if (!pointNearStroke(cssPoint, stroke, radius)) {
+        continue;
+      }
+      const sourceIndex = state.sourceIndices[encoded - 1];
+      if (
+        sourceIndex !== undefined &&
+        sourceIndex >= 0 &&
+        sourceIndex < totalPointCount &&
+        (!filterSourceIndex || filterSourceIndex(sourceIndex))
+      ) {
+        selected.add(sourceIndex);
+      }
+    }
+  }
+  const strokeIndices = [];
+  for (const point of stroke) {
+    const sourceIndex = sourceIndexNearStrokePoint(point, pixels, size, rect, radius, filterSourceIndex);
+    if (sourceIndex !== null && strokeIndices[strokeIndices.length - 1] !== sourceIndex) {
+      strokeIndices.push(sourceIndex);
+    }
+  }
+  return {
+    selected: Array.from(selected).sort((a, b) => a - b),
+    strokeIndices
+  };
+}
+
+function collectVisibleSelectionForStroke(stroke, radius, filterSourceIndex = null) {
+  return collectVisibleSelectionForStrokeDetailed(stroke, radius, filterSourceIndex).selected;
+}
+
+function collectProjectedInterfaceSelectionForStroke(stroke, radius) {
+  if (
+    !state.interfaceDraft ||
+    !state.view ||
+    state.view.kind !== "pointCloud" ||
+    !stroke.length
+  ) {
+    return [];
+  }
+  const rect = el.viewer.getBoundingClientRect();
+  const projection = sourceIndexToScreenMap(rect);
+  if (!projection) {
+    return [];
+  }
+  const selected = [];
+  const seen = new Set();
+  for (const sourceIndex of state.interfaceDraft.effective_indices || []) {
+    const idx = Number(sourceIndex);
+    if (!Number.isFinite(idx) || seen.has(idx)) {
+      continue;
+    }
+    const projected = projection.project(idx);
+    if (!projected || !projected.visible) {
+      continue;
+    }
+    if (pointNearStroke(projected, stroke, radius)) {
+      selected.push(idx);
+      seen.add(idx);
+    }
+  }
+  return selected;
+}
+
+function collectManualRemovalSelection() {
+  state.manualRemovalSelected = [];
+  if (
+    !state.manualRemovalWindowOpen ||
+    state.activeView !== "mesh_prepared" ||
+    state.manualRemovalPolygon.length < 3
+  ) {
+    updateManualRemovalUI();
+    return;
+  }
+  state.manualRemovalSelected = collectVisibleSelectionForPolygon(state.manualRemovalPolygon);
   updateManualRemovalUI();
 }
 
@@ -1175,6 +1476,1261 @@ async function applyManualRemoval() {
   state.manualRemovalDrawMode = false;
   showManualRemovalWindow();
   updateManualRemovalUI();
+}
+
+function resizeInterfaceEditorOverlay() {
+  if (!el.interfaceEditorOverlay) {
+    return null;
+  }
+  const rect = el.viewer.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.floor(rect.width * dpr));
+  const height = Math.max(1, Math.floor(rect.height * dpr));
+  if (el.interfaceEditorOverlay.width !== width || el.interfaceEditorOverlay.height !== height) {
+    el.interfaceEditorOverlay.width = width;
+    el.interfaceEditorOverlay.height = height;
+  }
+  el.interfaceEditorOverlay.style.width = `${rect.width}px`;
+  el.interfaceEditorOverlay.style.height = `${rect.height}px`;
+  return { rect, dpr, width, height };
+}
+
+function interfaceControlColor(partIndex) {
+  const colors = [
+    "#b7ff4a",
+    "#00c4ff",
+    "#ffb000",
+    "#d978ff",
+    "#ff5f8f",
+    "#55d68f"
+  ];
+  return colors[partIndex % colors.length];
+}
+
+function draftEdgeCount(part, partCount) {
+  const anchorCount = part?.selected_indices?.length || 0;
+  if (anchorCount < 2) {
+    return 0;
+  }
+  return Boolean(state.interfaceDraft?.close_loop ?? true) && partCount === 1
+    ? anchorCount
+    : anchorCount - 1;
+}
+
+function currentSourceToRenderMap() {
+  if (!state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
+    return null;
+  }
+  if (state.renderKey !== state.view) {
+    uploadPointCloudToGPU();
+  }
+  const sourceToRender = new Map();
+  for (let i = 0; i < state.sourceIndices.length; i += 1) {
+    if (!sourceToRender.has(state.sourceIndices[i])) {
+      sourceToRender.set(state.sourceIndices[i], i);
+    }
+  }
+  return sourceToRender;
+}
+
+function centeredPositionForSourceIndex(sourceIndex, sourceToRender = null) {
+  const sourceToRenderMap = sourceToRender || currentSourceToRenderMap();
+  if (!sourceToRenderMap || !state.centeredPositions) {
+    return null;
+  }
+  const renderIndex = sourceToRenderMap.get(Number(sourceIndex));
+  if (renderIndex === undefined) {
+    return null;
+  }
+  const offset = renderIndex * 3;
+  return {
+    x: state.centeredPositions[offset],
+    y: state.centeredPositions[offset + 1],
+    z: state.centeredPositions[offset + 2]
+  };
+}
+
+function distance3dSq(a, b) {
+  if (!a || !b) {
+    return Infinity;
+  }
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+function sourceIndexToScreenMap(rect) {
+  if (!state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
+    return null;
+  }
+  const sourceToRender = currentSourceToRenderMap();
+  if (!sourceToRender) {
+    return null;
+  }
+  if (!state.mvpMatrix) {
+    state.mvpMatrix = computeMatrices(canvasSize());
+  }
+  return {
+    sourceToRender,
+    project(sourceIndex) {
+      const renderIndex = sourceToRender.get(sourceIndex);
+      if (renderIndex === undefined) {
+        return null;
+      }
+      const offset = renderIndex * 3;
+      const clip = transformPoint(
+        state.mvpMatrix,
+        state.centeredPositions[offset],
+        state.centeredPositions[offset + 1],
+        state.centeredPositions[offset + 2]
+      );
+      if (clip[3] <= 0) {
+        return null;
+      }
+      const ndcX = clip[0] / clip[3];
+      const ndcY = clip[1] / clip[3];
+      const ndcZ = clip[2] / clip[3];
+      return {
+        sourceIndex,
+        x: (ndcX * 0.5 + 0.5) * rect.width,
+        y: (-ndcY * 0.5 + 0.5) * rect.height,
+        visible: ndcX >= -1 && ndcX <= 1 && ndcY >= -1 && ndcY <= 1 && ndcZ >= -1 && ndcZ <= 1,
+        depth: ndcZ
+      };
+    }
+  };
+}
+
+function projectedInterfaceControlPaths(rect) {
+  if (!state.interfaceDraft || !state.interfaceEditorOpen || state.activeView !== "interface") {
+    return [];
+  }
+  const projection = sourceIndexToScreenMap(rect);
+  if (!projection) {
+    return [];
+  }
+  const parts = draftAnchorParts();
+  return parts.map((part, partIndex) => {
+    const anchors = (part.selected_indices || []).map((sourceIndex, anchorIndex) => {
+      const projected = projection.project(sourceIndex);
+      return projected ? { anchorIndex, ...projected } : null;
+    });
+    return {
+      part,
+      partIndex,
+      anchors,
+      color: interfaceControlColor(partIndex),
+      edgeCount: draftEdgeCount(part, parts.length)
+    };
+  });
+}
+
+function drawArrowHead(ctx, start, end, size) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const length = Math.hypot(dx, dy);
+  if (length < 12) {
+    return;
+  }
+  const ux = dx / length;
+  const uy = dy / length;
+  const tip = {
+    x: start.x + dx * 0.62,
+    y: start.y + dy * 0.62
+  };
+  ctx.beginPath();
+  ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(tip.x - ux * size - uy * size * 0.55, tip.y - uy * size + ux * size * 0.55);
+  ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(tip.x - ux * size + uy * size * 0.55, tip.y - uy * size - ux * size * 0.55);
+  ctx.stroke();
+}
+
+function controlPathEdgeSequence(startEdge, endEdge, edgeCount) {
+  if (edgeCount <= 0) {
+    return [];
+  }
+  const edges = [((startEdge % edgeCount) + edgeCount) % edgeCount];
+  const target = ((endEdge % edgeCount) + edgeCount) % edgeCount;
+  while (edges[edges.length - 1] !== target) {
+    edges.push((edges[edges.length - 1] + 1) % edgeCount);
+    if (edges.length > edgeCount) {
+      break;
+    }
+  }
+  return edges;
+}
+
+function summarizeControlArcOverlap(path, edges, stroke, threshold) {
+  if (!edges.length || !stroke.length) {
+    return {
+      edges,
+      edgeCount: edges.length,
+      overlapEdgeCount: 0,
+      overlapWeight: 0,
+      overlapFraction: 0
+    };
+  }
+  let overlapEdgeCount = 0;
+  let overlapWeight = 0;
+  for (const edgeIndex of edges) {
+    const start = path.anchors[edgeIndex];
+    const end = path.anchors[(edgeIndex + 1) % path.anchors.length];
+    if (!start || !end || !start.visible || !end.visible) {
+      continue;
+    }
+    const midpoint = {
+      x: (start.x + end.x) * 0.5,
+      y: (start.y + end.y) * 0.5
+    };
+    const distances = [start, midpoint, end].map((point) => Math.sqrt(distancePointToStrokeSq(point, stroke)));
+    const localWeight = distances.reduce((total, distance) => {
+      if (!Number.isFinite(distance) || distance > threshold) {
+        return total;
+      }
+      return total + Math.max(0.1, 1 - distance / Math.max(threshold, 1e-6));
+    }, 0);
+    if (localWeight > 0) {
+      overlapEdgeCount += 1;
+      overlapWeight += localWeight;
+    }
+  }
+  return {
+    edges,
+    edgeCount: edges.length,
+    overlapEdgeCount,
+    overlapWeight,
+    overlapFraction: overlapEdgeCount / Math.max(edges.length, 1)
+  };
+}
+
+function brushAddReplacementPreview(paths) {
+  const start = state.interfaceEditorBrushStartSegment;
+  const end = state.interfaceEditorBrushEndSegment || state.interfaceEditorActiveSegment;
+  const stroke = state.interfaceEditorStroke;
+  if (
+    state.interfaceEditorMode !== "brush_add" ||
+    !start ||
+    !end ||
+    start.partIndex !== end.partIndex ||
+    !stroke.length
+  ) {
+    return null;
+  }
+  const path = paths.find((candidate) => candidate.partIndex === start.partIndex);
+  if (!path || path.edgeCount <= 0) {
+    return null;
+  }
+  const closed = Boolean(state.interfaceDraft?.close_loop ?? true) && paths.length === 1;
+  const radius = Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12);
+  const threshold = Math.max(10, radius * 1.5);
+  const specs = [];
+  if (closed) {
+    specs.push({
+      startEdge: start.edgeIndex,
+      endEdge: end.edgeIndex,
+      edges: controlPathEdgeSequence(start.edgeIndex, end.edgeIndex, path.edgeCount)
+    });
+    specs.push({
+      startEdge: end.edgeIndex,
+      endEdge: start.edgeIndex,
+      edges: controlPathEdgeSequence(end.edgeIndex, start.edgeIndex, path.edgeCount)
+    });
+  } else {
+    const startEdge = Math.min(start.edgeIndex, end.edgeIndex);
+    const endEdge = Math.max(start.edgeIndex, end.edgeIndex);
+    specs.push({
+      startEdge,
+      endEdge,
+      edges: Array.from({ length: endEdge - startEdge + 1 }, (_, offset) => startEdge + offset)
+    });
+  }
+  const maxLocalEdges = Math.max(3, Math.ceil(path.edgeCount * 0.35));
+  const candidates = specs.map((spec) => {
+    const summary = summarizeControlArcOverlap(path, spec.edges, stroke, threshold);
+    const broadWithoutOverlap = summary.edgeCount > maxLocalEdges && summary.overlapFraction < 0.5;
+    const endpointOnlyOverlap = summary.edgeCount > 3 && summary.overlapEdgeCount <= 1;
+    return {
+      ...spec,
+      ...summary,
+      acceptable: summary.overlapWeight > 0 && !broadWithoutOverlap && !endpointOnlyOverlap
+    };
+  }).filter((candidate) => candidate.acceptable);
+  if (!candidates.length) {
+    return null;
+  }
+  candidates.sort((a, b) => {
+    const densityA = a.overlapWeight / Math.max(a.edgeCount, 1);
+    const densityB = b.overlapWeight / Math.max(b.edgeCount, 1);
+    return (b.overlapFraction - a.overlapFraction) ||
+      (densityB - densityA) ||
+      (a.edgeCount - b.edgeCount);
+  });
+  const chosen = candidates[0];
+  return {
+    partIndex: start.partIndex,
+    startEdge: chosen.startEdge,
+    endEdge: chosen.endEdge,
+    edges: new Set(chosen.edges)
+  };
+}
+
+function drawInterfaceControlPaths(ctx, geometry) {
+  const paths = projectedInterfaceControlPaths(geometry.rect);
+  const active = state.interfaceEditorActiveSegment;
+  const replacement = brushAddReplacementPreview(paths);
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const path of paths) {
+    const activePart = active && active.partIndex === path.partIndex;
+    const dimmed = Boolean(active) && !activePart;
+    const color = path.color;
+    for (let edgeIndex = 0; edgeIndex < path.edgeCount; edgeIndex += 1) {
+      const start = path.anchors[edgeIndex];
+      const end = path.anchors[(edgeIndex + 1) % path.anchors.length];
+      if (!start || !end || !start.visible || !end.visible) {
+        continue;
+      }
+      const replacementEdge = replacement &&
+        replacement.partIndex === path.partIndex &&
+        replacement.edges.has(edgeIndex);
+      const startSnap = state.interfaceEditorBrushStartSegment &&
+        state.interfaceEditorBrushStartSegment.partIndex === path.partIndex &&
+        state.interfaceEditorBrushStartSegment.edgeIndex === edgeIndex;
+      const endSnap = state.interfaceEditorBrushEndSegment &&
+        state.interfaceEditorBrushEndSegment.partIndex === path.partIndex &&
+        state.interfaceEditorBrushEndSegment.edgeIndex === edgeIndex;
+      const activeEdge = activePart && active.edgeIndex === edgeIndex;
+      ctx.globalAlpha = dimmed && !replacementEdge ? 0.18 : activeEdge || replacementEdge ? 1 : 0.7;
+      ctx.lineWidth = activeEdge || replacementEdge ? 5 : 3;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.45)";
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      ctx.lineWidth = activeEdge || replacementEdge ? 3 : 1.6;
+      ctx.strokeStyle = replacementEdge ? "#ffdf64" : activeEdge ? "#ffffff" : color;
+      ctx.beginPath();
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+      if (startSnap || endSnap) {
+        const snapMarkers = [];
+        if (startSnap) {
+          snapMarkers.push({
+            snap: state.interfaceEditorBrushStartSegment,
+            fallback: start,
+            color: "#00c4ff"
+          });
+        }
+        if (endSnap) {
+          snapMarkers.push({
+            snap: state.interfaceEditorBrushEndSegment,
+            fallback: end,
+            color: "#ff6b52"
+          });
+        }
+        for (const marker of snapMarkers) {
+          const markerX = Number.isFinite(marker.snap?.x) ? marker.snap.x : marker.fallback.x;
+          const markerY = Number.isFinite(marker.snap?.y) ? marker.snap.y : marker.fallback.y;
+          ctx.fillStyle = marker.color;
+          ctx.beginPath();
+          ctx.arc(markerX, markerY, 5.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.lineWidth = activeEdge || replacementEdge ? 2.4 : 1.4;
+      ctx.strokeStyle = replacementEdge ? "#ff7a00" : activeEdge ? color : "rgba(255, 255, 255, 0.9)";
+      drawArrowHead(ctx, start, end, activeEdge || replacementEdge ? 8 : 6);
+    }
+  }
+
+  if (state.interfaceEditorShowOrder) {
+    ctx.font = "11px system-ui, -apple-system, Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const path of paths) {
+      const activePart = active && active.partIndex === path.partIndex;
+      if (active && !activePart) {
+        continue;
+      }
+      for (const anchor of path.anchors) {
+        if (!anchor || !anchor.visible) {
+          continue;
+        }
+        const label = String(anchor.anchorIndex + 1);
+        const radius = Math.max(9, 5 + label.length * 3);
+        ctx.globalAlpha = active ? 0.95 : 0.78;
+        ctx.fillStyle = "rgba(248, 250, 247, 0.92)";
+        ctx.beginPath();
+        ctx.arc(anchor.x, anchor.y - 16, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = path.color;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+        ctx.fillStyle = "#203f3b";
+        ctx.fillText(label, anchor.x, anchor.y - 16);
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function brushEndpointSnapThreshold() {
+  return Math.max(18, Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12) * 2);
+}
+
+function nearestEffectiveInterfacePoint(pointer, threshold) {
+  if (!state.interfaceDraft?.effective_indices?.length) {
+    return null;
+  }
+  const rect = el.viewer.getBoundingClientRect();
+  const projection = sourceIndexToScreenMap(rect);
+  if (!projection) {
+    return null;
+  }
+  const thresholdSq = threshold * threshold;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const sourceIndex of state.interfaceDraft.effective_indices || []) {
+    const projected = projection.project(Number(sourceIndex));
+    if (!projected || !projected.visible) {
+      continue;
+    }
+    const distance = (pointer.x - projected.x) ** 2 + (pointer.y - projected.y) ** 2;
+    if (distance <= thresholdSq && distance < bestDistance) {
+      bestDistance = distance;
+      best = {
+        sourceIndex: Number(sourceIndex),
+        x: projected.x,
+        y: projected.y,
+        distance: Math.sqrt(distance)
+      };
+    }
+  }
+  return best;
+}
+
+function interfaceControlIndexSet() {
+  const controls = new Set();
+  for (const part of state.interfaceDraft?.parts || []) {
+    for (const sourceIndex of part.selected_indices || []) {
+      const idx = Number(sourceIndex);
+      if (Number.isFinite(idx)) {
+        controls.add(idx);
+      }
+    }
+  }
+  return controls;
+}
+
+function nearestEffectiveInterfacePoint3D(targetSourceIndex, options = {}) {
+  if (!state.interfaceDraft?.effective_indices?.length) {
+    return null;
+  }
+  const sourceToRender = currentSourceToRenderMap();
+  if (!sourceToRender) {
+    return null;
+  }
+  const target = centeredPositionForSourceIndex(Number(targetSourceIndex), sourceToRender);
+  if (!target) {
+    return null;
+  }
+  const controlIndices = options.preferDense ? interfaceControlIndexSet() : null;
+  let best = null;
+  let bestDense = null;
+  let bestDistance = Infinity;
+  let bestDenseDistance = Infinity;
+  for (const sourceIndex of state.interfaceDraft.effective_indices || []) {
+    const idx = Number(sourceIndex);
+    if (!Number.isFinite(idx)) {
+      continue;
+    }
+    const position = centeredPositionForSourceIndex(idx, sourceToRender);
+    if (!position) {
+      continue;
+    }
+    const distance = distance3dSq(target, position);
+    const isControlAnchor = controlIndices?.has(idx) || false;
+    if (!isControlAnchor && distance < bestDenseDistance) {
+      bestDenseDistance = distance;
+      bestDense = {
+        sourceIndex: idx,
+        distance: Math.sqrt(distance),
+        isControlAnchor: false
+      };
+    }
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = {
+        sourceIndex: idx,
+        distance: Math.sqrt(distance),
+        isControlAnchor
+      };
+    }
+  }
+  return bestDense || best;
+}
+
+function brushEndpointTargetsFromStroke3D() {
+  const strokeIndices = state.interfaceEditorStrokeIndices || [];
+  if (!strokeIndices.length) {
+    return { start: null, end: null };
+  }
+  const start = nearestEffectiveInterfacePoint3D(strokeIndices[0], { preferDense: true });
+  const end = nearestEffectiveInterfacePoint3D(strokeIndices[strokeIndices.length - 1], { preferDense: true });
+  return {
+    start: start ? { sourceIndex: start.sourceIndex, sourceDistance3d: start.distance, isControlAnchor: start.isControlAnchor } : null,
+    end: end ? { sourceIndex: end.sourceIndex, sourceDistance3d: end.distance, isControlAnchor: end.isControlAnchor } : null
+  };
+}
+
+function nearestInterfaceControlSegment(event, options = {}) {
+  if (!state.interfaceEditorOpen || state.activeView !== "interface" || !state.interfaceDraft) {
+    return null;
+  }
+  const geometry = resizeInterfaceEditorOverlay();
+  if (!geometry) {
+    return null;
+  }
+  const paths = projectedInterfaceControlPaths(geometry.rect);
+  const rect = el.viewer.getBoundingClientRect();
+  const pointer = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  };
+  const threshold = Number.isFinite(options.threshold) ? Number(options.threshold) : 14;
+  const thresholdSq = threshold * threshold;
+  const nearestInterface = options.includeInterfacePoint
+    ? nearestEffectiveInterfacePoint(pointer, Math.max(threshold, 24))
+    : null;
+  const snapPointer = nearestInterface
+    ? { x: nearestInterface.x, y: nearestInterface.y }
+    : pointer;
+  const segmentThresholdSq = nearestInterface ? Number.POSITIVE_INFINITY : thresholdSq;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const path of paths) {
+    for (let edgeIndex = 0; edgeIndex < path.edgeCount; edgeIndex += 1) {
+      const start = path.anchors[edgeIndex];
+      const end = path.anchors[(edgeIndex + 1) % path.anchors.length];
+      if (!start || !end || !start.visible || !end.visible) {
+        continue;
+      }
+      const closest = closestPointOnSegment(snapPointer, start, end);
+      if (closest.distanceSq <= segmentThresholdSq && closest.distanceSq < bestDistance) {
+        const startDistance = (snapPointer.x - start.x) ** 2 + (snapPointer.y - start.y) ** 2;
+        const endDistance = (snapPointer.x - end.x) ** 2 + (snapPointer.y - end.y) ** 2;
+        bestDistance = closest.distanceSq;
+        best = {
+          partIndex: path.partIndex,
+          edgeIndex,
+          edgeT: closest.t,
+          x: nearestInterface ? nearestInterface.x : closest.x,
+          y: nearestInterface ? nearestInterface.y : closest.y,
+          distance: Math.sqrt(closest.distanceSq),
+          sourceIndex: nearestInterface?.sourceIndex,
+          sourceDistance: nearestInterface?.distance,
+          anchorIndex: startDistance <= endDistance
+            ? edgeIndex
+            : (edgeIndex + 1) % path.anchors.length
+        };
+      }
+    }
+  }
+  return best;
+}
+
+function sameInterfaceSegment(a, b) {
+  return Boolean(a) === Boolean(b) &&
+    (!a || (a.partIndex === b.partIndex && a.edgeIndex === b.edgeIndex));
+}
+
+function interfaceEditorActiveSegmentLabel() {
+  const active = state.interfaceEditorActiveSegment;
+  const parts = draftAnchorParts();
+  if (!active || !parts[active.partIndex]) {
+    return "";
+  }
+  const anchors = parts[active.partIndex].selected_indices || [];
+  if (!anchors.length) {
+    return "";
+  }
+  const nextIndex = (active.edgeIndex + 1) % anchors.length;
+  return `Part ${active.partIndex + 1}, segment ${active.edgeIndex + 1}-${nextIndex + 1}`;
+}
+
+function interfaceEditorBrushReplacementLabel() {
+  const start = state.interfaceEditorBrushStartSegment;
+  const end = state.interfaceEditorBrushEndSegment || state.interfaceEditorActiveSegment;
+  if (state.interfaceEditorMode !== "brush_add" || !start || !end) {
+    return "";
+  }
+  if (start.partIndex !== end.partIndex) {
+    return "Brush endpoints on different parts; insert fallback";
+  }
+  if (start.edgeIndex === end.edgeIndex) {
+    return `Redraw overlapped section in Part ${start.partIndex + 1}`;
+  }
+  return `Redraw overlapped local section in Part ${start.partIndex + 1}`;
+}
+
+function updateInterfaceEditorReadout() {
+  if (!el.editorReadout) {
+    return;
+  }
+  const draftReady = Boolean(state.interfaceDraft);
+  const brushMode = state.interfaceEditorMode === "brush_add" || state.interfaceEditorMode === "brush_remove";
+  const summary = state.interfaceDraft?.summary;
+  const anchorCount = summary?.anchor_count ?? draftAnchorIndices().length;
+  const effectiveCount = summary?.effective_count ?? 0;
+  const selectedText = brushMode
+    ? `${state.interfaceEditorSelected.length.toLocaleString()} brush selected`
+    : `${anchorCount} anchors`;
+  const segment = interfaceEditorBrushReplacementLabel() || interfaceEditorActiveSegmentLabel();
+  el.editorReadout.textContent = draftReady
+    ? `${selectedText} - ${effectiveCount.toLocaleString()} interface points${segment ? ` - ${segment}` : ""}`
+    : "No draft";
+}
+
+function updateInterfaceEditorActiveSegmentFromEvent(event, options = {}) {
+  const snapThreshold = state.interfaceEditorMode === "brush_add"
+    ? brushEndpointSnapThreshold()
+    : undefined;
+  const next = nearestInterfaceControlSegment(event, {
+    threshold: snapThreshold,
+    includeInterfacePoint: state.interfaceEditorMode === "brush_add"
+  });
+  if (sameInterfaceSegment(state.interfaceEditorActiveSegment, next)) {
+    if (next && state.interfaceEditorActiveSegment) {
+      Object.assign(state.interfaceEditorActiveSegment, next);
+    }
+    return;
+  }
+  state.interfaceEditorActiveSegment = next;
+  updateInterfaceEditorReadout();
+  if (options.redraw !== false) {
+    drawInterfaceEditorOverlay();
+  }
+}
+
+function drawInterfaceEditorOverlay() {
+  if (!el.interfaceEditorOverlay) {
+    return;
+  }
+  const geometry = resizeInterfaceEditorOverlay();
+  if (!geometry) {
+    return;
+  }
+  const ctx = el.interfaceEditorOverlay.getContext("2d");
+  ctx.setTransform(geometry.dpr, 0, 0, geometry.dpr, 0, 0);
+  ctx.clearRect(0, 0, geometry.rect.width, geometry.rect.height);
+  const shouldShow = state.interfaceEditorOpen && state.activeView === "interface";
+  el.interfaceEditorOverlay.classList.toggle("hidden", !shouldShow);
+  document.body.classList.toggle(
+    "interface-editor-drawing",
+    shouldShow && (state.interfaceEditorMode === "brush_add" || state.interfaceEditorMode === "brush_remove")
+  );
+  if (!shouldShow) {
+    return;
+  }
+
+  drawInterfaceControlPaths(ctx, geometry);
+
+  const stroke = state.interfaceEditorStroke;
+  if (!stroke.length) {
+    return;
+  }
+  const addMode = state.interfaceEditorMode === "brush_add";
+  const radius = Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(2, radius * 2);
+  ctx.strokeStyle = addMode ? "rgba(0, 196, 255, 0.18)" : "rgba(255, 107, 82, 0.2)";
+  ctx.beginPath();
+  ctx.moveTo(stroke[0].x, stroke[0].y);
+  for (let i = 1; i < stroke.length; i += 1) {
+    ctx.lineTo(stroke[i].x, stroke[i].y);
+  }
+  ctx.stroke();
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = addMode ? "#00c4ff" : "#ff6b52";
+  ctx.beginPath();
+  ctx.moveTo(stroke[0].x, stroke[0].y);
+  for (let i = 1; i < stroke.length; i += 1) {
+    ctx.lineTo(stroke[i].x, stroke[i].y);
+  }
+  ctx.stroke();
+}
+
+function clearInterfaceEditorLocal(options = {}) {
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorActiveSegment = null;
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  state.interfaceAnchorDrag = null;
+  if (!options.keepDraft) {
+    state.interfaceDraft = null;
+  }
+  updateInterfaceEditorUI({ redraw: options.redraw !== false });
+}
+
+function draftAnchorParts() {
+  return (state.interfaceDraft?.parts || []).map((part) => ({
+    selected_indices: [...(part.selected_indices || [])],
+    is_lateral: Boolean(part.is_lateral)
+  }));
+}
+
+function draftAnchorIndices() {
+  return draftAnchorParts().flatMap((part) => part.selected_indices || []);
+}
+
+function activeDraftPayload() {
+  return {
+    parts: draftAnchorParts(),
+    close_loop: Boolean(state.interfaceDraft?.close_loop ?? true)
+  };
+}
+
+async function refreshInterfaceDraft() {
+  if (!state.session) {
+    return null;
+  }
+  const payload = await api(`/api/sessions/${state.session.session_id}/interface/draft?t=${Date.now()}`);
+  state.interfaceDraft = payload.draft || null;
+  if (payload.summary) {
+    await refreshSession(payload.summary);
+  }
+  updateInterfaceEditorUI();
+  return state.interfaceDraft;
+}
+
+function showInterfaceEditorWindow() {
+  if (!el.interfaceEditorWindow) {
+    return;
+  }
+  state.interfaceEditorOpen = true;
+  el.interfaceEditorWindow.classList.remove("hidden");
+  el.interfaceEditorWindow.setAttribute("aria-hidden", "false");
+  updateInterfaceEditorUI();
+}
+
+function hideInterfaceEditorWindow() {
+  if (!el.interfaceEditorWindow) {
+    return;
+  }
+  state.interfaceEditorOpen = false;
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorActiveSegment = null;
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  state.interfaceAnchorDrag = null;
+  el.interfaceEditorWindow.classList.add("hidden");
+  el.interfaceEditorWindow.setAttribute("aria-hidden", "true");
+  updateInterfaceEditorUI();
+}
+
+function moveInterfaceEditorWindow(clientX, clientY) {
+  if (!state.interfaceEditorWindowDragOffset || !el.interfaceEditorWindow) {
+    return;
+  }
+  const margin = 8;
+  const rect = el.interfaceEditorWindow.getBoundingClientRect();
+  const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+  const left = clamp(clientX - state.interfaceEditorWindowDragOffset[0], margin, maxLeft);
+  const top = clamp(clientY - state.interfaceEditorWindowDragOffset[1], margin, maxTop);
+  el.interfaceEditorWindow.style.left = `${left}px`;
+  el.interfaceEditorWindow.style.top = `${top}px`;
+  el.interfaceEditorWindow.style.right = "auto";
+}
+
+function startInterfaceEditorWindowDrag(event) {
+  if (!el.interfaceEditorWindow || event.button !== 0) {
+    return;
+  }
+  if (event.target?.closest?.("button")) {
+    return;
+  }
+  const rect = el.interfaceEditorWindow.getBoundingClientRect();
+  state.interfaceEditorWindowDragging = true;
+  state.interfaceEditorWindowDragOffset = [event.clientX - rect.left, event.clientY - rect.top];
+  el.interfaceEditorWindowHandle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function dragInterfaceEditorWindow(event) {
+  if (!state.interfaceEditorWindowDragging) {
+    return;
+  }
+  moveInterfaceEditorWindow(event.clientX, event.clientY);
+}
+
+function stopInterfaceEditorWindowDrag(event) {
+  if (!state.interfaceEditorWindowDragging) {
+    return;
+  }
+  state.interfaceEditorWindowDragging = false;
+  state.interfaceEditorWindowDragOffset = null;
+  if (el.interfaceEditorWindowHandle?.hasPointerCapture?.(event.pointerId)) {
+    el.interfaceEditorWindowHandle.releasePointerCapture(event.pointerId);
+  }
+}
+
+function setInterfaceEditorMode(mode) {
+  state.interfaceEditorMode = mode;
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  updateInterfaceEditorUI();
+}
+
+function collectInterfaceEditorSelection() {
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorStrokeIndices = [];
+  if (
+    !state.interfaceEditorOpen ||
+    state.activeView !== "interface" ||
+    state.interfaceEditorMode === "anchors" ||
+    !state.interfaceEditorStroke.length
+  ) {
+    updateInterfaceEditorUI();
+    return;
+  }
+  const radius = Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12);
+  if (state.interfaceEditorMode === "brush_remove") {
+    state.interfaceEditorSelected = collectProjectedInterfaceSelectionForStroke(
+      state.interfaceEditorStroke,
+      radius
+    );
+    state.interfaceEditorStrokeIndices = [];
+  } else {
+    const selection = collectVisibleSelectionForStrokeDetailed(
+      state.interfaceEditorStroke,
+      radius
+    );
+    state.interfaceEditorSelected = selection.selected;
+    state.interfaceEditorStrokeIndices = selection.strokeIndices;
+  }
+  updateInterfaceEditorUI();
+}
+
+function updateInterfaceEditorUI(options = {}) {
+  const redraw = options.redraw !== false;
+  const available = Boolean(state.session?.status?.auto_interface_ready || state.session?.status?.manual_interface_ready);
+  const draftReady = Boolean(state.interfaceDraft);
+  const brushMode = state.interfaceEditorMode === "brush_add" || state.interfaceEditorMode === "brush_remove";
+  if (el.editAutoInterface) {
+    el.editAutoInterface.disabled = !available;
+  }
+  if (el.editorAnchorMode) {
+    el.editorAnchorMode.classList.toggle("active", state.interfaceEditorMode === "anchors");
+  }
+  if (el.editorBrushAddMode) {
+    el.editorBrushAddMode.disabled = !draftReady;
+    el.editorBrushAddMode.classList.toggle("active", state.interfaceEditorMode === "brush_add");
+  }
+  if (el.editorBrushRemoveMode) {
+    el.editorBrushRemoveMode.disabled = !draftReady;
+    el.editorBrushRemoveMode.classList.toggle("active", state.interfaceEditorMode === "brush_remove");
+  }
+  if (el.editorUndo) {
+    el.editorUndo.disabled = !draftReady || !state.interfaceDraft?.summary?.can_undo;
+  }
+  if (el.editorBrushRadius) {
+    el.editorBrushRadius.disabled = !brushMode;
+    state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
+  }
+  if (el.editorBrushRadiusValue) {
+    el.editorBrushRadiusValue.textContent = `${Math.round(Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12))} px`;
+  }
+  if (el.editorShowOrder) {
+    el.editorShowOrder.checked = Boolean(state.interfaceEditorShowOrder);
+  }
+  if (el.editorSaveManual) {
+    el.editorSaveManual.disabled = !draftReady;
+  }
+  updateInterfaceEditorReadout();
+  drawInterfaceEditorOverlay();
+  if (redraw && state.view?.kind === "pointCloud") {
+    uploadMarkersToGPU();
+    draw();
+  }
+}
+
+async function openInterfaceEditor() {
+  const hasAuto = Boolean(state.session?.status?.auto_interface_ready);
+  const hasManual = Boolean(state.session?.status?.manual_interface_ready);
+  if (!hasAuto && !hasManual) {
+    showToast("Run regular region growing or save a manual interface before editing.", true);
+    return;
+  }
+  if (hasAuto && hasManual) {
+    showInterfaceSourceChooser();
+    return;
+  }
+  await openInterfaceEditorForSource(hasManual ? "manual" : "auto");
+}
+
+function showInterfaceSourceChooser() {
+  if (el.interfaceSourceChooser) {
+    el.interfaceSourceChooser.classList.remove("hidden");
+  }
+}
+
+function hideInterfaceSourceChooser() {
+  if (el.interfaceSourceChooser) {
+    el.interfaceSourceChooser.classList.add("hidden");
+  }
+}
+
+async function openInterfaceEditorForSource(source) {
+  hideInterfaceSourceChooser();
+  state.interfaceEditorMode = "anchors";
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorActiveSegment = null;
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  const job = await runAction(
+    "Creating interface draft",
+    `/api/sessions/${state.session.session_id}/interface/draft/from-source`,
+    { source },
+    "interface"
+  );
+  if (!job) {
+    return;
+  }
+  const result = job.result || {};
+  state.interfaceDraft = result.draft || null;
+  if (!state.interfaceDraft) {
+    await refreshInterfaceDraft();
+  }
+  showInterfaceEditorWindow();
+}
+
+async function submitInterfaceDraftAnchors(parts, closeLoop) {
+  if (!state.session) {
+    return null;
+  }
+  const job = await runAction(
+    "Updating interface anchors",
+    `/api/sessions/${state.session.session_id}/interface/draft/anchors`,
+    { parts, close_loop: closeLoop },
+    "interface"
+  );
+  if (job?.result?.draft) {
+    state.interfaceDraft = job.result.draft;
+  } else if (job) {
+    await refreshInterfaceDraft();
+  }
+  return job;
+}
+
+function nearestDraftAnchorFromProjection(event) {
+  const anchors = draftAnchorIndices();
+  if (!anchors.length || !state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
+    return null;
+  }
+  if (state.renderKey !== state.view) {
+    uploadPointCloudToGPU();
+  }
+  if (!state.mvpMatrix) {
+    state.mvpMatrix = computeMatrices(canvasSize());
+  }
+  const selected = new Set(anchors);
+  const rect = el.viewer.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const pickRadius = Math.max(22, Number(el.pointSize.value || 3.5) + 16);
+  const pickRadiusSq = pickRadius * pickRadius;
+  let best = null;
+  let bestDist = Infinity;
+  let bestPart = 0;
+  let bestAnchor = 0;
+  for (let i = 0; i < state.pointCount; i += 1) {
+    const sourceIndex = state.sourceIndices[i];
+    if (!selected.has(sourceIndex)) {
+      continue;
+    }
+    const clip = transformPoint(state.mvpMatrix, state.centeredPositions[i * 3], state.centeredPositions[i * 3 + 1], state.centeredPositions[i * 3 + 2]);
+    if (clip[3] <= 0) {
+      continue;
+    }
+    const ndcX = clip[0] / clip[3];
+    const ndcY = clip[1] / clip[3];
+    const ndcZ = clip[2] / clip[3];
+    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) {
+      continue;
+    }
+    const sx = (ndcX * 0.5 + 0.5) * rect.width;
+    const sy = (-ndcY * 0.5 + 0.5) * rect.height;
+    const dx = sx - x;
+    const dy = sy - y;
+    const dist = dx * dx + dy * dy;
+    if (dist > pickRadiusSq || dist >= bestDist) {
+      continue;
+    }
+    const parts = draftAnchorParts();
+    for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+      const anchorIndex = parts[partIndex].selected_indices.indexOf(sourceIndex);
+      if (anchorIndex >= 0) {
+        bestPart = partIndex;
+        bestAnchor = anchorIndex;
+        break;
+      }
+    }
+    best = sourceIndex;
+    bestDist = dist;
+  }
+  return best === null ? null : { sourceIndex: best, partIndex: bestPart, anchorIndex: bestAnchor };
+}
+
+function nearestInsertionIndex(partIndices, sourceIndex) {
+  if (!state.view?.points || !state.view?.indices || partIndices.length < 2) {
+    return partIndices.length;
+  }
+  const indexToPoint = new Map();
+  state.view.indices.forEach((idx, renderIdx) => indexToPoint.set(idx, state.view.points[renderIdx]));
+  const point = indexToPoint.get(sourceIndex);
+  if (!point) {
+    return partIndices.length;
+  }
+  let bestInsert = partIndices.length;
+  let bestDistance = Infinity;
+  const loop = Boolean(state.interfaceDraft?.close_loop ?? true);
+  const edgeCount = loop ? partIndices.length : partIndices.length - 1;
+  for (let i = 0; i < edgeCount; i += 1) {
+    const a = indexToPoint.get(partIndices[i]);
+    const b = indexToPoint.get(partIndices[(i + 1) % partIndices.length]);
+    if (!a || !b) {
+      continue;
+    }
+    const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const ap = [point[0] - a[0], point[1] - a[1], point[2] - a[2]];
+    const denom = Math.max(1e-12, ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]);
+    const t = clamp((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / denom, 0, 1);
+    const closest = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    const dx = point[0] - closest[0];
+    const dy = point[1] - closest[1];
+    const dz = point[2] - closest[2];
+    const distance = dx * dx + dy * dy + dz * dz;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestInsert = i + 1;
+    }
+  }
+  return bestInsert;
+}
+
+async function insertDraftAnchor(event) {
+  const sourceIndex = pickSourceIndexFromCanvas(event);
+  if (sourceIndex === null || sourceIndex === undefined) {
+    return;
+  }
+  const parts = draftAnchorParts();
+  if (!parts.length) {
+    parts.push({ selected_indices: [sourceIndex], is_lateral: false });
+  } else if (!parts.some((part) => part.selected_indices.includes(sourceIndex))) {
+    const targetPart = parts[0];
+    const insertAt = nearestInsertionIndex(targetPart.selected_indices, sourceIndex);
+    targetPart.selected_indices.splice(insertAt, 0, sourceIndex);
+  }
+  await submitInterfaceDraftAnchors(parts, Boolean(state.interfaceDraft?.close_loop ?? true));
+}
+
+async function removeDraftAnchor(event) {
+  const nearest = nearestDraftAnchorFromProjection(event);
+  if (!nearest) {
+    return;
+  }
+  const parts = draftAnchorParts();
+  const part = parts[nearest.partIndex];
+  if (!part || part.selected_indices.length <= 2) {
+    showToast("Keep at least two anchors in a draft part.", true);
+    return;
+  }
+  part.selected_indices.splice(nearest.anchorIndex, 1);
+  await submitInterfaceDraftAnchors(parts, Boolean(state.interfaceDraft?.close_loop ?? true));
+}
+
+async function moveDraftAnchor(anchorDrag, event) {
+  const sourceIndex = pickSourceIndexFromCanvas(event);
+  if (sourceIndex === null || sourceIndex === undefined || !anchorDrag) {
+    return;
+  }
+  const parts = draftAnchorParts();
+  const part = parts[anchorDrag.partIndex];
+  if (!part || part.selected_indices.includes(sourceIndex)) {
+    return;
+  }
+  part.selected_indices[anchorDrag.anchorIndex] = sourceIndex;
+  await submitInterfaceDraftAnchors(parts, Boolean(state.interfaceDraft?.close_loop ?? true));
+}
+
+async function applyInterfaceBrushEdit() {
+  if (!state.interfaceDraft) {
+    return;
+  }
+  if (state.interfaceEditorMode !== "brush_add" && state.interfaceEditorMode !== "brush_remove") {
+    return;
+  }
+  if (!state.interfaceEditorSelected.length && !state.interfaceEditorStrokeIndices.length) {
+    showToast("Draw a brush stroke that selects visible points first.", true);
+    clearInterfaceEditorLocal({ keepDraft: true });
+    return;
+  }
+  const mode = state.interfaceEditorMode === "brush_add" ? "add" : "remove";
+  const endpointTargets3D = mode === "add" ? brushEndpointTargetsFromStroke3D() : { start: null, end: null };
+  const startSegment = mode === "add"
+    ? (endpointTargets3D.start || state.interfaceEditorBrushStartSegment || state.interfaceEditorBrushTargetSegment)
+    : null;
+  const endSegment = mode === "add"
+    ? (endpointTargets3D.end || state.interfaceEditorBrushEndSegment || state.interfaceEditorActiveSegment)
+    : null;
+  const payload = {
+    mode,
+    selected_indices: state.interfaceEditorSelected,
+    stroke_indices: state.interfaceEditorStrokeIndices
+  };
+  if (startSegment) {
+    if (Number.isFinite(startSegment.partIndex) && Number.isFinite(startSegment.edgeIndex)) {
+      payload.target_part_index = startSegment.partIndex;
+      payload.target_edge_index = startSegment.edgeIndex;
+      payload.start_target_part_index = startSegment.partIndex;
+      payload.start_target_edge_index = startSegment.edgeIndex;
+    }
+    if (Number.isFinite(startSegment.anchorIndex)) {
+      payload.target_anchor_index = startSegment.anchorIndex;
+      payload.start_target_anchor_index = startSegment.anchorIndex;
+    }
+    if (Number.isFinite(startSegment.edgeT)) {
+      payload.start_target_edge_t = startSegment.edgeT;
+    }
+    if (Number.isFinite(startSegment.sourceIndex)) {
+      payload.target_source_index = startSegment.sourceIndex;
+      payload.start_target_source_index = startSegment.sourceIndex;
+    }
+  }
+  if (endSegment) {
+    if (Number.isFinite(endSegment.partIndex) && Number.isFinite(endSegment.edgeIndex)) {
+      payload.end_target_part_index = endSegment.partIndex;
+      payload.end_target_edge_index = endSegment.edgeIndex;
+    }
+    if (Number.isFinite(endSegment.anchorIndex)) {
+      payload.end_target_anchor_index = endSegment.anchorIndex;
+    }
+    if (Number.isFinite(endSegment.edgeT)) {
+      payload.end_target_edge_t = endSegment.edgeT;
+    }
+    if (Number.isFinite(endSegment.sourceIndex)) {
+      payload.end_target_source_index = endSegment.sourceIndex;
+    }
+  }
+  const job = await runAction(
+    mode === "add" ? "Brush adding interface points" : "Brush removing interface points",
+    `/api/sessions/${state.session.session_id}/interface/draft/brush`,
+    payload,
+    "interface"
+  );
+  if (job?.result?.draft) {
+    state.interfaceDraft = job.result.draft;
+  } else if (job) {
+    await refreshInterfaceDraft();
+  }
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  updateInterfaceEditorUI();
+}
+
+async function undoInterfaceDraftEdit() {
+  if (!state.interfaceDraft) {
+    return;
+  }
+  const job = await runAction(
+    "Undoing interface edit",
+    `/api/sessions/${state.session.session_id}/interface/draft/undo`,
+    undefined,
+    "interface"
+  );
+  if (job?.result?.draft) {
+    state.interfaceDraft = job.result.draft;
+  } else if (job) {
+    await refreshInterfaceDraft();
+  }
+  state.interfaceEditorStroke = [];
+  state.interfaceEditorSelected = [];
+  state.interfaceEditorBrushTargetSegment = null;
+  state.interfaceEditorBrushStartSegment = null;
+  state.interfaceEditorBrushEndSegment = null;
+  updateInterfaceEditorUI();
+}
+
+async function clearInterfaceDraft() {
+  if (!state.interfaceDraft) {
+    return;
+  }
+  const job = await runAction(
+    "Clearing interface draft",
+    `/api/sessions/${state.session.session_id}/interface/draft/clear`,
+    undefined,
+    "interface"
+  );
+  if (job) {
+    clearInterfaceEditorLocal({ keepDraft: false });
+  }
+}
+
+async function closeInterfaceEditorDiscardingDraft() {
+  if (state.interfaceDraft && state.session) {
+    const job = await runAction(
+      "Discarding interface draft",
+      `/api/sessions/${state.session.session_id}/interface/draft/clear`,
+      undefined,
+      "interface"
+    );
+    if (!job) {
+      return;
+    }
+    clearInterfaceEditorLocal({ keepDraft: false });
+  }
+  hideInterfaceEditorWindow();
+}
+
+async function commitInterfaceDraft() {
+  if (!state.interfaceDraft) {
+    return;
+  }
+  const job = await runAction(
+    "Saving draft as manual interface",
+    `/api/sessions/${state.session.session_id}/interface/draft/commit`,
+    undefined,
+    "interface"
+  );
+  if (job) {
+    clearInterfaceEditorLocal({ keepDraft: false });
+    hideInterfaceEditorWindow();
+    showInterfaceWindow();
+  }
 }
 
 function pickPoint(index) {
@@ -1980,9 +3536,18 @@ function markerSourcePoints() {
 
   pushSelection(state.rockSeeds, [1, 0.05, 0.02]);
   pushSelection(state.pedestalSeeds, [0.0, 0.24, 1.0]);
-  pushSelection(state.interfacePoints, [0.0, 0.9, 0.45]);
+  pushSelection(state.interfacePoints, [0.0, 1.0, 0.0]);
   for (const part of state.interfaceParts) {
-    pushSelection(part.selected_indices || [], part.is_lateral ? [1.0, 0.86, 0.0] : [0.0, 0.9, 0.45]);
+    pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+  }
+  if (state.activeView === "interface" && state.interfaceEditorOpen && state.interfaceDraft) {
+    for (const part of state.interfaceDraft.parts || []) {
+      pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+    }
+    if (state.interfaceEditorSelected.length) {
+      const brushColor = state.interfaceEditorMode === "brush_remove" ? [1.0, 0.18, 0.08] : [0.0, 0.78, 1.0];
+      pushSelection(state.interfaceEditorSelected, brushColor);
+    }
   }
   if (state.activeView === "mesh_prepared" && state.manualRemovalSelected.length) {
     pushSelection(state.manualRemovalSelected, [1.0, 0.84, 0.0]);
@@ -2339,6 +3904,7 @@ function draw() {
   if (!state.view) {
     drawText("Upload a LAS or LAZ file to begin.");
     drawManualRemovalOverlay();
+    drawInterfaceEditorOverlay();
     return;
   }
   if (state.view.kind === "mesh") {
@@ -2358,11 +3924,13 @@ function draw() {
       drawSolidBatch(gl, state.meshLinePositionBuffer, state.meshLineColorBuffer, state.meshLineVertexCount, gl.LINES);
     }
     drawManualRemovalOverlay();
+    drawInterfaceEditorOverlay();
     return;
   }
   if (!state.view.points || !state.view.points.length) {
     drawText("No points available for this view.");
     drawManualRemovalOverlay();
+    drawInterfaceEditorOverlay();
     return;
   }
 
@@ -2403,6 +3971,7 @@ function draw() {
   drawPointBatch(gl, state.program, state.markerHaloPositionBuffer, state.markerHaloColorBuffer, "a_color", state.markerHaloCount, Math.max(pointSize + 16, 18), null, false);
   drawPointBatch(gl, state.program, state.markerPositionBuffer, state.markerColorBuffer, "a_color", state.markerCount, Math.max(pointSize + 9, 12), null, false);
   drawManualRemovalOverlay();
+  drawInterfaceEditorOverlay();
 }
 
 function renderPickBuffer(size) {
@@ -2544,6 +4113,18 @@ function pickFromCanvas(event) {
   if (!state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
     return;
   }
+  const sourceIndex = pickSourceIndexFromCanvas(event);
+  if (sourceIndex !== null && sourceIndex !== undefined) {
+    pickPoint(sourceIndex);
+  } else {
+    draw();
+  }
+}
+
+function pickSourceIndexFromCanvas(event) {
+  if (!state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
+    return null;
+  }
   if (state.renderKey !== state.view) {
     uploadPointCloudToGPU();
   }
@@ -2552,10 +4133,9 @@ function pickFromCanvas(event) {
   if (!renderPickBuffer(size)) {
     const fallbackIndex = pickFromProjection(event);
     if (fallbackIndex !== null) {
-      pickPoint(fallbackIndex);
+      return fallbackIndex;
     }
-    draw();
-    return;
+    return null;
   }
 
   const gl = state.gl;
@@ -2600,19 +4180,16 @@ function pickFromCanvas(event) {
   if (bestRenderIndex === null) {
     const fallbackIndex = pickFromProjection(event);
     if (fallbackIndex !== null) {
-      pickPoint(fallbackIndex);
-      return;
+      return fallbackIndex;
     }
-    draw();
-    return;
+    return null;
   }
 
   const sourceIndex = state.sourceIndices[bestRenderIndex];
   if (sourceIndex !== undefined) {
-    pickPoint(sourceIndex);
-  } else {
-    draw();
+    return sourceIndex;
   }
+  return null;
 }
 
 function bindEvents() {
@@ -2660,7 +4237,30 @@ function bindEvents() {
   el.stagePart.addEventListener("click", stagePart);
   el.interpolateInterface.addEventListener("click", interpolateInterface);
   el.saveInterface.addEventListener("click", saveInterface);
+  el.editAutoInterface.addEventListener("click", openInterfaceEditor);
+  el.editAutoDraft.addEventListener("click", () => openInterfaceEditorForSource("auto"));
+  el.editManualDraft.addEventListener("click", () => openInterfaceEditorForSource("manual"));
+  el.cancelInterfaceSource.addEventListener("click", hideInterfaceSourceChooser);
   el.clearParts.addEventListener("click", clearInterfaceParts);
+  el.closeInterfaceEditorWindow.addEventListener("click", closeInterfaceEditorDiscardingDraft);
+  el.interfaceEditorWindowHandle.addEventListener("pointerdown", startInterfaceEditorWindowDrag);
+  el.interfaceEditorWindowHandle.addEventListener("pointermove", dragInterfaceEditorWindow);
+  el.interfaceEditorWindowHandle.addEventListener("pointerup", stopInterfaceEditorWindowDrag);
+  el.interfaceEditorWindowHandle.addEventListener("pointercancel", stopInterfaceEditorWindowDrag);
+  el.editorAnchorMode.addEventListener("click", () => setInterfaceEditorMode("anchors"));
+  el.editorBrushAddMode.addEventListener("click", () => setInterfaceEditorMode("brush_add"));
+  el.editorBrushRemoveMode.addEventListener("click", () => setInterfaceEditorMode("brush_remove"));
+  el.editorUndo.addEventListener("click", undoInterfaceDraftEdit);
+  el.editorSaveManual.addEventListener("click", commitInterfaceDraft);
+  el.editorClose.addEventListener("click", closeInterfaceEditorDiscardingDraft);
+  el.editorBrushRadius.addEventListener("input", () => {
+    state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
+    updateInterfaceEditorUI();
+  });
+  el.editorShowOrder.addEventListener("change", () => {
+    state.interfaceEditorShowOrder = Boolean(el.editorShowOrder.checked);
+    updateInterfaceEditorUI();
+  });
   el.runSegment.addEventListener("click", async () => {
     await flushSeedAutosave();
     await runAction(
@@ -2668,6 +4268,15 @@ function bindEvents() {
       `/api/sessions/${state.session.session_id}/segment`,
       segmentParams(),
       (result) => result?.auto_interface_generated ? "interface" : "segmented"
+    );
+  });
+  el.runICRG.addEventListener("click", async () => {
+    await flushSeedAutosave();
+    await runAction(
+      "Running ICRG",
+      `/api/sessions/${state.session.session_id}/segment/icrg`,
+      segmentParams(),
+      "segmented"
     );
   });
   el.prepareMesh.addEventListener("click", async () => {
@@ -2706,8 +4315,37 @@ function bindEvents() {
     }
     event.preventDefault();
     state.dragging = true;
+    const editorActive = state.interfaceEditorOpen && state.activeView === "interface" && state.interfaceDraft;
+    if (editorActive) {
+      updateInterfaceEditorActiveSegmentFromEvent(event, { redraw: false });
+    }
+    const editorBrush = editorActive && state.interfaceEditorMode !== "anchors";
+    const editorAnchors = editorActive && state.interfaceEditorMode === "anchors";
+    const nearestAnchor = editorAnchors && event.button === 0 && !event.shiftKey
+      ? nearestDraftAnchorFromProjection(event)
+      : null;
     if (state.manualRemovalDrawMode && state.activeView === "mesh_prepared" && event.button === 0) {
       state.dragMode = "manual_removal_vertex";
+    } else if (editorBrush && event.button === 0) {
+      state.dragMode = "interface_editor_stroke";
+      state.interfaceEditorBrushTargetSegment = state.interfaceEditorMode === "brush_add"
+        ? state.interfaceEditorActiveSegment
+        : null;
+      state.interfaceEditorBrushStartSegment = state.interfaceEditorMode === "brush_add"
+        ? state.interfaceEditorActiveSegment
+        : null;
+      state.interfaceEditorBrushEndSegment = null;
+      state.interfaceEditorStroke = [viewerPointFromEvent(event)];
+      state.interfaceEditorStrokeIndices = [];
+      state.interfaceEditorSelected = [];
+      updateInterfaceEditorUI();
+    } else if (nearestAnchor) {
+      state.dragMode = "interface_anchor_drag";
+      state.interfaceAnchorDrag = nearestAnchor;
+    } else if (editorAnchors && event.shiftKey && event.button === 0) {
+      state.dragMode = "interface_anchor_insert";
+    } else if (editorAnchors && event.shiftKey && event.button === 2) {
+      state.dragMode = "interface_anchor_remove";
     } else if (event.shiftKey && event.button === 0) {
       state.dragMode = "select";
     } else if (event.shiftKey && event.button === 2) {
@@ -2724,6 +4362,7 @@ function bindEvents() {
   });
   el.viewer.addEventListener("pointermove", (event) => {
     if (!state.dragging || !state.lastPointer) {
+      updateInterfaceEditorActiveSegmentFromEvent(event);
       return;
     }
     const dx = event.clientX - state.lastPointer[0];
@@ -2734,15 +4373,27 @@ function bindEvents() {
       state.panY -= dy * scale;
     } else if (state.dragMode === "rotate") {
       applyTrackballRotation(event.clientX, event.clientY);
+    } else if (state.dragMode === "interface_editor_stroke") {
+      const point = viewerPointFromEvent(event);
+      const previous = state.interfaceEditorStroke[state.interfaceEditorStroke.length - 1];
+      if (!previous || ((point.x - previous.x) ** 2 + (point.y - previous.y) ** 2) >= 4) {
+        state.interfaceEditorStroke.push(point);
+      }
+      if (state.interfaceEditorMode === "brush_add") {
+        updateInterfaceEditorActiveSegmentFromEvent(event, { redraw: false });
+        state.interfaceEditorBrushEndSegment = state.interfaceEditorActiveSegment;
+      }
     }
     state.lastPointer = [event.clientX, event.clientY];
     draw();
   });
-  el.viewer.addEventListener("pointerup", (event) => {
+  el.viewer.addEventListener("pointerup", async (event) => {
     const start = state.dragStart;
     const mode = state.dragMode;
+    const anchorDrag = state.interfaceAnchorDrag;
     state.dragging = false;
     state.dragMode = null;
+    state.interfaceAnchorDrag = null;
     state.lastPointer = null;
     state.trackballVector = null;
     if (start) {
@@ -2756,11 +4407,30 @@ function bindEvents() {
           state.manualRemovalSelected = [];
           updateManualRemovalUI();
         }
+      } else if (mode === "interface_editor_stroke") {
+        const point = viewerPointFromEvent(event);
+        const previous = state.interfaceEditorStroke[state.interfaceEditorStroke.length - 1];
+        if (!previous || previous.x !== point.x || previous.y !== point.y) {
+          state.interfaceEditorStroke.push(point);
+        }
+        if (state.interfaceEditorMode === "brush_add") {
+          updateInterfaceEditorActiveSegmentFromEvent(event, { redraw: false });
+          state.interfaceEditorBrushEndSegment = state.interfaceEditorActiveSegment;
+        }
+        collectInterfaceEditorSelection();
+        await applyInterfaceBrushEdit();
+      } else if (mode === "interface_anchor_insert" && (dx * dx + dy * dy) < 25) {
+        await insertDraftAnchor(event);
+      } else if (mode === "interface_anchor_remove" && (dx * dx + dy * dy) < 25) {
+        await removeDraftAnchor(event);
+      } else if (mode === "interface_anchor_drag") {
+        await moveDraftAnchor(anchorDrag, event);
       } else if (mode === "select" && (dx * dx + dy * dy) < 25) {
         pickFromCanvas(event);
       } else if (mode === "unselect" && (dx * dx + dy * dy) < 25) {
         unselectFromCanvas(event);
       }
+      updateInterfaceEditorActiveSegmentFromEvent(event, { redraw: false });
     }
     state.dragStart = null;
   });
@@ -2770,6 +4440,14 @@ function bindEvents() {
     state.dragStart = null;
     state.lastPointer = null;
     state.trackballVector = null;
+    state.interfaceAnchorDrag = null;
+    state.interfaceEditorStroke = [];
+    state.interfaceEditorStrokeIndices = [];
+    state.interfaceEditorSelected = [];
+    state.interfaceEditorBrushTargetSegment = null;
+    state.interfaceEditorBrushStartSegment = null;
+    state.interfaceEditorBrushEndSegment = null;
+    updateInterfaceEditorUI();
   });
   el.viewer.addEventListener("wheel", (event) => {
     event.preventDefault();

@@ -306,7 +306,15 @@ h1 {
   pointer-events: none;
 }
 
+.interface-editor-overlay {
+  z-index: 13;
+}
+
 .manual-removal-drawing #viewer {
+  cursor: crosshair;
+}
+
+.interface-editor-drawing #viewer {
   cursor: crosshair;
 }
 
@@ -410,11 +418,26 @@ h1 {
   z-index: 55;
 }
 
+.interface-editor-window {
+  top: 92px;
+  right: 372px;
+  z-index: 58;
+  width: min(390px, calc(100vw - 28px));
+}
+
 .tool-note {
   margin: 0 0 10px;
   color: #536059;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.source-choice {
+  margin-top: 9px;
+  padding: 9px;
+  border: 1px solid #d7ddd5;
+  border-radius: 6px;
+  background: #f1f5f0;
 }
 
 .segmented-control {
@@ -461,6 +484,12 @@ h1 {
 
 .check-label {
   width: 100%;
+}
+
+.compact-check {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  margin-top: 7px;
 }
 
 .info-button {

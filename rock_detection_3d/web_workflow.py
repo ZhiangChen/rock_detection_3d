@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -31,17 +32,20 @@ from RegionGrowing import RegionGrowingSegmentation
 from utils import filter_point_cloud
 
 
-INTERFACE_PART_COLOR_CYCLE = [
-    (1.0, 0.0, 0.0),
-    (0.0, 1.0, 0.0),
-    (0.0, 0.0, 1.0),
-    (1.0, 1.0, 0.0),
-    (1.0, 0.0, 1.0),
-]
+INTERFACE_GREEN = (0.0, 1.0, 0.0)
+INTERFACE_PART_COLOR_CYCLE = [INTERFACE_GREEN]
 
 NORMAL_VECTOR_SCALE_FRACTION = 0.01
 VIEW_NORMAL_RADIUS = 0.05
 VIEW_NORMAL_MAX_NN = 50
+DRAFT_TARGET_ANCHORS = 40
+DRAFT_MIN_ANCHORS = 12
+DRAFT_MAX_ANCHORS = 80
+DRAFT_HISTORY_LIMIT = 20
+BRUSH_ADD_MIN_ANCHORS = 3
+BRUSH_ADD_MAX_ANCHORS = 18
+BRUSH_REMOVE_MAX_ANCHORS = 12
+BRUSH_JUMP_MEDIAN_MULTIPLIER = 12.0
 
 DEFAULT_CONFIG = {
     "thresholds": {
@@ -116,10 +120,7 @@ def _load_config() -> dict[str, Any]:
 
 
 def _compute_part_color(part_index: int, is_lateral: bool) -> np.ndarray:
-    base = np.array(INTERFACE_PART_COLOR_CYCLE[part_index % len(INTERFACE_PART_COLOR_CYCLE)], dtype=float)
-    if is_lateral:
-        base = np.clip(base + 0.3, 0.0, 1.0)
-    return base
+    return np.array(INTERFACE_GREEN, dtype=float)
 
 
 def _array_to_list(array: np.ndarray, precision: int | None = None) -> list[list[float]]:
@@ -235,11 +236,15 @@ def _dense_basal_points(
 class WorkflowStatus:
     point_cloud_loaded: bool = False
     seeds_ready: bool = False
+    manual_interface_ready: bool = False
+    auto_interface_ready: bool = False
+    interface_draft_ready: bool = False
     interface_ready: bool = False
     segmentation_ready: bool = False
     mesh_prepared: bool = False
     mesh_completed: bool = False
     analysis_completed: bool = False
+    last_segmentation_mode: Literal["rg", "icrg"] | None = None
 
 
 @dataclass
@@ -293,6 +298,24 @@ class WebWorkflowSession:
         self.epsg_code: int | None = None
         self.rock_seeds: list[int] = []
         self.pedestal_seeds: list[int] = []
+        self.manual_basal_points: np.ndarray | None = None
+        self.manual_dense_basal_parts: list[np.ndarray] = []
+        self.manual_dense_basal_parts_is_lateral: list[bool] = []
+        self.manual_basal_parts_metadata: dict[str, Any] = {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        }
+        self.auto_basal_points: np.ndarray | None = None
+        self.auto_basal_parts_metadata: dict[str, Any] = {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        }
         self.basal_points: np.ndarray | None = None
         self.dense_basal_parts: list[np.ndarray] = []
         self.dense_basal_parts_is_lateral: list[bool] = []
@@ -304,6 +327,7 @@ class WebWorkflowSession:
             "palette": [],
         }
         self.interface_source: Literal["manual", "auto"] | None = None
+        self.interface_edit_draft: dict[str, Any] | None = None
         self.segmenter: RegionGrowingSegmentation | None = None
         self.segmented_pcd: o3d.geometry.PointCloud | None = None
         self.segmented_labels: np.ndarray | None = None
@@ -327,6 +351,11 @@ class WebWorkflowSession:
                 "pedestal": self.pedestal_seeds,
             },
             "interface_source": self.interface_source,
+            "manual_interface_ready": self.status.manual_interface_ready,
+            "auto_interface_ready": self.status.auto_interface_ready,
+            "interface_draft_ready": self.status.interface_draft_ready,
+            "last_segmentation_mode": self.status.last_segmentation_mode,
+            "interface_draft": self._interface_draft_summary(),
             "outputs": {
                 "segmented": self.segmented_pcd_file_path,
                 "mesh": self.mesh_path,
@@ -530,6 +559,1953 @@ class WebWorkflowSession:
         self._clear_interface_preview_state()
         return self.summary()
 
+    def _interface_draft_summary(self) -> dict[str, Any] | None:
+        draft = self.interface_edit_draft
+        if not draft:
+            return None
+        parts = draft.get("parts", []) or []
+        anchor_count = sum(len(part.get("selected_indices", []) or []) for part in parts)
+        return {
+            "part_count": len(parts),
+            "anchor_count": int(anchor_count),
+            "include_count": int(len(draft.get("include_indices", []) or [])),
+            "exclude_count": int(len(draft.get("exclude_indices", []) or [])),
+            "effective_count": int(len(draft.get("effective_indices", []) or [])),
+            "can_undo": bool(draft.get("history")),
+            "close_loop": bool(draft.get("close_loop", True)),
+        }
+
+    def _ordered_auto_interface_indices(self, indices: np.ndarray) -> list[int]:
+        pcd = self._require_pcd()
+        unique_indices = np.unique(np.asarray(indices, dtype=int))
+        if len(unique_indices) <= 2:
+            return unique_indices.astype(int).tolist()
+
+        points = np.asarray(pcd.points, dtype=float)[unique_indices]
+        finite_mask = np.all(np.isfinite(points), axis=1)
+        if not np.all(finite_mask):
+            unique_indices = unique_indices[finite_mask]
+            points = points[finite_mask]
+        if len(unique_indices) <= 2:
+            return unique_indices.astype(int).tolist()
+
+        centroid = np.mean(points, axis=0)
+        centered = points - centroid
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            axis_a = vh[0]
+            axis_b = vh[1] if vh.shape[0] > 1 else np.array([0.0, 1.0, 0.0])
+            proj_a = centered @ axis_a
+            proj_b = centered @ axis_b
+            angles = np.arctan2(proj_b, proj_a)
+            order = np.argsort(angles)
+        except np.linalg.LinAlgError:
+            order = np.lexsort((points[:, 2], points[:, 1], points[:, 0]))
+        return unique_indices[order].astype(int).tolist()
+
+    @staticmethod
+    def _resample_anchor_indices(ordered_indices: list[int]) -> list[int]:
+        if len(ordered_indices) <= DRAFT_MIN_ANCHORS:
+            return list(dict.fromkeys(int(idx) for idx in ordered_indices))
+        target_count = min(len(ordered_indices), max(DRAFT_MIN_ANCHORS, min(DRAFT_MAX_ANCHORS, DRAFT_TARGET_ANCHORS)))
+        positions = np.floor(np.arange(target_count) * len(ordered_indices) / target_count).astype(int)
+        anchors = [int(ordered_indices[int(pos)]) for pos in positions]
+        return list(dict.fromkeys(anchors))
+
+    @staticmethod
+    def _unique_ordered_indices(indices: list[int] | np.ndarray) -> list[int]:
+        return list(dict.fromkeys(int(idx) for idx in indices))
+
+    @staticmethod
+    def _squared_distance(a: np.ndarray, b: np.ndarray) -> float:
+        delta = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+        return float(np.dot(delta, delta))
+
+    @staticmethod
+    def _point_to_segment_distance_sq(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+        segment = np.asarray(end, dtype=float) - np.asarray(start, dtype=float)
+        denom = float(np.dot(segment, segment))
+        if denom <= 1e-12:
+            return WebWorkflowSession._squared_distance(point, start)
+        t = float(np.dot(np.asarray(point, dtype=float) - start, segment) / denom)
+        t = max(0.0, min(1.0, t))
+        closest = np.asarray(start, dtype=float) + segment * t
+        return WebWorkflowSession._squared_distance(point, closest)
+
+    @staticmethod
+    def _point_to_segment_t(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+        segment = np.asarray(end, dtype=float) - np.asarray(start, dtype=float)
+        denom = float(np.dot(segment, segment))
+        if denom <= 1e-12:
+            return 0.0
+        t = float(np.dot(np.asarray(point, dtype=float) - start, segment) / denom)
+        return float(max(0.0, min(1.0, t)))
+
+    def _valid_ordered_indices(self, indices: list[int] | np.ndarray, point_count: int, label: str) -> list[int]:
+        ordered: list[int] = []
+        previous: int | None = None
+        for idx in ([] if indices is None else list(indices)):
+            valid = self._validate_index(idx, point_count, label)
+            if previous is None or valid != previous:
+                ordered.append(valid)
+            previous = valid
+        return ordered
+
+    def _clean_brush_stroke_indices(self, ordered_indices: list[int]) -> list[int]:
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        unique_indices: list[int] = []
+        seen: set[int] = set()
+        for idx in ordered_indices:
+            if idx in seen:
+                continue
+            point = points[idx]
+            if np.all(np.isfinite(point)):
+                unique_indices.append(int(idx))
+                seen.add(int(idx))
+        if len(unique_indices) <= 2:
+            return unique_indices
+
+        coords = points[np.asarray(unique_indices, dtype=int)]
+        segment_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        positive_lengths = segment_lengths[segment_lengths > 1e-12]
+        if len(positive_lengths) == 0:
+            return unique_indices[:1]
+
+        median_step = float(np.median(positive_lengths))
+        q75_step = float(np.percentile(positive_lengths, 75))
+        jump_threshold = max(median_step * BRUSH_JUMP_MEDIAN_MULTIPLIER, q75_step * 6.0)
+        if not np.isfinite(jump_threshold) or jump_threshold <= 0:
+            return unique_indices
+
+        runs: list[list[int]] = []
+        current = [unique_indices[0]]
+        for offset, length in enumerate(segment_lengths, start=1):
+            if length > jump_threshold:
+                if len(current) >= 2:
+                    runs.append(current)
+                current = [unique_indices[offset]]
+            else:
+                current.append(unique_indices[offset])
+        if len(current) >= 2:
+            runs.append(current)
+        if not runs:
+            return unique_indices
+        return max(
+            runs,
+            key=lambda run: float(np.sum(np.linalg.norm(np.diff(points[np.asarray(run, dtype=int)], axis=0), axis=1))) if len(run) > 1 else 0.0,
+        )
+
+    def _sample_brush_anchor_indices(self, ordered_indices: list[int]) -> list[int]:
+        cleaned = self._clean_brush_stroke_indices(ordered_indices)
+        if len(cleaned) < 2:
+            raise ValueError("Brush Add needs at least two visible points along the stroke.")
+        if len(cleaned) <= BRUSH_ADD_MAX_ANCHORS:
+            return cleaned
+
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        coords = points[np.asarray(cleaned, dtype=int)]
+        segment_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        total_length = float(np.sum(segment_lengths))
+        if not np.isfinite(total_length) or total_length <= 1e-12:
+            return [cleaned[0], cleaned[-1]]
+
+        positive_lengths = segment_lengths[segment_lengths > 1e-12]
+        median_step = float(np.median(positive_lengths)) if len(positive_lengths) else total_length
+        desired_spacing = max(median_step * 8.0, total_length / max(1, BRUSH_ADD_MAX_ANCHORS - 1))
+        target_count = int(np.ceil(total_length / desired_spacing)) + 1
+        target_count = min(BRUSH_ADD_MAX_ANCHORS, max(min(BRUSH_ADD_MIN_ANCHORS, len(cleaned)), target_count))
+
+        cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+        target_distances = np.linspace(0.0, total_length, target_count)
+        sampled: list[int] = []
+        for distance in target_distances:
+            position = int(np.searchsorted(cumulative, distance, side="left"))
+            position = min(max(position, 0), len(cleaned) - 1)
+            sampled.append(cleaned[position])
+        sampled[0] = cleaned[0]
+        sampled[-1] = cleaned[-1]
+        sampled = self._unique_ordered_indices(sampled)
+        if len(sampled) < 2:
+            sampled = [cleaned[0], cleaned[-1]]
+        return sampled
+
+    def _sample_sparse_path_controls(self, ordered_indices: list[int], max_count: int) -> list[int]:
+        unique_indices = self._unique_ordered_indices(ordered_indices)
+        if len(unique_indices) <= max_count:
+            return unique_indices
+
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        coords = points[np.asarray(unique_indices, dtype=int)]
+        segment_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        total_length = float(np.sum(segment_lengths))
+        if not np.isfinite(total_length) or total_length <= 1e-12:
+            positions = np.floor(np.linspace(0, len(unique_indices) - 1, max_count)).astype(int)
+            sampled = [unique_indices[int(pos)] for pos in positions]
+        else:
+            cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+            sampled = []
+            for distance in np.linspace(0.0, total_length, max_count):
+                position = int(np.searchsorted(cumulative, distance, side="left"))
+                position = min(max(position, 0), len(unique_indices) - 1)
+                sampled.append(unique_indices[position])
+
+        sampled[0] = unique_indices[0]
+        sampled[-1] = unique_indices[-1]
+        sampled = self._unique_ordered_indices(sampled)
+        if len(sampled) < 2:
+            sampled = [unique_indices[0], unique_indices[-1]]
+        return sampled
+
+    def _splice_brush_anchors_into_draft(
+        self,
+        brush_anchors: list[int],
+        brush_selected_indices: set[int] | None = None,
+        ordered_stroke_indices: list[int] | None = None,
+        target_part_index: int | None = None,
+        target_edge_index: int | None = None,
+        target_anchor_index: int | None = None,
+        target_source_index: int | None = None,
+        start_target_part_index: int | None = None,
+        start_target_edge_index: int | None = None,
+        start_target_anchor_index: int | None = None,
+        start_target_edge_t: float | None = None,
+        start_target_source_index: int | None = None,
+        end_target_part_index: int | None = None,
+        end_target_edge_index: int | None = None,
+        end_target_anchor_index: int | None = None,
+        end_target_edge_t: float | None = None,
+        end_target_source_index: int | None = None,
+        replace_direction: Literal["forward", "opposite"] | None = None,
+    ) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before brushing points.")
+        if len(brush_anchors) < 2:
+            raise ValueError("Brush Add needs at least two sampled anchors.")
+
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        parts = [
+            {
+                "selected_indices": self._unique_ordered_indices(part.get("selected_indices", []) or []),
+                "is_lateral": bool(part.get("is_lateral", False)),
+            }
+            for part in self.interface_edit_draft.get("parts", []) or []
+        ]
+        parts = [part for part in parts if len(part["selected_indices"]) >= 2]
+        if not parts:
+            self.interface_edit_draft["parts"] = [{"selected_indices": brush_anchors, "is_lateral": False}]
+            self.interface_edit_draft["close_loop"] = False
+            return {
+                "brush_add_mode": "new_path",
+                "path_edited": True,
+                "path_part_count": 1,
+                "sampled_anchor_count": len(brush_anchors),
+                "inserted_anchor_count": len(brush_anchors),
+                "removed_anchor_count": 0,
+                "guided_target_used": False,
+            }
+
+        sample_coords = points[np.asarray(brush_anchors, dtype=int)]
+        start_target = self._resolve_brush_endpoint_target(
+            parts,
+            sample_coords[0],
+            start_target_part_index if start_target_part_index is not None else target_part_index,
+            start_target_edge_index if start_target_edge_index is not None else target_edge_index,
+            start_target_anchor_index if start_target_anchor_index is not None else target_anchor_index,
+            start_target_edge_t,
+            start_target_source_index if start_target_source_index is not None else target_source_index,
+        )
+        end_target = self._resolve_brush_endpoint_target(
+            parts,
+            sample_coords[-1],
+            end_target_part_index,
+            end_target_edge_index,
+            end_target_anchor_index,
+            end_target_edge_t,
+            end_target_source_index,
+        )
+        if start_target and end_target:
+            return self._splice_brush_path_into_draft(
+                parts,
+                brush_anchors,
+                start_target,
+                end_target,
+            )
+
+        probe_coords = [sample_coords[0], sample_coords[-1], np.mean(sample_coords, axis=0)]
+        best: tuple[float, int, int, bool] | None = None
+        guided_target_used = False
+
+        if start_target:
+            part_idx = int(start_target["part_idx"])
+            edge_idx = int(start_target["edge_idx"])
+            indices = parts[part_idx]["selected_indices"]
+            start_idx = indices[edge_idx]
+            end_idx = indices[(edge_idx + 1) % len(indices)]
+            start = points[start_idx]
+            end = points[end_idx]
+            forward_score = self._squared_distance(sample_coords[0], start) + self._squared_distance(sample_coords[-1], end)
+            reverse_score = self._squared_distance(sample_coords[-1], start) + self._squared_distance(sample_coords[0], end)
+            reverse = reverse_score < forward_score
+            best = (0.0, part_idx, edge_idx, reverse)
+            guided_target_used = bool(start_target.get("guided"))
+
+        for part_idx, part in enumerate(parts):
+            if guided_target_used:
+                break
+            indices = part["selected_indices"]
+            closes_part = bool(self.interface_edit_draft.get("close_loop", True)) and len(parts) == 1
+            edge_count = len(indices) if closes_part else len(indices) - 1
+            for edge_idx in range(edge_count):
+                start_idx = indices[edge_idx]
+                end_idx = indices[(edge_idx + 1) % len(indices)]
+                start = points[start_idx]
+                end = points[end_idx]
+                segment_score = float(np.mean([self._point_to_segment_distance_sq(probe, start, end) for probe in probe_coords]))
+                forward_score = self._squared_distance(sample_coords[0], start) + self._squared_distance(sample_coords[-1], end)
+                reverse_score = self._squared_distance(sample_coords[-1], start) + self._squared_distance(sample_coords[0], end)
+                reverse = reverse_score < forward_score
+                score = segment_score + 0.15 * min(forward_score, reverse_score)
+                if best is None or score < best[0]:
+                    best = (score, part_idx, edge_idx, reverse)
+
+        if best is None:
+            raise ValueError("Could not find an existing interface path segment for Brush Add.")
+
+        _, part_idx, edge_idx, reverse = best
+        target_part = parts[part_idx]
+        existing = target_part["selected_indices"]
+        oriented = list(reversed(brush_anchors)) if reverse else list(brush_anchors)
+        existing_set = set(existing)
+        insert_anchors = [idx for idx in oriented if idx not in existing_set]
+        if len(insert_anchors) < 1:
+            raise ValueError("Brush Add did not add any new interface anchors.")
+
+        insert_at = edge_idx + 1
+        target_part["selected_indices"] = self._unique_ordered_indices(existing[:insert_at] + insert_anchors + existing[insert_at:])
+        self.interface_edit_draft["parts"] = parts
+        result = {
+            "brush_add_mode": "insert_fallback",
+            "replacement_selection": "different_endpoint_parts" if start_target and end_target else "nearest_edge_insert",
+            "fallback_reason": "different_endpoint_parts" if start_target and end_target else "nearest_edge_insert",
+            "path_edited": True,
+            "path_part_count": len(parts),
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": len(insert_anchors),
+            "removed_anchor_count": 0,
+            "target_part_index": int(part_idx),
+            "target_edge_index": int(edge_idx),
+            "guided_target_used": guided_target_used,
+        }
+        return result
+
+    def _edge_count_for_part(self, part: dict[str, Any], part_count: int) -> int:
+        indices = part.get("selected_indices", []) or []
+        if len(indices) < 2:
+            return 0
+        closes_part = bool(self.interface_edit_draft.get("close_loop", True)) and part_count == 1
+        return len(indices) if closes_part else len(indices) - 1
+
+    def _resolve_brush_endpoint_target(
+        self,
+        parts: list[dict[str, Any]],
+        endpoint: np.ndarray,
+        target_part_index: int | None,
+        target_edge_index: int | None,
+        target_anchor_index: int | None = None,
+        target_edge_t: float | None = None,
+        target_source_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        point_count = len(points)
+        if target_source_index is not None:
+            source_target = self._resolve_brush_source_target(
+                parts,
+                int(target_source_index),
+                guided=target_part_index is not None or target_edge_index is not None,
+            )
+            if source_target is not None:
+                return source_target
+
+        if target_part_index is not None and target_edge_index is not None:
+            part_idx = int(target_part_index)
+            edge_idx = int(target_edge_index)
+            if 0 <= part_idx < len(parts) and 0 <= edge_idx < self._edge_count_for_part(parts[part_idx], len(parts)):
+                target: dict[str, Any] = {"part_idx": part_idx, "edge_idx": edge_idx, "guided": True}
+                indices = parts[part_idx]["selected_indices"]
+                if target_anchor_index is not None:
+                    anchor_idx = int(target_anchor_index)
+                    if 0 <= anchor_idx < len(indices):
+                        target["anchor_idx"] = anchor_idx
+                if target_edge_t is not None and np.isfinite(float(target_edge_t)):
+                    target["edge_t"] = float(max(0.0, min(1.0, float(target_edge_t))))
+                if target_source_index is not None:
+                    source_idx = int(target_source_index)
+                    if 0 <= source_idx < point_count:
+                        target["source_idx"] = source_idx
+                return target
+
+        best: tuple[float, int, int] | None = None
+        for part_idx, part in enumerate(parts):
+            indices = part["selected_indices"]
+            for edge_idx in range(self._edge_count_for_part(part, len(parts))):
+                start = points[indices[edge_idx]]
+                end = points[indices[(edge_idx + 1) % len(indices)]]
+                score = self._point_to_segment_distance_sq(endpoint, start, end)
+                if best is None or score < best[0]:
+                    best = (score, part_idx, edge_idx)
+        if best is None:
+            return None
+        _, part_idx, edge_idx = best
+        indices = parts[part_idx]["selected_indices"]
+        start = points[indices[edge_idx]]
+        end = points[indices[(edge_idx + 1) % len(indices)]]
+        start_distance = self._squared_distance(endpoint, start)
+        end_distance = self._squared_distance(endpoint, end)
+        anchor_idx = edge_idx if start_distance <= end_distance else (edge_idx + 1) % len(indices)
+        return {"part_idx": part_idx, "edge_idx": edge_idx, "anchor_idx": int(anchor_idx), "guided": False}
+
+    def _resolve_brush_source_target(
+        self,
+        parts: list[dict[str, Any]],
+        source_idx: int,
+        guided: bool = False,
+    ) -> dict[str, Any] | None:
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        if source_idx < 0 or source_idx >= len(points):
+            return None
+        tree = cKDTree(points)
+        source_point = points[int(source_idx)]
+        best: tuple[int, float, int, int, float] | None = None
+        for part_idx, part in enumerate(parts):
+            indices = part.get("selected_indices", []) or []
+            edge_count = self._edge_count_for_part(part, len(parts))
+            for edge_idx in range(edge_count):
+                start_idx = int(indices[edge_idx])
+                end_idx = int(indices[(edge_idx + 1) % len(indices)])
+                start = points[start_idx]
+                end = points[end_idx]
+                dense_indices = set(self._edge_dense_source_indices(points, tree, start_idx, end_idx))
+                on_dense_edge = int(source_idx) in dense_indices
+                distance = self._point_to_segment_distance_sq(source_point, start, end)
+                edge_t = self._point_to_segment_t(source_point, start, end)
+                candidate = (0 if on_dense_edge else 1, distance, part_idx, edge_idx, edge_t)
+                if best is None or candidate < best:
+                    best = candidate
+        if best is None:
+            return None
+
+        _, _, part_idx, edge_idx, edge_t = best
+        indices = parts[part_idx]["selected_indices"]
+        start_idx = int(indices[edge_idx])
+        end_anchor_idx = (edge_idx + 1) % len(indices)
+        end_idx = int(indices[end_anchor_idx])
+        start_distance = self._squared_distance(source_point, points[start_idx])
+        end_distance = self._squared_distance(source_point, points[end_idx])
+        anchor_idx = int(edge_idx if start_distance <= end_distance else end_anchor_idx)
+        return {
+            "part_idx": int(part_idx),
+            "edge_idx": int(edge_idx),
+            "anchor_idx": anchor_idx,
+            "edge_t": float(edge_t),
+            "source_idx": int(source_idx),
+            "guided": bool(guided),
+            "source_guided": True,
+        }
+
+    def _materialize_endpoint_source_anchor(
+        self,
+        part: dict[str, Any],
+        part_count: int,
+        target: dict[str, Any],
+        sibling: dict[str, Any] | None,
+    ) -> None:
+        if "source_idx" not in target:
+            return
+        indices = part["selected_indices"]
+        source_idx = int(target["source_idx"])
+        if source_idx in indices:
+            target["anchor_idx"] = int(indices.index(source_idx))
+            return
+
+        edge_count = self._edge_count_for_part(part, part_count)
+        if edge_count <= 0:
+            return
+        edge_idx = self._edge_index_for_source_point(part, part_count, source_idx)
+        if edge_idx is None:
+            edge_idx = max(0, min(edge_count - 1, int(target["edge_idx"])))
+        else:
+            target["edge_idx"] = int(edge_idx)
+        insert_at = edge_idx + 1
+        indices.insert(insert_at, source_idx)
+        target["anchor_idx"] = int(insert_at)
+        target["edge_idx"] = int(insert_at)
+
+        if sibling is not None:
+            if "anchor_idx" in sibling and int(sibling["anchor_idx"]) >= insert_at:
+                sibling["anchor_idx"] = int(sibling["anchor_idx"]) + 1
+            if int(sibling.get("edge_idx", -1)) > edge_idx:
+                sibling["edge_idx"] = int(sibling["edge_idx"]) + 1
+            elif int(sibling.get("edge_idx", -1)) == edge_idx:
+                sibling_t = float(sibling.get("edge_t", 0.0))
+                target_t = float(target.get("edge_t", 0.5))
+                if sibling_t > target_t:
+                    sibling["edge_idx"] = int(sibling["edge_idx"]) + 1
+
+    def _materialize_endpoint_source_anchors(
+        self,
+        part: dict[str, Any],
+        part_count: int,
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> None:
+        start_t = float(start_target.get("edge_t", 0.0))
+        end_t = float(end_target.get("edge_t", 1.0))
+        targets = [
+            (start_target, end_target, start_t),
+            (end_target, start_target, end_t),
+        ]
+        targets.sort(key=lambda item: (int(item[0].get("edge_idx", 0)), item[2]), reverse=True)
+        for target, sibling, _ in targets:
+            self._materialize_endpoint_source_anchor(part, part_count, target, sibling)
+
+    def _edge_index_for_source_point(
+        self,
+        part: dict[str, Any],
+        part_count: int,
+        source_idx: int,
+    ) -> int | None:
+        indices = part["selected_indices"]
+        edge_count = self._edge_count_for_part(part, part_count)
+        if edge_count <= 0:
+            return None
+
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        tree = cKDTree(points)
+        source_point = points[int(source_idx)]
+        best: tuple[float, int] | None = None
+        for edge_idx in range(edge_count):
+            start_idx = int(indices[edge_idx])
+            end_idx = int(indices[(edge_idx + 1) % len(indices)])
+            dense_indices = self._edge_dense_source_indices(points, tree, start_idx, end_idx)
+            if int(source_idx) in set(dense_indices):
+                return int(edge_idx)
+            start = points[start_idx]
+            end = points[end_idx]
+            score = self._point_to_segment_distance_sq(source_point, start, end)
+            if best is None or score < best[0]:
+                best = (score, edge_idx)
+        return int(best[1]) if best is not None else None
+
+    @staticmethod
+    def _path_edge_sequence(start_edge: int, end_edge: int, edge_count: int) -> list[int]:
+        if edge_count <= 0:
+            return []
+        start = int(start_edge) % edge_count
+        end = int(end_edge) % edge_count
+        edges = [start]
+        while edges[-1] != end:
+            edges.append((edges[-1] + 1) % edge_count)
+            if len(edges) > edge_count:
+                break
+        return edges
+
+    def _edge_dense_source_indices(
+        self,
+        points: np.ndarray,
+        tree: cKDTree,
+        start_idx: int,
+        end_idx: int,
+    ) -> list[int]:
+        try:
+            dense = _dense_basal_points(points, [int(start_idx), int(end_idx)], False)
+            if dense.size == 0:
+                return self._unique_ordered_indices([start_idx, end_idx])
+            _, indices = tree.query(dense)
+            return self._unique_ordered_indices(np.asarray(indices, dtype=int).tolist())
+        except Exception:
+            return self._unique_ordered_indices([start_idx, end_idx])
+
+    @staticmethod
+    def _point_to_polyline_distance_sq(point: np.ndarray, polyline: np.ndarray) -> float:
+        if len(polyline) == 0:
+            return float("inf")
+        if len(polyline) == 1:
+            return WebWorkflowSession._squared_distance(point, polyline[0])
+        return float(min(
+            WebWorkflowSession._point_to_segment_distance_sq(point, polyline[idx - 1], polyline[idx])
+            for idx in range(1, len(polyline))
+        ))
+
+    @staticmethod
+    def _positive_median(values: np.ndarray) -> float | None:
+        finite = np.asarray(values, dtype=float)
+        finite = finite[np.isfinite(finite) & (finite > 1e-9)]
+        if finite.size == 0:
+            return None
+        return float(np.median(finite))
+
+    def _brush_overlap_threshold(
+        self,
+        points: np.ndarray,
+        stroke_indices: list[int],
+        existing: list[int],
+        closed: bool,
+    ) -> float:
+        candidates: list[float] = []
+        if len(stroke_indices) >= 2:
+            stroke_coords = points[np.asarray(stroke_indices, dtype=int)]
+            stroke_step = self._positive_median(np.linalg.norm(np.diff(stroke_coords, axis=0), axis=1))
+            if stroke_step is not None:
+                candidates.append(stroke_step * 3.0)
+
+        edge_indices = list(existing)
+        if closed and len(existing) > 2:
+            edge_indices = [*edge_indices, existing[0]]
+        if len(edge_indices) >= 2:
+            control_coords = points[np.asarray(edge_indices, dtype=int)]
+            control_step = self._positive_median(np.linalg.norm(np.diff(control_coords, axis=0), axis=1))
+            if control_step is not None:
+                candidates.append(control_step * 0.08)
+
+        if not candidates:
+            return 0.05
+        return float(max(0.01, min(0.3, max(candidates))))
+
+    def _score_brush_overlap_by_edge(
+        self,
+        existing: list[int],
+        closed: bool,
+        brush_selected_indices: set[int],
+        ordered_stroke_indices: list[int],
+        brush_anchors: list[int],
+    ) -> tuple[list[dict[str, Any]], float]:
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        tree = cKDTree(points)
+        edge_count = len(existing) if closed else len(existing) - 1
+        stroke_source = ordered_stroke_indices if len(ordered_stroke_indices) >= 2 else brush_anchors
+        stroke_coords = points[np.asarray(stroke_source, dtype=int)]
+        threshold = self._brush_overlap_threshold(points, stroke_source, existing, closed)
+        selected = set(int(idx) for idx in brush_selected_indices)
+
+        scores: list[dict[str, Any]] = []
+        for edge_idx in range(edge_count):
+            start_idx = int(existing[edge_idx])
+            end_idx = int(existing[(edge_idx + 1) % len(existing)])
+            dense_indices = self._edge_dense_source_indices(points, tree, start_idx, end_idx)
+            dense_set = set(dense_indices)
+            hit_count = len(dense_set.intersection(selected))
+
+            if dense_indices:
+                sample_count = min(24, len(dense_indices))
+                sample_positions = np.linspace(0, len(dense_indices) - 1, sample_count).astype(int)
+                sample_indices = [dense_indices[int(pos)] for pos in sample_positions]
+                sample_coords = points[np.asarray(sample_indices, dtype=int)]
+            else:
+                sample_coords = np.asarray([(points[start_idx] + points[end_idx]) * 0.5], dtype=float)
+
+            distances = np.asarray([
+                np.sqrt(self._point_to_polyline_distance_sq(sample, stroke_coords))
+                for sample in sample_coords
+            ], dtype=float)
+            finite_distances = distances[np.isfinite(distances)]
+            mean_distance = float(np.mean(finite_distances)) if finite_distances.size else float("inf")
+            near_count = int(np.sum(finite_distances <= threshold)) if finite_distances.size else 0
+            overlap_weight = int(hit_count * 4 + near_count)
+            scores.append({
+                "edge": int(edge_idx),
+                "dense_indices": dense_indices,
+                "hit_count": int(hit_count),
+                "near_count": int(near_count),
+                "overlap_weight": int(overlap_weight),
+                "mean_distance": mean_distance,
+                "positive": bool(hit_count > 0 or near_count > 0),
+            })
+        return scores, threshold
+
+    def _summarize_brush_overlap_arc(
+        self,
+        edges: list[int],
+        edge_scores: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not edges:
+            return {
+                "edges": [],
+                "edge_count": 0,
+                "overlap_edge_count": 0,
+                "selected_hit_count": 0,
+                "near_sample_count": 0,
+                "overlap_weight": 0,
+                "overlap_fraction": 0.0,
+                "mean_distance": float("inf"),
+            }
+        selected_hit_count = int(sum(edge_scores[edge]["hit_count"] for edge in edges))
+        near_sample_count = int(sum(edge_scores[edge]["near_count"] for edge in edges))
+        overlap_weight = int(sum(edge_scores[edge]["overlap_weight"] for edge in edges))
+        overlap_edge_count = int(sum(1 for edge in edges if edge_scores[edge]["positive"]))
+        distances = [
+            float(edge_scores[edge]["mean_distance"])
+            for edge in edges
+            if np.isfinite(edge_scores[edge]["mean_distance"])
+        ]
+        mean_distance = float(np.mean(distances)) if distances else float("inf")
+        return {
+            "edges": [int(edge) for edge in edges],
+            "edge_count": int(len(edges)),
+            "overlap_edge_count": overlap_edge_count,
+            "selected_hit_count": selected_hit_count,
+            "near_sample_count": near_sample_count,
+            "overlap_weight": overlap_weight,
+            "overlap_fraction": float(overlap_edge_count / max(len(edges), 1)),
+            "mean_distance": mean_distance,
+        }
+
+    def _select_brush_replacement_arc(
+        self,
+        existing: list[int],
+        closed: bool,
+        start_edge: int,
+        end_edge: int,
+        brush_selected_indices: set[int],
+        ordered_stroke_indices: list[int],
+        brush_anchors: list[int],
+        replace_direction: Literal["forward", "opposite"] | None = None,
+        start_anchor_idx: int | None = None,
+        end_anchor_idx: int | None = None,
+    ) -> dict[str, Any] | None:
+        edge_count = len(existing) if closed else len(existing) - 1
+        if edge_count <= 0:
+            return None
+        edge_scores, threshold = self._score_brush_overlap_by_edge(
+            existing,
+            closed,
+            brush_selected_indices,
+            ordered_stroke_indices,
+            brush_anchors,
+        )
+
+        anchor_candidates = False
+        if start_anchor_idx is not None and end_anchor_idx is not None and start_anchor_idx != end_anchor_idx:
+            start_anchor = int(start_anchor_idx) % len(existing)
+            end_anchor = int(end_anchor_idx) % len(existing)
+            anchor_candidates = True
+            if closed:
+                candidate_specs = [
+                    (
+                        "forward",
+                        start_anchor,
+                        (end_anchor - 1) % edge_count,
+                        self._path_edge_sequence(start_anchor, (end_anchor - 1) % edge_count, edge_count),
+                    ),
+                    (
+                        "opposite",
+                        end_anchor,
+                        (start_anchor - 1) % edge_count,
+                        self._path_edge_sequence(end_anchor, (start_anchor - 1) % edge_count, edge_count),
+                    ),
+                ]
+            else:
+                arc_start = int(min(start_anchor, end_anchor))
+                arc_end = int(max(start_anchor, end_anchor) - 1)
+                candidate_specs = [
+                    ("forward", arc_start, arc_end, list(range(arc_start, arc_end + 1)))
+                ] if arc_start <= arc_end else []
+        elif closed:
+            candidate_specs = [
+                ("forward", int(start_edge), int(end_edge), self._path_edge_sequence(start_edge, end_edge, edge_count)),
+                ("opposite", int(end_edge), int(start_edge), self._path_edge_sequence(end_edge, start_edge, edge_count)),
+            ]
+        else:
+            arc_start = int(min(start_edge, end_edge))
+            arc_end = int(max(start_edge, end_edge))
+            candidate_specs = [("forward", arc_start, arc_end, list(range(arc_start, arc_end + 1)))]
+
+        max_local_edges = max(3, int(np.ceil(edge_count * 0.35)))
+        candidates: list[dict[str, Any]] = []
+        for direction, arc_start, arc_end, edges in candidate_specs:
+            summary = self._summarize_brush_overlap_arc(edges, edge_scores)
+            overlap_fraction = float(summary["overlap_fraction"])
+            broad_without_overlap = summary["edge_count"] > max_local_edges and overlap_fraction < 0.5
+            weak_endpoint_only = (
+                summary["edge_count"] > 3
+                and summary["overlap_edge_count"] <= 1
+                and summary["selected_hit_count"] == 0
+            )
+            acceptable = bool(summary["overlap_weight"] > 0 and not broad_without_overlap and not weak_endpoint_only)
+            candidates.append({
+                **summary,
+                "direction": direction,
+                "start_edge": int(arc_start),
+                "end_edge": int(arc_end),
+                "acceptable": acceptable,
+                "anchor_candidate": bool(anchor_candidates),
+                "max_local_edge_count": int(max_local_edges),
+                "overlap_threshold": float(threshold),
+                "fallback_reason": "no_overlapping_arc" if summary["overlap_weight"] <= 0 else (
+                    "replacement_not_local" if broad_without_overlap else (
+                        "endpoint_only_overlap" if weak_endpoint_only else None
+                    )
+                ),
+            })
+
+        acceptable_candidates = [candidate for candidate in candidates if candidate["acceptable"]]
+        if not acceptable_candidates and anchor_candidates:
+            shortest_endpoint_arc = [
+                candidate
+                for candidate in candidates
+                if candidate["edge_count"] > 0
+            ]
+            if shortest_endpoint_arc:
+                selected = min(
+                    shortest_endpoint_arc,
+                    key=lambda candidate: (
+                        int(candidate["edge_count"]),
+                        -float(candidate["overlap_weight"]),
+                        float(candidate["mean_distance"]) if np.isfinite(candidate["mean_distance"]) else float("inf"),
+                    ),
+                )
+                selected = {
+                    **selected,
+                    "acceptable": True,
+                    "fallback_reason": "endpoint_shortest_local_arc",
+                }
+                return {
+                    "selected": selected,
+                    "candidates": candidates,
+                    "fallback_reason": None,
+                }
+
+        if not acceptable_candidates:
+            return {
+                "selected": None,
+                "candidates": candidates,
+                "fallback_reason": next(
+                    (candidate["fallback_reason"] for candidate in candidates if candidate["fallback_reason"]),
+                    "no_overlapping_arc",
+                ),
+            }
+
+        if replace_direction in {"forward", "opposite"}:
+            directed = [
+                candidate
+                for candidate in acceptable_candidates
+                if candidate["direction"] == replace_direction
+            ]
+            if directed:
+                acceptable_candidates = directed
+
+        selected = max(
+            acceptable_candidates,
+            key=lambda candidate: (
+                int(candidate["selected_hit_count"] > 0),
+                float(candidate["overlap_fraction"]),
+                float(candidate["overlap_weight"]) / max(int(candidate["edge_count"]), 1),
+                -int(candidate["edge_count"]),
+            ),
+        )
+        return {
+            "selected": selected,
+            "candidates": candidates,
+            "fallback_reason": None,
+        }
+
+    @staticmethod
+    def _replacement_edge_from_target_anchor(
+        target: dict[str, Any],
+        role: Literal["start", "end"],
+        anchor_count: int,
+        closed: bool,
+    ) -> int:
+        edge_idx = int(target["edge_idx"])
+        if "anchor_idx" not in target or anchor_count < 2:
+            return edge_idx
+
+        anchor_idx = max(0, min(anchor_count - 1, int(target["anchor_idx"])))
+        if closed:
+            return anchor_idx % anchor_count if role == "start" else (anchor_idx - 1) % anchor_count
+
+        max_edge = max(0, anchor_count - 2)
+        if role == "start":
+            return max(0, min(max_edge, anchor_idx))
+        return max(0, min(max_edge, anchor_idx - 1))
+
+    def _orient_brush_anchors_for_connection(
+        self,
+        brush_anchors: list[int],
+        start_anchor: int,
+        end_anchor: int,
+    ) -> list[int]:
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        sample_coords = points[np.asarray(brush_anchors, dtype=int)]
+        start = points[int(start_anchor)]
+        end = points[int(end_anchor)]
+        forward_score = self._squared_distance(sample_coords[0], start) + self._squared_distance(sample_coords[-1], end)
+        reverse_score = self._squared_distance(sample_coords[-1], start) + self._squared_distance(sample_coords[0], end)
+        return list(reversed(brush_anchors)) if reverse_score < forward_score else list(brush_anchors)
+
+    def _polyline_length_for_indices(self, indices: list[int]) -> float:
+        if len(indices) < 2:
+            return 0.0
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        coords = points[np.asarray(indices, dtype=int)]
+        return self._polyline_length_for_points(coords)
+
+    @staticmethod
+    def _polyline_length_for_points(points: np.ndarray) -> float:
+        coords = np.asarray(points, dtype=float)
+        if len(coords) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(coords, axis=0), axis=1)))
+
+    def _interpolated_length_for_indices(self, indices: list[int]) -> float:
+        if len(indices) < 2:
+            return 0.0
+        points = np.asarray(self._require_pcd().points, dtype=float)
+        try:
+            dense = _dense_basal_points(points, [int(idx) for idx in indices], False)
+        except Exception:
+            return self._polyline_length_for_indices(indices)
+        if dense.size == 0:
+            return self._polyline_length_for_indices(indices)
+        return self._polyline_length_for_points(dense)
+
+    def _brush_path_between(self, brush_anchors: list[int], start_idx: int, end_idx: int) -> list[int]:
+        oriented = self._orient_brush_anchors_for_connection(brush_anchors, start_idx, end_idx)
+        interior = [int(idx) for idx in oriented if int(idx) not in {int(start_idx), int(end_idx)}]
+        return self._unique_ordered_indices([int(start_idx), *interior, int(end_idx)])
+
+    @staticmethod
+    def _closed_nodes_between(existing: list[int], start_anchor_idx: int, end_anchor_idx: int) -> list[int]:
+        if not existing:
+            return []
+        n = len(existing)
+        idx = int(start_anchor_idx) % n
+        end = int(end_anchor_idx) % n
+        nodes = [int(existing[idx])]
+        while idx != end:
+            idx = (idx + 1) % n
+            nodes.append(int(existing[idx]))
+            if len(nodes) > n:
+                break
+        return nodes
+
+    def _open_path_to_anchor(self, indices: list[int], anchor_idx: int) -> list[int]:
+        anchor_idx = max(0, min(len(indices) - 1, int(anchor_idx)))
+        left = [int(idx) for idx in indices[:anchor_idx + 1]]
+        right = [int(idx) for idx in reversed(indices[anchor_idx:])]
+        return left if self._interpolated_length_for_indices(left) >= self._interpolated_length_for_indices(right) else right
+
+    def _open_path_from_anchor(self, indices: list[int], anchor_idx: int) -> list[int]:
+        anchor_idx = max(0, min(len(indices) - 1, int(anchor_idx)))
+        left = [int(idx) for idx in reversed(indices[:anchor_idx + 1])]
+        right = [int(idx) for idx in indices[anchor_idx:]]
+        return right if self._interpolated_length_for_indices(right) >= self._interpolated_length_for_indices(left) else left
+
+    def _splice_brush_path_into_same_part(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        part_idx = int(start_target["part_idx"])
+        target_part = parts[part_idx]
+        closed = bool(self.interface_edit_draft.get("close_loop", True)) and len(parts) == 1
+        self._materialize_endpoint_source_anchors(target_part, len(parts), start_target, end_target)
+
+        existing = target_part["selected_indices"]
+        if "anchor_idx" not in start_target or "anchor_idx" not in end_target:
+            raise ValueError("Brush Add could not resolve both endpoint anchors.")
+
+        start_anchor = int(start_target["anchor_idx"])
+        end_anchor = int(end_target["anchor_idx"])
+        if start_anchor == end_anchor:
+            raise ValueError("Brush Add endpoints snapped to the same interface point.")
+
+        start_idx = int(existing[start_anchor])
+        end_idx = int(existing[end_anchor])
+        brush_path = self._brush_path_between(brush_anchors, start_idx, end_idx)
+        if len(brush_path) < 2:
+            raise ValueError("Brush Add did not add enough points for a splice.")
+
+        candidate_lengths: dict[str, float] = {}
+        removed_anchor_count_override: int | None = None
+        removed_segment_length_override: float | None = None
+        preserved_segment_length_override: float | None = None
+        if closed:
+            start_to_end = self._closed_nodes_between(existing, start_anchor, end_anchor)
+            end_to_start = self._closed_nodes_between(existing, end_anchor, start_anchor)
+            start_to_end_length = self._interpolated_length_for_indices(start_to_end)
+            end_to_start_length = self._interpolated_length_for_indices(end_to_start)
+            candidate_lengths = {
+                "start_to_end": float(start_to_end_length),
+                "end_to_start": float(end_to_start_length),
+            }
+            keep_start_to_end = start_to_end_length >= end_to_start_length
+            kept_nodes = start_to_end if keep_start_to_end else end_to_start
+            removed_nodes = end_to_start if keep_start_to_end else start_to_end
+            bridge_interior = list(reversed(brush_path))[1:-1] if keep_start_to_end else brush_path[1:-1]
+            new_indices = self._unique_ordered_indices([*kept_nodes, *bridge_interior])
+            close_loop = True
+            splice_case = "closed_keep_start_to_end" if keep_start_to_end else "closed_keep_end_to_start"
+        else:
+            low = min(start_anchor, end_anchor)
+            high = max(start_anchor, end_anchor)
+            low_idx = int(existing[low])
+            high_idx = int(existing[high])
+            bridge_low_to_high = brush_path if brush_path[0] == low_idx else list(reversed(brush_path))
+            start_is_end = start_anchor in {0, len(existing) - 1}
+            end_is_end = end_anchor in {0, len(existing) - 1}
+            if start_is_end or end_is_end:
+                if {start_anchor, end_anchor} == {0, len(existing) - 1}:
+                    if existing[-1] == brush_path[0] and existing[0] == brush_path[-1]:
+                        bridge_after_existing = brush_path[1:-1]
+                    elif existing[-1] == brush_path[-1] and existing[0] == brush_path[0]:
+                        bridge_after_existing = list(reversed(brush_path))[1:-1]
+                    else:
+                        bridge_after_existing = bridge_low_to_high[1:-1]
+                    new_indices = self._unique_ordered_indices([*existing, *bridge_after_existing])
+                    close_loop = True
+                    splice_case = "open_both_ends_preserve_original_close_with_brush"
+                    removed_nodes = []
+                    kept_nodes = list(existing)
+                    candidate_lengths = {
+                        "original_path": float(self._interpolated_length_for_indices(existing)),
+                        "brush_path": float(self._interpolated_length_for_indices(brush_path)),
+                    }
+                else:
+                    endpoint_anchor = start_anchor if start_is_end else end_anchor
+                    interior_anchor = end_anchor if start_is_end else start_anchor
+                    endpoint_idx = int(existing[endpoint_anchor])
+                    before = [int(idx) for idx in existing[:interior_anchor + 1]]
+                    after = [int(idx) for idx in existing[interior_anchor:]]
+                    before_length = self._interpolated_length_for_indices(before)
+                    after_length = self._interpolated_length_for_indices(after)
+                    keep_before = before_length >= after_length
+                    kept_nodes = before if keep_before else after
+                    removed_nodes = after if keep_before else before
+                    kept_contains_endpoint = (
+                        (keep_before and endpoint_anchor == 0)
+                        or ((not keep_before) and endpoint_anchor == len(existing) - 1)
+                    )
+                    if kept_contains_endpoint:
+                        connector = self._brush_path_between(brush_anchors, int(kept_nodes[-1]), int(kept_nodes[0]))
+                        new_indices = self._unique_ordered_indices([*kept_nodes, *connector[1:-1]])
+                        close_loop = True
+                        splice_case = "open_one_end_keep_longer_endpoint_piece_close_with_brush"
+                    elif keep_before:
+                        connector = self._brush_path_between(brush_anchors, int(kept_nodes[-1]), endpoint_idx)
+                        new_indices = self._unique_ordered_indices([*kept_nodes, *connector[1:]])
+                        close_loop = False
+                        splice_case = "open_one_end_keep_longer_opposite_piece_append_brush"
+                    else:
+                        connector = self._brush_path_between(brush_anchors, endpoint_idx, int(kept_nodes[0]))
+                        new_indices = self._unique_ordered_indices([*connector[:-1], *kept_nodes])
+                        close_loop = False
+                        splice_case = "open_one_end_keep_longer_opposite_piece_prepend_brush"
+                    removed_anchor_count_override = max(0, len(removed_nodes) - 1)
+                    candidate_lengths = {
+                        "before_including_interior_snap": float(before_length),
+                        "after_including_interior_snap": float(after_length),
+                        "kept_piece": float(self._interpolated_length_for_indices(kept_nodes)),
+                        "removed_piece": float(self._interpolated_length_for_indices(removed_nodes)),
+                        "brush_path": float(self._interpolated_length_for_indices(brush_path)),
+                    }
+            else:
+                bounded_nodes = [int(idx) for idx in existing[low:high + 1]]
+                prefix_nodes = [int(idx) for idx in existing[:low + 1]]
+                suffix_nodes = [int(idx) for idx in existing[high:]]
+                outside_nodes = [*prefix_nodes, *suffix_nodes]
+                bounded_length = self._interpolated_length_for_indices(bounded_nodes)
+                outside_length = (
+                    self._interpolated_length_for_indices(prefix_nodes)
+                    + self._interpolated_length_for_indices(suffix_nodes)
+                )
+                if bounded_length <= outside_length:
+                    new_indices = self._unique_ordered_indices([
+                        *prefix_nodes,
+                        *bridge_low_to_high[1:-1],
+                        *suffix_nodes,
+                    ])
+                    removed_nodes = bounded_nodes
+                    kept_nodes = outside_nodes
+                    close_loop = False
+                    splice_case = "open_interior_remove_shorter_bounded_interval"
+                    removed_anchor_count_override = max(0, len(bounded_nodes) - 2)
+                    removed_segment_length_override = float(bounded_length)
+                    preserved_segment_length_override = float(outside_length)
+                else:
+                    bridge_high_to_low = list(reversed(bridge_low_to_high))
+                    new_indices = self._unique_ordered_indices([
+                        *bounded_nodes,
+                        *bridge_high_to_low[1:-1],
+                    ])
+                    removed_nodes = outside_nodes
+                    kept_nodes = bounded_nodes
+                    close_loop = True
+                    splice_case = "open_interior_remove_shorter_outside_route"
+                    removed_anchor_count_override = max(0, len(prefix_nodes) + len(suffix_nodes) - 2)
+                    removed_segment_length_override = float(outside_length)
+                    preserved_segment_length_override = float(bounded_length)
+                candidate_lengths = {
+                    "bounded_interval": float(bounded_length),
+                    "outside_terminal_route": float(outside_length),
+                    "brush_path": float(self._interpolated_length_for_indices(brush_path)),
+                }
+
+        if len(new_indices) < 2:
+            raise ValueError("Brush Add splice would leave fewer than two interface anchors.")
+
+        target_part["selected_indices"] = new_indices
+        self.interface_edit_draft["parts"] = parts
+        self.interface_edit_draft["close_loop"] = close_loop
+        removed_anchor_count = (
+            int(removed_anchor_count_override)
+            if removed_anchor_count_override is not None
+            else max(0, len(removed_nodes) - 2)
+        )
+        result = {
+            "brush_add_mode": "splice",
+            "replacement_selection": "longest_segment_splice",
+            "splice_case": splice_case,
+            "path_edited": True,
+            "path_part_count": len(parts),
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": max(0, len(brush_path) - 2),
+            "removed_anchor_count": int(removed_anchor_count),
+            "preserved_anchor_count": int(len(kept_nodes)),
+            "removed_segment_length": float(
+                removed_segment_length_override
+                if removed_segment_length_override is not None
+                else self._interpolated_length_for_indices(removed_nodes)
+            ),
+            "preserved_segment_length": float(
+                preserved_segment_length_override
+                if preserved_segment_length_override is not None
+                else self._interpolated_length_for_indices(kept_nodes)
+            ),
+            "candidate_lengths": candidate_lengths,
+            "start_target_part_index": int(part_idx),
+            "end_target_part_index": int(part_idx),
+            "start_target_source_index": int(start_idx),
+            "end_target_source_index": int(end_idx),
+            "start_target_anchor_index": int(start_anchor),
+            "end_target_anchor_index": int(end_anchor),
+            "start_target_at_open_end": bool(not closed and start_anchor in {0, len(existing) - 1}),
+            "end_target_at_open_end": bool(not closed and end_anchor in {0, len(existing) - 1}),
+            "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+        }
+        return {
+            **result,
+        }
+
+    def _splice_brush_path_between_parts(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        start_part_idx = int(start_target["part_idx"])
+        end_part_idx = int(end_target["part_idx"])
+        self._materialize_endpoint_source_anchor(parts[start_part_idx], len(parts), start_target, None)
+        self._materialize_endpoint_source_anchor(parts[end_part_idx], len(parts), end_target, None)
+        if "anchor_idx" not in start_target or "anchor_idx" not in end_target:
+            raise ValueError("Brush Add could not resolve both endpoint anchors.")
+
+        start_indices = parts[start_part_idx]["selected_indices"]
+        end_indices = parts[end_part_idx]["selected_indices"]
+        start_anchor = int(start_target["anchor_idx"])
+        end_anchor = int(end_target["anchor_idx"])
+        start_path = self._open_path_to_anchor(start_indices, start_anchor)
+        end_path = self._open_path_from_anchor(end_indices, end_anchor)
+        brush_path = self._brush_path_between(brush_anchors, start_path[-1], end_path[0])
+        insert_anchors = [idx for idx in brush_path[1:-1] if idx not in set(start_path).union(end_path)]
+        if len(insert_anchors) < 1:
+            raise ValueError("Brush Add did not add any new interface anchors.")
+
+        merged = self._unique_ordered_indices([*start_path, *insert_anchors, *end_path])
+        merged_part = {
+            "selected_indices": merged,
+            "is_lateral": bool(parts[start_part_idx].get("is_lateral", False) or parts[end_part_idx].get("is_lateral", False)),
+        }
+        next_parts = [
+            part
+            for idx, part in enumerate(parts)
+            if idx not in {start_part_idx, end_part_idx}
+        ]
+        insert_at = min(start_part_idx, end_part_idx, len(next_parts))
+        next_parts.insert(insert_at, merged_part)
+        removed_anchor_count = max(0, len(start_indices) + len(end_indices) - len(start_path) - len(end_path))
+        self.interface_edit_draft["parts"] = next_parts
+        self.interface_edit_draft["close_loop"] = False
+        result = {
+            "brush_add_mode": "splice",
+            "replacement_selection": "connect_parts_splice",
+            "path_edited": True,
+            "path_part_count": len(next_parts),
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": len(insert_anchors),
+            "removed_anchor_count": int(removed_anchor_count),
+            "preserved_anchor_count": int(len(start_path) + len(end_path)),
+            "removed_segment_length": 0.0,
+            "preserved_segment_length": float(self._interpolated_length_for_indices(start_path) + self._interpolated_length_for_indices(end_path)),
+            "start_target_part_index": int(start_part_idx),
+            "end_target_part_index": int(end_part_idx),
+            "start_target_source_index": int(start_path[-1]),
+            "end_target_source_index": int(end_path[0]),
+            "start_target_at_open_end": bool(start_anchor in {0, len(start_indices) - 1}),
+            "end_target_at_open_end": bool(end_anchor in {0, len(end_indices) - 1}),
+            "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+        }
+        return result
+
+    def _splice_brush_path_into_draft(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        if int(start_target["part_idx"]) == int(end_target["part_idx"]):
+            return self._splice_brush_path_into_same_part(parts, brush_anchors, start_target, end_target)
+        return self._splice_brush_path_between_parts(parts, brush_anchors, start_target, end_target)
+
+    def _connect_brush_between_draft_parts(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        start_part_idx = int(start_target["part_idx"])
+        end_part_idx = int(end_target["part_idx"])
+        if start_part_idx == end_part_idx:
+            raise ValueError("Endpoint part merge requires two different parts.")
+
+        self._materialize_endpoint_source_anchor(parts[start_part_idx], len(parts), start_target, None)
+        self._materialize_endpoint_source_anchor(parts[end_part_idx], len(parts), end_target, None)
+        start_indices = parts[start_part_idx]["selected_indices"]
+        end_indices = parts[end_part_idx]["selected_indices"]
+        if "anchor_idx" not in start_target or "anchor_idx" not in end_target:
+            raise ValueError("Brush Add could not resolve both endpoint anchors.")
+
+        start_path = self._open_path_to_anchor(start_indices, int(start_target["anchor_idx"]))
+        end_path = self._open_path_from_anchor(end_indices, int(end_target["anchor_idx"]))
+        oriented = self._orient_brush_anchors_for_connection(
+            brush_anchors,
+            start_path[-1],
+            end_path[0],
+        )
+        protected = set(start_path).union(end_path)
+        insert_anchors = [idx for idx in oriented if idx not in protected]
+        if len(insert_anchors) < 1:
+            raise ValueError("Brush Add did not add any new interface anchors.")
+
+        merged = self._unique_ordered_indices(start_path + insert_anchors + end_path)
+        merged_part = {
+            "selected_indices": merged,
+            "is_lateral": bool(parts[start_part_idx].get("is_lateral", False) or parts[end_part_idx].get("is_lateral", False)),
+        }
+        next_parts = [
+            part
+            for idx, part in enumerate(parts)
+            if idx not in {start_part_idx, end_part_idx}
+        ]
+        insert_at = min(start_part_idx, end_part_idx, len(next_parts))
+        next_parts.insert(insert_at, merged_part)
+        self.interface_edit_draft["parts"] = next_parts
+        self.interface_edit_draft["close_loop"] = False
+        return {
+            "brush_add_mode": "replace",
+            "replacement_selection": "connect_parts",
+            "path_edited": True,
+            "path_part_count": len(next_parts),
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": len(insert_anchors),
+            "removed_anchor_count": 0,
+            "start_target_part_index": int(start_part_idx),
+            "end_target_part_index": int(end_part_idx),
+            "start_target_anchor_index": int(start_target["anchor_idx"]),
+            "end_target_anchor_index": int(end_target["anchor_idx"]),
+            "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+        }
+
+    def _add_brush_bridge_part_to_draft(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        points = np.asarray(self._require_pcd().points, dtype=float)
+
+        def endpoint_source(target: dict[str, Any]) -> int:
+            if "source_idx" in target:
+                return int(target["source_idx"])
+            part_idx = int(target["part_idx"])
+            anchor_idx = int(target.get("anchor_idx", target.get("edge_idx", 0)))
+            indices = parts[part_idx]["selected_indices"]
+            anchor_idx = max(0, min(len(indices) - 1, anchor_idx))
+            return int(indices[anchor_idx])
+
+        start_idx = endpoint_source(start_target)
+        end_idx = endpoint_source(end_target)
+        oriented = self._orient_brush_anchors_for_connection(brush_anchors, start_idx, end_idx)
+        bridge_indices = self._unique_ordered_indices([start_idx, *oriented, end_idx])
+        if len(bridge_indices) < 2:
+            raise ValueError("Brush Add did not add enough points for a bridge.")
+
+        original_anchor_count = int(sum(len(part.get("selected_indices", []) or []) for part in parts))
+        bridge_part = {
+            "selected_indices": bridge_indices,
+            "is_lateral": bool(
+                parts[int(start_target["part_idx"])].get("is_lateral", False)
+                if 0 <= int(start_target["part_idx"]) < len(parts)
+                else False
+            ),
+            "source": "brush_add",
+        }
+        self.interface_edit_draft["parts"] = [*parts, bridge_part]
+        self.interface_edit_draft["close_loop"] = False
+        return {
+            "brush_add_mode": "add_bridge",
+            "replacement_selection": "endpoint_bridge",
+            "path_edited": True,
+            "path_part_count": len(parts) + 1,
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": max(0, len(bridge_indices) - 2),
+            "removed_anchor_count": 0,
+            "preserved_anchor_count": original_anchor_count,
+            "start_target_part_index": int(start_target["part_idx"]),
+            "end_target_part_index": int(end_target["part_idx"]),
+            "start_target_source_index": int(start_idx),
+            "end_target_source_index": int(end_idx),
+            "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+        }
+
+    def _replace_brush_anchors_in_draft_part(
+        self,
+        parts: list[dict[str, Any]],
+        brush_anchors: list[int],
+        brush_selected_indices: set[int],
+        ordered_stroke_indices: list[int],
+        start_target: dict[str, Any],
+        end_target: dict[str, Any],
+        replace_direction: Literal["forward", "opposite"] | None = None,
+    ) -> dict[str, Any]:
+        part_idx = int(start_target["part_idx"])
+        target_part = parts[part_idx]
+        existing = target_part["selected_indices"]
+        closed = bool(self.interface_edit_draft.get("close_loop", True)) and len(parts) == 1
+        self._materialize_endpoint_source_anchors(target_part, len(parts), start_target, end_target)
+        existing = target_part["selected_indices"]
+        n = len(existing)
+        start_edge = self._replacement_edge_from_target_anchor(start_target, "start", n, closed)
+        end_edge = self._replacement_edge_from_target_anchor(end_target, "end", n, closed)
+        fallback_edge = start_edge
+        selection_result = self._select_brush_replacement_arc(
+            existing,
+            closed,
+            start_edge,
+            end_edge,
+            brush_selected_indices,
+            ordered_stroke_indices,
+            brush_anchors,
+            replace_direction,
+            int(start_target["anchor_idx"]) if "anchor_idx" in start_target else None,
+            int(end_target["anchor_idx"]) if "anchor_idx" in end_target else None,
+        )
+        selected_arc = selection_result.get("selected") if selection_result else None
+
+        if not selected_arc:
+            fallback_end = (fallback_edge + 1) % n if closed else fallback_edge + 1
+            fallback_oriented = self._orient_brush_anchors_for_connection(
+                brush_anchors,
+                existing[fallback_edge],
+                existing[fallback_end],
+            )
+            fallback_insert = [idx for idx in fallback_oriented if idx not in set(existing)]
+            if len(fallback_insert) < 1:
+                raise ValueError("Brush Add did not add any new interface anchors.")
+            insert_at = fallback_edge + 1
+            target_part["selected_indices"] = self._unique_ordered_indices(
+                existing[:insert_at] + fallback_insert + existing[insert_at:]
+            )
+            self.interface_edit_draft["parts"] = parts
+            diagnostics = selection_result or {"candidates": [], "fallback_reason": "no_overlapping_arc"}
+            return {
+                "brush_add_mode": "insert_fallback",
+                "replacement_selection": diagnostics.get("fallback_reason", "no_overlapping_arc"),
+                "fallback_reason": diagnostics.get("fallback_reason", "no_overlapping_arc"),
+                "path_edited": True,
+                "path_part_count": len(parts),
+                "sampled_anchor_count": len(brush_anchors),
+                "inserted_anchor_count": len(fallback_insert),
+                "removed_anchor_count": 0,
+                "target_part_index": int(part_idx),
+                "target_edge_index": int(fallback_edge),
+                "start_target_anchor_index": int(start_target["anchor_idx"]) if "anchor_idx" in start_target else None,
+                "end_target_anchor_index": int(end_target["anchor_idx"]) if "anchor_idx" in end_target else None,
+                "replacement_candidates": diagnostics.get("candidates", []),
+                "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+            }
+
+        start_edge = int(selected_arc["start_edge"])
+        end_edge = int(selected_arc["end_edge"])
+        replaced_edges = [int(edge) for edge in selected_arc["edges"]]
+
+        end_after = (end_edge + 1) % n if closed else min(end_edge + 1, n - 1)
+        oriented = self._orient_brush_anchors_for_connection(brush_anchors, existing[start_edge], existing[end_after])
+        existing_set = set(existing)
+        insert_anchors = [idx for idx in oriented if idx not in existing_set]
+        if len(insert_anchors) < 1:
+            raise ValueError("Brush Add did not add any new interface anchors.")
+
+        if not closed:
+            new_indices = existing[:start_edge + 1] + insert_anchors + existing[end_edge + 1:]
+            removed_anchor_count = max(0, end_edge - start_edge)
+        else:
+            kept_nodes = self._closed_nodes_between(existing, end_after, start_edge)
+            new_indices = kept_nodes + insert_anchors
+            removed_anchor_count = max(0, n - len(kept_nodes))
+
+        new_indices = self._unique_ordered_indices(new_indices)
+        if len(new_indices) < 2:
+            raise ValueError("Brush Add replacement would leave fewer than two interface anchors.")
+        target_part["selected_indices"] = new_indices
+        self.interface_edit_draft["parts"] = parts
+        return {
+            "brush_add_mode": "replace",
+            "replacement_selection": "overlap",
+            "path_edited": True,
+            "path_part_count": len(parts),
+            "sampled_anchor_count": len(brush_anchors),
+            "inserted_anchor_count": len(insert_anchors),
+            "removed_anchor_count": int(removed_anchor_count),
+            "target_part_index": int(part_idx),
+            "target_edge_index": int(start_edge),
+            "start_target_part_index": int(part_idx),
+            "start_target_edge_index": int(start_edge),
+            "start_target_anchor_index": int(start_target["anchor_idx"]) if "anchor_idx" in start_target else None,
+            "end_target_part_index": int(part_idx),
+            "end_target_edge_index": int(end_edge),
+            "end_target_anchor_index": int(end_target["anchor_idx"]) if "anchor_idx" in end_target else None,
+            "replaced_edge_indices": [int(edge) for edge in replaced_edges],
+            "replacement_edge_count": int(len(replaced_edges)),
+            "overlap_edge_count": int(selected_arc["overlap_edge_count"]),
+            "overlap_fraction": float(selected_arc["overlap_fraction"]),
+            "selected_overlap_count": int(selected_arc["selected_hit_count"]),
+            "near_overlap_count": int(selected_arc["near_sample_count"]),
+            "replacement_candidates": selection_result.get("candidates", []) if selection_result else [],
+            "guided_target_used": bool(start_target.get("guided") or end_target.get("guided")),
+        }
+
+    @staticmethod
+    def _split_ordered_path_by_removed(point_indices: np.ndarray, removed: set[int], closed: bool = False) -> tuple[list[list[int]], int]:
+        runs: list[list[int]] = []
+        current: list[int] = []
+        ordered = point_indices.astype(int).tolist()
+        removed_positions = [pos for pos, point_idx in enumerate(ordered) if int(point_idx) in removed]
+        if not removed_positions:
+            return [ordered] if len(dict.fromkeys(ordered)) >= 2 else [], 0
+
+        bridge_gap = max(3, min(25, len(ordered) // 100))
+        pad = max(1, min(5, len(ordered) // 500))
+        remove_mask = np.zeros(len(ordered), dtype=bool)
+        start = removed_positions[0]
+        previous = removed_positions[0]
+        for pos in removed_positions[1:]:
+            if pos - previous > bridge_gap:
+                remove_mask[max(0, start - pad):min(len(ordered), previous + pad + 1)] = True
+                start = pos
+            previous = pos
+        remove_mask[max(0, start - pad):min(len(ordered), previous + pad + 1)] = True
+
+        for pos, point_idx in enumerate(ordered):
+            if remove_mask[pos]:
+                if len(dict.fromkeys(current)) >= 2:
+                    runs.append(current)
+                current = []
+            else:
+                current.append(int(point_idx))
+        if len(dict.fromkeys(current)) >= 2:
+            runs.append(current)
+        if closed and len(runs) > 1 and ordered and not remove_mask[0] and not remove_mask[-1]:
+            runs = [runs[-1] + runs[0], *runs[1:-1]]
+        return runs, int(np.sum(remove_mask))
+
+    def _sparse_part_from_remaining_path(
+        self,
+        remaining_indices: list[int] | np.ndarray,
+        selected_indices: list[int],
+        is_lateral: bool = False,
+    ) -> dict[str, Any] | None:
+        remaining = self._unique_ordered_indices(remaining_indices)
+        if len(remaining) < 2:
+            return None
+
+        remaining_positions = {int(idx): pos for pos, idx in enumerate(remaining)}
+        preserved_controls = [
+            int(idx)
+            for idx in selected_indices
+            if int(idx) in remaining_positions
+        ]
+        preserved_controls.sort(key=lambda idx: remaining_positions[idx])
+
+        candidate_anchors = [remaining[0], *preserved_controls, remaining[-1]]
+        candidate_anchors = self._unique_ordered_indices(candidate_anchors)
+        if len(candidate_anchors) < 2:
+            candidate_anchors = [remaining[0], remaining[-1]]
+
+        anchors = self._sample_sparse_path_controls(candidate_anchors, BRUSH_REMOVE_MAX_ANCHORS)
+        if len(anchors) < 2:
+            return None
+        return {"selected_indices": anchors, "is_lateral": bool(is_lateral)}
+
+    def _rewrite_draft_paths_after_brush_remove(self, removed: set[int]) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before brushing points.")
+
+        metadata, _, _ = self._draft_effective_interface(self.interface_edit_draft)
+        new_parts: list[dict[str, Any]] = []
+        path_removed_count = 0
+        path_edited = False
+        editable_parts = [part for part in metadata.get("parts", []) or [] if part.get("source") != "brush_add"]
+        closed_single_part = bool(self.interface_edit_draft.get("close_loop", True)) and len(editable_parts) == 1
+
+        for part in metadata.get("parts", []) or []:
+            if part.get("source") == "brush_add":
+                continue
+
+            is_lateral = bool(part.get("is_lateral", False))
+            point_indices = np.asarray(part.get("point_indices", []), dtype=int)
+            selected_indices = self._unique_ordered_indices(part.get("selected_indices", []) or [])
+            touched = bool(len(point_indices)) and any(int(idx) in removed for idx in point_indices)
+
+            if not touched:
+                if len(selected_indices) >= 2:
+                    new_parts.append({"selected_indices": selected_indices, "is_lateral": is_lateral})
+                continue
+
+            path_edited = True
+            remaining_runs, removed_from_path = self._split_ordered_path_by_removed(point_indices, removed, closed_single_part)
+            path_removed_count += removed_from_path
+            for run in remaining_runs:
+                new_part = self._sparse_part_from_remaining_path(run, selected_indices, is_lateral)
+                if new_part is not None:
+                    new_parts.append(new_part)
+
+        if path_edited:
+            self.interface_edit_draft["parts"] = new_parts
+            self.interface_edit_draft["close_loop"] = False
+
+        return {
+            "path_edited": path_edited,
+            "path_removed_count": path_removed_count,
+            "path_part_count": len(new_parts),
+            "control_anchor_count": int(sum(len(part.get("selected_indices", []) or []) for part in new_parts)),
+        }
+
+    def _push_draft_history(self) -> None:
+        if not self.interface_edit_draft:
+            return
+        snapshot = deepcopy({
+            "parts": self.interface_edit_draft.get("parts", []),
+            "close_loop": self.interface_edit_draft.get("close_loop", True),
+            "include_indices": self.interface_edit_draft.get("include_indices", []),
+            "exclude_indices": self.interface_edit_draft.get("exclude_indices", []),
+        })
+        history = self.interface_edit_draft.setdefault("history", [])
+        history.append(snapshot)
+        del history[:-DRAFT_HISTORY_LIMIT]
+
+    def _draft_effective_interface(
+        self,
+        draft: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[np.ndarray], np.ndarray]:
+        pcd = self._require_pcd()
+        point_count = len(pcd.points)
+        parts = draft.get("parts", []) or []
+        if not parts:
+            raise ValueError("The interface draft has no control anchors.")
+
+        part_indices_list, lateral_flags = self._validate_interface_parts(parts)
+        metadata, dense_parts, _ = self._compute_basal_metadata(
+            part_indices_list,
+            lateral_flags,
+            bool(draft.get("close_loop", True)),
+        )
+        include = {
+            self._validate_index(idx, point_count, "draft include point")
+            for idx in draft.get("include_indices", []) or []
+        }
+        exclude = {
+            self._validate_index(idx, point_count, "draft exclude point")
+            for idx in draft.get("exclude_indices", []) or []
+        }
+        include.difference_update(exclude)
+
+        filtered_parts: list[dict[str, Any]] = []
+        filtered_dense_parts: list[np.ndarray] = []
+        effective_indices: list[int] = []
+        for part in metadata.get("parts", []) or []:
+            point_indices = np.asarray(part.get("point_indices", []), dtype=int)
+            dense_points = np.asarray(part.get("dense_points", []), dtype=float)
+            if len(point_indices) and dense_points.shape[0] == len(point_indices):
+                keep_mask = np.array([int(idx) not in exclude for idx in point_indices], dtype=bool)
+                point_indices = point_indices[keep_mask]
+                dense_points = dense_points[keep_mask]
+            else:
+                point_indices = point_indices[[int(idx) not in exclude for idx in point_indices]]
+                dense_points = np.asarray(self._require_pcd().points)[point_indices] if len(point_indices) else np.empty((0, 3))
+            if len(point_indices) == 0:
+                continue
+            filtered = deepcopy(part)
+            filtered["id"] = len(filtered_parts) + 1
+            filtered["point_indices"] = point_indices.astype(int).tolist()
+            filtered["dense_points"] = dense_points.astype(float).tolist()
+            filtered["num_points"] = int(len(point_indices))
+            filtered_parts.append(filtered)
+            filtered_dense_parts.append(dense_points)
+            effective_indices.extend(point_indices.astype(int).tolist())
+
+        if include:
+            points = np.asarray(pcd.points, dtype=float)
+            include_indices = np.asarray(sorted(include), dtype=int)
+            brush_color = list(INTERFACE_GREEN)
+            filtered_parts.append({
+                "id": len(filtered_parts) + 1,
+                "is_lateral": False,
+                "selected_indices": include_indices.astype(int).tolist(),
+                "original_points": points[include_indices].astype(float).tolist(),
+                "dense_points": points[include_indices].astype(float).tolist(),
+                "point_indices": include_indices.astype(int).tolist(),
+                "num_points": int(len(include_indices)),
+                "color": brush_color,
+                "source": "brush_add",
+            })
+            filtered_dense_parts.append(points[include_indices])
+            effective_indices.extend(include_indices.astype(int).tolist())
+
+        if not effective_indices:
+            raise ValueError("The interface draft removed every interface point.")
+
+        effective_metadata = {
+            "parts": filtered_parts,
+            "close_loop": bool(draft.get("close_loop", True)),
+            "num_parts": len(filtered_parts),
+            "has_lateral_parts": any(bool(part.get("is_lateral")) for part in filtered_parts),
+            "palette": [list(color) for color in INTERFACE_PART_COLOR_CYCLE],
+            "draft": True,
+            "include_indices": sorted(include),
+            "exclude_indices": sorted(exclude),
+        }
+        return effective_metadata, filtered_dense_parts, np.unique(np.asarray(effective_indices, dtype=int))
+
+    def _refresh_interface_draft_preview(self) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before editing it.")
+        pcd = self._require_pcd()
+        metadata, dense_parts, basal_indices = self._draft_effective_interface(self.interface_edit_draft)
+        colors = self._build_basal_color_array(metadata)
+        self.interface_preview_view_points = np.asarray(pcd.points).copy()
+        self.interface_preview_view_colors = colors
+        self.interface_preview_view_normals = self._ensure_view_normals(pcd).copy()
+        self.interface_preview_metadata = metadata
+        self.interface_preview_dense_parts = dense_parts
+        self.interface_preview_basal_points = basal_indices
+        self.interface_edit_draft["effective_indices"] = basal_indices.astype(int).tolist()
+        self.interface_edit_draft["preview_metadata"] = deepcopy(metadata)
+        self.status.interface_draft_ready = True
+        self.normals_display_ready = False
+        return {
+            "basal_point_count": int(len(basal_indices)),
+            "metadata": metadata,
+        }
+
+    def get_interface_draft(self) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            return {"draft": None, "summary": self.summary()}
+        self._refresh_interface_draft_preview()
+        return {
+            "draft": self._serialize_interface_draft(),
+            "summary": self.summary(),
+        }
+
+    def _serialize_interface_draft(self) -> dict[str, Any]:
+        draft = self.interface_edit_draft or {}
+        return {
+            "parts": deepcopy(draft.get("parts", []) or []),
+            "close_loop": bool(draft.get("close_loop", True)),
+            "include_indices": list(draft.get("include_indices", []) or []),
+            "exclude_indices": list(draft.get("exclude_indices", []) or []),
+            "effective_indices": list(draft.get("effective_indices", []) or []),
+            "metadata": deepcopy(draft.get("preview_metadata", {}) or {}),
+            "summary": self._interface_draft_summary(),
+        }
+
+    def _resampled_part_from_indices(self, indices: np.ndarray, is_lateral: bool = False) -> dict[str, Any]:
+        ordered = self._ordered_auto_interface_indices(np.asarray(indices, dtype=int))
+        anchors = self._resample_anchor_indices(ordered)
+        if len(anchors) < 2:
+            raise ValueError("The interface source is too small to create an editable draft.")
+        return {"selected_indices": anchors, "is_lateral": bool(is_lateral)}
+
+    def _draft_parts_from_metadata(self, metadata: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[int], list[int]]:
+        if not metadata:
+            return [], [], []
+        parts: list[dict[str, Any]] = []
+        include_indices = set(int(idx) for idx in metadata.get("include_indices", []) or [])
+        exclude_indices = set(int(idx) for idx in metadata.get("exclude_indices", []) or [])
+        for part in metadata.get("parts", []) or []:
+            selected = [int(idx) for idx in part.get("selected_indices", []) or []]
+            point_indices = [int(idx) for idx in part.get("point_indices", []) or []]
+            if part.get("source") == "brush_add":
+                include_indices.update(point_indices or selected)
+                continue
+            if len(dict.fromkeys(selected)) >= 2:
+                parts.append({
+                    "selected_indices": list(dict.fromkeys(selected)),
+                    "is_lateral": bool(part.get("is_lateral", False)),
+                })
+            elif len(point_indices) >= 2:
+                parts.append(self._resampled_part_from_indices(
+                    np.asarray(point_indices, dtype=int),
+                    bool(part.get("is_lateral", False)),
+                ))
+        return parts, sorted(include_indices), sorted(exclude_indices)
+
+    def create_interface_draft_from_source(self, source: Literal["auto", "manual"]) -> dict[str, Any]:
+        pcd = self._require_pcd()
+        source_name = str(source).lower()
+        source_indices: np.ndarray | None
+        draft_parts: list[dict[str, Any]]
+        include_indices: list[int] = []
+        exclude_indices: list[int] = []
+        close_loop = True
+
+        if source_name == "auto":
+            source_indices = self.auto_basal_points if self.auto_basal_points is not None else (
+                self.basal_points if self.interface_source == "auto" else None
+            )
+            draft_parts = []
+        elif source_name == "manual":
+            if not self._has_manual_interface() or self.manual_basal_points is None:
+                raise ValueError("Save a manual interface before editing the manual interface.")
+            source_indices = self.manual_basal_points
+            draft_parts, include_indices, exclude_indices = self._draft_parts_from_metadata(self.manual_basal_parts_metadata)
+            close_loop = bool((self.manual_basal_parts_metadata or {}).get("close_loop", True))
+        else:
+            raise ValueError("Interface draft source must be 'auto' or 'manual'.")
+
+        if source_indices is None or len(source_indices) < 2:
+            if source_name == "auto":
+                raise ValueError("Run regular region growing first so an automatic interface is available.")
+            raise ValueError("Save a manual interface with at least two interface points before editing it.")
+        if not draft_parts:
+            draft_parts = [self._resampled_part_from_indices(np.asarray(source_indices, dtype=int))]
+        anchor_count = sum(len(part.get("selected_indices", []) or []) for part in draft_parts)
+        self.interface_edit_draft = {
+            "source": source_name,
+            "parts": draft_parts,
+            "close_loop": close_loop,
+            "include_indices": include_indices,
+            "exclude_indices": exclude_indices,
+            "history": [],
+            "source_point_count": int(len(source_indices)),
+        }
+        colors = np.full((len(pcd.points), 3), 0.5, dtype=float)
+        colors[np.asarray(source_indices, dtype=int)] = INTERFACE_GREEN
+        self.interface_view_points = np.asarray(pcd.points).copy()
+        self.interface_view_colors = colors
+        self.interface_view_normals = self._ensure_view_normals(pcd).copy()
+        preview = self._refresh_interface_draft_preview()
+        return {
+            "draft": self._serialize_interface_draft(),
+            "source": source_name,
+            "source_point_count": int(len(source_indices)),
+            "auto_point_count": int(len(source_indices)) if source_name == "auto" else 0,
+            "anchor_count": int(anchor_count),
+            **preview,
+            "summary": self.summary(),
+        }
+
+    def create_interface_draft_from_auto(self) -> dict[str, Any]:
+        return self.create_interface_draft_from_source("auto")
+
+    def update_interface_draft_anchors(self, parts: list[dict[str, Any]], close_loop: bool) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before editing anchors.")
+        part_indices_list, _ = self._validate_interface_parts(parts)
+        normalized_parts: list[dict[str, Any]] = []
+        for idx, indices in enumerate(part_indices_list):
+            unique_indices = list(dict.fromkeys(int(point_idx) for point_idx in indices))
+            if len(unique_indices) < 2:
+                raise ValueError(f"Draft part {idx + 1} needs at least two unique anchors.")
+            normalized_parts.append({
+                "selected_indices": unique_indices,
+                "is_lateral": bool(parts[idx].get("is_lateral", False)),
+            })
+        self._push_draft_history()
+        self.interface_edit_draft["parts"] = normalized_parts
+        self.interface_edit_draft["close_loop"] = bool(close_loop)
+        preview = self._refresh_interface_draft_preview()
+        return {"draft": self._serialize_interface_draft(), **preview, "summary": self.summary()}
+
+    def brush_interface_draft(
+        self,
+        mode: Literal["add", "remove"],
+        selected_indices: list[int],
+        stroke_indices: list[int] | None = None,
+        target_part_index: int | None = None,
+        target_edge_index: int | None = None,
+        target_anchor_index: int | None = None,
+        target_source_index: int | None = None,
+        start_target_part_index: int | None = None,
+        start_target_edge_index: int | None = None,
+        start_target_anchor_index: int | None = None,
+        start_target_edge_t: float | None = None,
+        start_target_source_index: int | None = None,
+        end_target_part_index: int | None = None,
+        end_target_edge_index: int | None = None,
+        end_target_anchor_index: int | None = None,
+        end_target_edge_t: float | None = None,
+        end_target_source_index: int | None = None,
+        replace_direction: Literal["forward", "opposite"] | None = None,
+    ) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before brushing points.")
+        pcd = self._require_pcd()
+        point_count = len(pcd.points)
+        valid_indices = {
+            self._validate_index(idx, point_count, "draft brush point")
+            for idx in (selected_indices or [])
+        }
+        ordered_stroke_indices = self._valid_ordered_indices(stroke_indices or selected_indices or [], point_count, "draft brush stroke point")
+        if not valid_indices:
+            valid_indices.update(ordered_stroke_indices)
+        if not valid_indices:
+            raise ValueError("Brush selection did not include any valid visible points.")
+        previous_draft = deepcopy(self.interface_edit_draft)
+        self._push_draft_history()
+        include = set(int(idx) for idx in self.interface_edit_draft.get("include_indices", []) or [])
+        exclude = set(int(idx) for idx in self.interface_edit_draft.get("exclude_indices", []) or [])
+        path_edit_result = {
+            "path_edited": False,
+            "path_removed_count": 0,
+            "path_part_count": len(self.interface_edit_draft.get("parts", []) or []),
+            "sampled_anchor_count": 0,
+            "inserted_anchor_count": 0,
+            "removed_anchor_count": 0,
+            "control_anchor_count": int(sum(
+                len(part.get("selected_indices", []) or [])
+                for part in self.interface_edit_draft.get("parts", []) or []
+            )),
+            "guided_target_used": False,
+            "brush_add_mode": "none",
+        }
+        try:
+            if mode == "add":
+                brush_anchors = self._sample_brush_anchor_indices(ordered_stroke_indices)
+                path_edit_result = self._splice_brush_anchors_into_draft(
+                    brush_anchors,
+                    valid_indices,
+                    ordered_stroke_indices,
+                    target_part_index,
+                    target_edge_index,
+                    target_anchor_index,
+                    target_source_index,
+                    start_target_part_index,
+                    start_target_edge_index,
+                    start_target_anchor_index,
+                    start_target_edge_t,
+                    start_target_source_index,
+                    end_target_part_index,
+                    end_target_edge_index,
+                    end_target_anchor_index,
+                    end_target_edge_t,
+                    end_target_source_index,
+                    replace_direction,
+                )
+                exclude.difference_update(valid_indices)
+                exclude.difference_update(brush_anchors)
+            elif mode == "remove":
+                path_edit_result = self._rewrite_draft_paths_after_brush_remove(valid_indices)
+                exclude.update(valid_indices)
+                include.difference_update(valid_indices)
+            else:
+                raise ValueError("Brush mode must be 'add' or 'remove'.")
+            self.interface_edit_draft["include_indices"] = sorted(include)
+            self.interface_edit_draft["exclude_indices"] = sorted(exclude)
+            preview = self._refresh_interface_draft_preview()
+            draft_summary = self._interface_draft_summary() or {}
+        except Exception:
+            self.interface_edit_draft = previous_draft
+            raise
+        return {
+            "mode": mode,
+            "changed_count": int(len(valid_indices)),
+            **path_edit_result,
+            "control_anchor_count": int(draft_summary.get("anchor_count", 0)),
+            "effective_interface_count": int(draft_summary.get("effective_count", 0)),
+            "draft": self._serialize_interface_draft(),
+            **preview,
+            "summary": self.summary(),
+        }
+
+    def undo_interface_draft(self) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("No interface draft is available to undo.")
+        history = self.interface_edit_draft.get("history", [])
+        if not history:
+            raise ValueError("There are no draft edits to undo.")
+        previous = history.pop()
+        self.interface_edit_draft.update(previous)
+        self.interface_edit_draft["history"] = history
+        preview = self._refresh_interface_draft_preview()
+        return {"draft": self._serialize_interface_draft(), **preview, "summary": self.summary()}
+
+    def clear_interface_draft(self) -> dict[str, Any]:
+        self.interface_edit_draft = None
+        self.status.interface_draft_ready = False
+        self._clear_interface_preview_state()
+        self.normals_display_ready = False
+        return self.summary()
+
+    def commit_interface_draft(self) -> dict[str, Any]:
+        if not self.interface_edit_draft:
+            raise ValueError("Create an interface draft before saving it as manual interface.")
+        pcd = self._require_pcd()
+        metadata, dense_parts, basal_indices = self._draft_effective_interface(self.interface_edit_draft)
+        colors = self._build_basal_color_array(metadata)
+        self.normals_display_ready = False
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        self._snapshot_interface_view()
+        self.manual_basal_points = basal_indices.copy()
+        self.manual_dense_basal_parts = [part.copy() for part in dense_parts]
+        self.manual_dense_basal_parts_is_lateral = [bool(part.get("is_lateral")) for part in metadata.get("parts", [])]
+        self.manual_basal_parts_metadata = deepcopy(metadata)
+        self.basal_points = basal_indices.copy()
+        self.dense_basal_parts = [part.copy() for part in dense_parts]
+        self.dense_basal_parts_is_lateral = [bool(part.get("is_lateral")) for part in metadata.get("parts", [])]
+        self.basal_parts_metadata = deepcopy(metadata)
+        self.interface_source = "manual"
+        self.interface_edit_draft = None
+        self.status.interface_draft_ready = False
+        self.status.manual_interface_ready = True
+        self.status.interface_ready = True
+        self._clear_interface_preview_state()
+        return {
+            "basal_point_count": int(len(basal_indices)),
+            "metadata": metadata,
+            "summary": self.summary(),
+        }
+
     def set_interface(self, parts: list[dict[str, Any]], close_loop: bool) -> dict[str, Any]:
         pcd = self._require_pcd()
         part_indices_list, lateral_flags = self._validate_interface_parts(parts)
@@ -539,12 +2515,17 @@ class WebWorkflowSession:
         self.normals_display_ready = False
         pcd.colors = o3d.utility.Vector3dVector(colors)
         self._snapshot_interface_view()
+        self.manual_basal_points = basal_indices.copy()
+        self.manual_dense_basal_parts = [part.copy() for part in dense_parts]
+        self.manual_dense_basal_parts_is_lateral = [bool(part["is_lateral"]) for part in metadata["parts"]]
+        self.manual_basal_parts_metadata = deepcopy(metadata)
         self.basal_points = basal_indices
         self.dense_basal_parts = dense_parts
         self.dense_basal_parts_is_lateral = [bool(part["is_lateral"]) for part in metadata["parts"]]
         self.basal_parts_metadata = metadata
         self.interface_source = "manual"
         self._clear_interface_preview_state()
+        self.status.manual_interface_ready = True
         self.status.interface_ready = True
         return {
             "basal_point_count": int(len(basal_indices)),
@@ -625,12 +2606,26 @@ class WebWorkflowSession:
         return colors
 
     def _has_manual_interface(self) -> bool:
-        return self.interface_source == "manual" and bool((self.basal_parts_metadata or {}).get("parts"))
+        return (
+            self.manual_basal_points is not None
+            and len(self.manual_basal_points) > 0
+            and bool((self.manual_basal_parts_metadata or {}).get("parts"))
+        )
 
     def _manual_basal_coords_for_segmentation(self) -> np.ndarray | None:
-        if not self._has_manual_interface() or self.basal_points is None or len(self.basal_points) == 0:
+        if not self._has_manual_interface() or self.manual_basal_points is None or len(self.manual_basal_points) == 0:
             return None
-        return np.asarray(self._require_pcd().points)[self.basal_points]
+        return np.asarray(self._require_pcd().points)[self.manual_basal_points]
+
+    def _activate_manual_interface_for_segmentation(self) -> None:
+        if not self._has_manual_interface() or self.manual_basal_points is None:
+            raise ValueError("Save a manual interface before running ICRG.")
+        self.basal_points = self.manual_basal_points.copy()
+        self.dense_basal_parts = [part.copy() for part in self.manual_dense_basal_parts]
+        self.dense_basal_parts_is_lateral = list(self.manual_dense_basal_parts_is_lateral)
+        self.basal_parts_metadata = deepcopy(self.manual_basal_parts_metadata)
+        self.interface_source = "manual"
+        self.status.interface_ready = True
 
     def _active_basal_export_data(self) -> dict[str, Any] | np.ndarray | None:
         if bool((self.basal_parts_metadata or {}).get("parts")):
@@ -659,7 +2654,7 @@ class WebWorkflowSession:
         basal_mask = np.asarray(self.detect_basal_points_optimized(points, self.segmented_labels), dtype=bool)
         basal_indices = np.flatnonzero(basal_mask)
         if len(basal_indices):
-            colors[basal_indices] = np.asarray([0.0, 1.0, 0.0], dtype=float)
+            colors[basal_indices] = np.asarray(INTERFACE_GREEN, dtype=float)
             pcd.colors = o3d.utility.Vector3dVector(colors)
             self.interface_view_points = points.copy()
             self.interface_view_colors = colors.copy()
@@ -668,6 +2663,7 @@ class WebWorkflowSession:
                 self.segmented_pcd.colors = o3d.utility.Vector3dVector(colors)
 
         self.basal_points = basal_indices.astype(int)
+        self.auto_basal_points = self.basal_points.copy()
         self.dense_basal_parts = []
         self.dense_basal_parts_is_lateral = []
         self.basal_parts_metadata = {
@@ -677,11 +2673,21 @@ class WebWorkflowSession:
             "has_lateral_parts": False,
             "palette": [],
         }
+        self.auto_basal_parts_metadata = deepcopy(self.basal_parts_metadata)
         self.interface_source = "auto"
         self.status.interface_ready = bool(len(basal_indices))
+        self.status.auto_interface_ready = bool(len(basal_indices))
+        self.interface_edit_draft = None
+        self.status.interface_draft_ready = False
         return self.basal_points
 
     def segment(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._run_segmentation(params, use_manual_interface=False)
+
+    def segment_icrg(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._run_segmentation(params, use_manual_interface=True)
+
+    def _run_segmentation(self, params: dict[str, Any] | None = None, *, use_manual_interface: bool) -> dict[str, Any]:
         pcd = self._require_pcd()
         if not self.rock_seeds or not self.pedestal_seeds:
             raise ValueError("Seed selection is required before segmentation.")
@@ -693,8 +2699,15 @@ class WebWorkflowSession:
         neighbor_count = int(params.get("neighbor_count", _deep_get(self.config, "region_growing.neighbor_count", 50)))
         distance_threshold = float(params.get("distance_threshold", _deep_get(self.config, "region_growing.distance_threshold", 0.05)))
 
-        basal_coords = self._manual_basal_coords_for_segmentation()
+        if use_manual_interface:
+            basal_coords = self._manual_basal_coords_for_segmentation()
+            if basal_coords is None:
+                raise ValueError("Save a manual interface before running ICRG.")
+            self._activate_manual_interface_for_segmentation()
+        else:
+            basal_coords = None
         used_manual_interface_constraint = basal_coords is not None
+        segmentation_mode: Literal["rg", "icrg"] = "icrg" if used_manual_interface_constraint else "rg"
 
         self.segmenter = RegionGrowingSegmentation(
             pcd,
@@ -721,8 +2734,19 @@ class WebWorkflowSession:
         self.segmented_pcd = colored_pcd
         self.segmented_labels = labels
         self.status.segmentation_ready = True
+        self.status.last_segmentation_mode = segmentation_mode
+        self.status.mesh_prepared = False
+        self.status.mesh_completed = False
+        self.status.analysis_completed = False
+        self.prepared_mesh_data = None
+        self.normals_display_ready = False
+        self.noise_removal_history = []
+        self.mesh_processor.reconstructed_mesh = None
+        self.mesh_processor.temp_mesh_path = None
+        self.mesh_path = None
+        self.analysis_csv_path = None
         auto_interface_indices = np.asarray([], dtype=int)
-        if not self._has_manual_interface():
+        if not used_manual_interface_constraint:
             auto_interface_indices = self._set_automatic_interface_from_segmentation()
 
         self.segmented_pcd_file_path = self.file_handler.save_point_cloud(
@@ -738,6 +2762,7 @@ class WebWorkflowSession:
                 "rock": int(np.sum(labels == 1)),
             },
             "used_manual_interface_constraint": used_manual_interface_constraint,
+            "segmentation_mode": segmentation_mode,
             "auto_interface_generated": bool(len(auto_interface_indices)),
             "auto_interface_point_count": int(len(auto_interface_indices)),
             "download": self.segmented_pcd_file_path,
@@ -748,7 +2773,9 @@ class WebWorkflowSession:
         if self.segmented_pcd is None or self.segmented_labels is None:
             raise ValueError("Run segmentation before preparing the mesh.")
         pcd = self._require_pcd()
-        if self.basal_points is None or len(self.basal_points) == 0:
+        if self.status.last_segmentation_mode == "icrg":
+            self._activate_manual_interface_for_segmentation()
+        elif self.interface_source == "manual" or self.basal_points is None or len(self.basal_points) == 0:
             self._set_automatic_interface_from_segmentation()
 
         result = self.mesh_processor.prepare_bottom_face(

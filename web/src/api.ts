@@ -1,11 +1,15 @@
 export type WorkflowStatus = {
   point_cloud_loaded: boolean;
   seeds_ready: boolean;
+  manual_interface_ready: boolean;
+  auto_interface_ready: boolean;
+  interface_draft_ready: boolean;
   interface_ready: boolean;
   segmentation_ready: boolean;
   mesh_prepared: boolean;
   mesh_completed: boolean;
   analysis_completed: boolean;
+  last_segmentation_mode?: "rg" | "icrg" | null;
 };
 
 export type SessionSummary = {
@@ -15,6 +19,11 @@ export type SessionSummary = {
   epsg_code: number | null;
   point_count: number;
   interface_source?: "manual" | "auto" | null;
+  manual_interface_ready?: boolean;
+  auto_interface_ready?: boolean;
+  interface_draft_ready?: boolean;
+  last_segmentation_mode?: "rg" | "icrg" | null;
+  interface_draft?: InterfaceDraftSummary | null;
   seeds: {
     rock: number[];
     pedestal: number[];
@@ -122,6 +131,34 @@ export type InterfaceRequest = {
   close_loop: boolean;
 };
 
+export type InterfaceDraftSummary = {
+  part_count: number;
+  anchor_count: number;
+  include_count: number;
+  exclude_count: number;
+  effective_count: number;
+  can_undo: boolean;
+  close_loop: boolean;
+};
+
+export type InterfaceDraft = {
+  parts: InterfacePartRequest[];
+  close_loop: boolean;
+  include_indices: number[];
+  exclude_indices: number[];
+  effective_indices: number[];
+  metadata?: unknown;
+  summary?: InterfaceDraftSummary | null;
+};
+
+export type InterfaceDraftResponse = {
+  draft: InterfaceDraft | null;
+  summary?: SessionSummary;
+  basal_point_count?: number;
+  auto_point_count?: number;
+  anchor_count?: number;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -182,6 +219,47 @@ export async function saveInterfaceConstraints(sessionId: string, body: Interfac
 
 export async function clearInterfacePreview(sessionId: string): Promise<JobResponse> {
   return runJob(`/api/sessions/${sessionId}/interface/preview/clear`);
+}
+
+export async function createInterfaceDraftFromAuto(sessionId: string): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/from-auto`);
+}
+
+export async function createInterfaceDraftFromSource(sessionId: string, source: "auto" | "manual"): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/from-source`, { source });
+}
+
+export async function getInterfaceDraft(sessionId: string): Promise<InterfaceDraftResponse> {
+  return request<InterfaceDraftResponse>(`/api/sessions/${sessionId}/interface/draft?t=${Date.now()}`);
+}
+
+export async function updateInterfaceDraftAnchors(sessionId: string, body: InterfaceRequest): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/anchors`, body);
+}
+
+export async function brushInterfaceDraft(
+  sessionId: string,
+  mode: "add" | "remove",
+  selectedIndices: number[],
+  strokeIndices: number[] = []
+): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/brush`, {
+    mode,
+    selected_indices: selectedIndices,
+    stroke_indices: strokeIndices
+  });
+}
+
+export async function undoInterfaceDraft(sessionId: string): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/undo`);
+}
+
+export async function clearInterfaceDraft(sessionId: string): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/clear`);
+}
+
+export async function commitInterfaceDraft(sessionId: string): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/interface/draft/commit`);
 }
 
 export async function manualRemovePreparedPoints(sessionId: string, selectedIndices: number[]): Promise<JobResponse> {

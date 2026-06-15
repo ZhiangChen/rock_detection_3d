@@ -26,14 +26,20 @@ import {
   Triangle
 } from "lucide-react";
 import {
+  clearInterfaceDraft as clearInterfaceDraftApi,
   createSession,
+  createInterfaceDraftFromSource,
+  commitInterfaceDraft,
   downloadUrl,
+  getInterfaceDraft,
   getJob,
   getSession,
   getViewer,
   runJob,
+  undoInterfaceDraft,
   uploadPointCloud,
   type DenoiseParams,
+  type InterfaceDraft,
   type JobResponse,
   type SegmentParams,
   type SessionSummary,
@@ -102,7 +108,7 @@ const viewHelp: Record<ViewName, string> = {
   raw: "Show the uploaded point cloud with its original colors before seed or interface edits.",
   seeds: "Show the seed-selection state, including saved rock and support seed markers.",
   interface: "Show the previewed or saved interface constraints near the contact.",
-  segmented: "Show the latest rock/support labels after running interface-constrained region growing.",
+  segmented: "Show the latest rock/support labels after running region growing or ICRG.",
   mesh_prepared: "Show the prepared point set used for normal estimation and mesh reconstruction.",
   mesh: "Show mesh status after reconstruction; download the PLY from the Downloads panel."
 };
@@ -116,8 +122,14 @@ const buttonHelp = {
   stagePart: "Store the current interface picks as one contact segment so you can pick another segment.",
   interpolateInterface: "Preview the dense interface path before saving it for segmentation.",
   saveInterface: "Finalize the interpolated interface constraints for region growing.",
+  editAutoInterface: "Edit an automatic or saved manual interface as a sparse draft for ICRG.",
+  previewDraft: "Refresh the dense preview from the current draft anchors.",
+  undoDraft: "Undo the most recent draft edit.",
+  clearDraft: "Discard the editable draft without changing the saved manual interface.",
+  saveDraftManual: "Commit this refined draft as the manual interface used by Run ICRG.",
   clearParts: "Remove staged interface parts and current interface picks.",
-  runSegment: "Segment rock and support using saved seeds, interface constraints, and the current parameter values.",
+  runSegment: "Segment from seeds without using interface constraints.",
+  runICRG: "Run interface-constrained region growing using the saved manual interface.",
   prepareMesh: "Create the prepared rock point set used for normals, reconstruction, and analysis.",
   removeNoise: "Run the selected denoise method: SOR, DBSCAN, or SOR followed by DBSCAN.",
   undoNoise: "Restore the prepared mesh point cloud to the state before the last denoise step.",
@@ -308,6 +320,11 @@ export default function App() {
   const [interfaceWindowOpen, setInterfaceWindowOpen] = useState(false);
   const [interfaceWindowPosition, setInterfaceWindowPosition] = useState<{ left: number; top: number } | null>(null);
   const interfaceWindowDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
+  const [interfaceSourceChooserOpen, setInterfaceSourceChooserOpen] = useState(false);
+  const [interfaceEditorOpen, setInterfaceEditorOpen] = useState(false);
+  const [interfaceDraft, setInterfaceDraft] = useState<InterfaceDraft | null>(null);
+  const [interfaceEditorWindowPosition, setInterfaceEditorWindowPosition] = useState<{ left: number; top: number } | null>(null);
+  const interfaceEditorWindowDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
   const [manualRemovalOpen, setManualRemovalOpen] = useState(false);
   const [manualRemovalDrawing, setManualRemovalDrawing] = useState(false);
   const [manualRemovalPolygon, setManualRemovalPolygon] = useState<ScreenPoint[]>([]);
@@ -435,6 +452,30 @@ export default function App() {
     }
   }
 
+  async function saveSeedsNow() {
+    if (!session?.status.point_cloud_loaded) {
+      return true;
+    }
+    const payload = {
+      rock_seed_indices: rockSeeds,
+      pedestal_seed_indices: pedestalSeeds
+    };
+    const signature = JSON.stringify(payload);
+    if (signature === seedAutosaveSignatureRef.current) {
+      return true;
+    }
+    try {
+      const submitted = await runJob(`/api/sessions/${session.session_id}/seeds/manual`, payload);
+      const job = await pollJob(submitted.job_id);
+      seedAutosaveSignatureRef.current = signature;
+      await refreshSession(extractSummary(job) ?? undefined);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? `Could not save seeds automatically: ${caught.message}` : String(caught));
+      return false;
+    }
+  }
+
   useEffect(() => {
     if (!session?.status.point_cloud_loaded) {
       return undefined;
@@ -483,6 +524,9 @@ export default function App() {
       setPedestalSeeds([]);
       setInterfaceParts([]);
       setInterfacePoints([]);
+      setInterfaceDraft(null);
+      setInterfaceEditorOpen(false);
+      setInterfaceSourceChooserOpen(false);
       setCurrentPartLateral(false);
       clearManualRemoval();
       await refreshView("raw", summary);
@@ -585,6 +629,49 @@ export default function App() {
     }
   }
 
+  function beginInterfaceEditorWindowDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) {
+      return;
+    }
+    if ((event.target as HTMLElement).closest("button")) {
+      return;
+    }
+    const panel = event.currentTarget.closest(".floating-window") as HTMLElement | null;
+    if (!panel) {
+      return;
+    }
+    const rect = panel.getBoundingClientRect();
+    interfaceEditorWindowDragRef.current = {
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function dragInterfaceEditorWindow(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = interfaceEditorWindowDragRef.current;
+    if (!drag) {
+      return;
+    }
+    const panel = event.currentTarget.closest(".floating-window") as HTMLElement | null;
+    const rect = panel?.getBoundingClientRect();
+    const width = rect?.width ?? 390;
+    const height = rect?.height ?? 280;
+    const margin = 8;
+    setInterfaceEditorWindowPosition({
+      left: clamp(event.clientX - drag.offsetX, margin, Math.max(margin, window.innerWidth - width - margin)),
+      top: clamp(event.clientY - drag.offsetY, margin, Math.max(margin, window.innerHeight - height - margin))
+    });
+  }
+
+  function endInterfaceEditorWindowDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    interfaceEditorWindowDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
   function stageInterfacePart() {
     if (interfacePoints.length < 2) {
       setError("Interface parts need at least two points.");
@@ -655,6 +742,133 @@ export default function App() {
       undefined,
       activeView === "interface" ? "interface" : undefined
     );
+  }
+
+  async function openInterfaceEditor() {
+    const hasAuto = Boolean(session?.status.auto_interface_ready);
+    const hasManual = Boolean(session?.status.manual_interface_ready);
+    if (!hasAuto && !hasManual) {
+      setError("Run regular region growing or save a manual interface before editing.");
+      return;
+    }
+    if (hasAuto && hasManual) {
+      setInterfaceSourceChooserOpen(true);
+      return;
+    }
+    await openInterfaceEditorForSource(hasManual ? "manual" : "auto");
+  }
+
+  async function openInterfaceEditorForSource(source: "auto" | "manual") {
+    if (!session) {
+      return;
+    }
+    setInterfaceSourceChooserOpen(false);
+    setBusyLabel("Creating interface draft");
+    setError(null);
+    try {
+      const submitted = await createInterfaceDraftFromSource(session.session_id, source);
+      const job = await pollJob(submitted.job_id);
+      const summary = await refreshSession(extractSummary(job) ?? undefined);
+      const result = job.result as { draft?: InterfaceDraft } | undefined;
+      if (result?.draft) {
+        setInterfaceDraft(result.draft);
+      } else {
+        const draftResponse = await getInterfaceDraft(session.session_id);
+        setInterfaceDraft(draftResponse.draft);
+      }
+      setInterfaceEditorOpen(true);
+      if (summary) {
+        await refreshView("interface", summary);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
+  }
+
+  async function previewInterfaceDraft() {
+    if (!session || !interfaceDraft) {
+      return;
+    }
+    const job = await runWorkflowAction(
+      "Previewing interface draft",
+      `/api/sessions/${session.session_id}/interface/draft/anchors`,
+      { parts: interfaceDraft.parts, close_loop: interfaceDraft.close_loop },
+      "interface"
+    );
+    const result = job?.result as { draft?: InterfaceDraft } | undefined;
+    if (result?.draft) {
+      setInterfaceDraft(result.draft);
+    } else if (job) {
+      const draftResponse = await getInterfaceDraft(session.session_id);
+      setInterfaceDraft(draftResponse.draft);
+    }
+  }
+
+  async function undoInterfaceDraftEdit() {
+    if (!session || !interfaceDraft) {
+      return;
+    }
+    setBusyLabel("Undoing interface edit");
+    setError(null);
+    try {
+      const submitted = await undoInterfaceDraft(session.session_id);
+      const job = await pollJob(submitted.job_id);
+      const summary = await refreshSession(extractSummary(job) ?? undefined);
+      const result = job.result as { draft?: InterfaceDraft } | undefined;
+      setInterfaceDraft(result?.draft ?? (await getInterfaceDraft(session.session_id)).draft);
+      if (summary) {
+        await refreshView("interface", summary);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
+  }
+
+  async function discardInterfaceDraft() {
+    if (!session || !interfaceDraft) {
+      return;
+    }
+    setBusyLabel("Clearing interface draft");
+    setError(null);
+    try {
+      const submitted = await clearInterfaceDraftApi(session.session_id);
+      const job = await pollJob(submitted.job_id);
+      const summary = await refreshSession(extractSummary(job) ?? undefined);
+      setInterfaceDraft(null);
+      if (summary) {
+        await refreshView("interface", summary);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
+  }
+
+  async function saveDraftAsManualInterface() {
+    if (!session || !interfaceDraft) {
+      return;
+    }
+    setBusyLabel("Saving draft as manual interface");
+    setError(null);
+    try {
+      const submitted = await commitInterfaceDraft(session.session_id);
+      const job = await pollJob(submitted.job_id);
+      const summary = await refreshSession(extractSummary(job) ?? undefined);
+      setInterfaceDraft(null);
+      setInterfaceEditorOpen(false);
+      if (summary) {
+        await refreshView("interface", summary);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
   }
 
   function clearManualRemoval() {
@@ -740,6 +954,9 @@ export default function App() {
     : undefined;
   const manualRemovalWindowStyle: CSSProperties | undefined = manualRemovalWindowPosition
     ? { left: manualRemovalWindowPosition.left, top: manualRemovalWindowPosition.top, right: "auto" }
+    : undefined;
+  const interfaceEditorWindowStyle: CSSProperties | undefined = interfaceEditorWindowPosition
+    ? { left: interfaceEditorWindowPosition.left, top: interfaceEditorWindowPosition.top, right: "auto" }
     : undefined;
 
   return (
@@ -834,6 +1051,7 @@ export default function App() {
           onPickPoint={handlePickPoint}
           onUnpickPoint={handleUnpickPoint}
           pickedIndices={selectedForMode}
+          pickedColor={pickMode === "interface" ? 0x00ff00 : undefined}
           pointSize={pointSize}
           normalDisplayScale={normalDisplayScale}
           manualRemoval={{
@@ -967,8 +1185,11 @@ export default function App() {
             disabled={!session?.status.seeds_ready}
             help={buttonHelp.runSegment}
             disabledHelp="Pick at least one rock seed and one pedestal seed first."
-            onClick={() =>
-              runWorkflowAction(
+            onClick={async () => {
+              if (!(await saveSeedsNow())) {
+                return;
+              }
+              await runWorkflowAction(
                 "Segmenting",
                 `/api/sessions/${session?.session_id}/segment`,
                 segmentParams,
@@ -976,10 +1197,33 @@ export default function App() {
                   const payload = result as { auto_interface_generated?: boolean } | undefined;
                   return payload?.auto_interface_generated ? "interface" : "segmented";
                 }
-              )
-            }
+              );
+            }}
           >
             <Play size={16} /> Run Region Growing
+          </ActionButton>
+          <ActionButton
+            className="wide"
+            disabled={!session?.status.seeds_ready || !session?.status.manual_interface_ready}
+            help={buttonHelp.runICRG}
+            disabledHelp={
+              !session?.status.seeds_ready
+                ? "Pick at least one rock seed and one pedestal seed first."
+                : "Save a manual interface first."
+            }
+            onClick={async () => {
+              if (!(await saveSeedsNow())) {
+                return;
+              }
+              await runWorkflowAction(
+                "Running ICRG",
+                `/api/sessions/${session?.session_id}/segment/icrg`,
+                segmentParams,
+                "segmented"
+              );
+            }}
+          >
+            <Play size={16} /> Run ICRG
           </ActionButton>
         </section>
 
@@ -1213,12 +1457,77 @@ export default function App() {
             <ActionButton className="wide" disabled={!session?.status.point_cloud_loaded} help={buttonHelp.saveInterface} disabledHelp="Upload a point cloud first." onClick={saveInterface}>
               <Save size={16} /> Save Interface
             </ActionButton>
+            <ActionButton
+              className="wide"
+              disabled={!session?.status.auto_interface_ready && !session?.status.manual_interface_ready}
+              help={buttonHelp.editAutoInterface}
+              disabledHelp="Run regular region growing or save a manual interface first."
+              onClick={openInterfaceEditor}
+            >
+              <Sparkles size={16} /> Edit Interface
+            </ActionButton>
+            {interfaceSourceChooserOpen && (
+              <div className="source-choice">
+                <div className="button-row">
+                  <ActionButton help="Create an editable draft from the latest automatic interface." onClick={() => openInterfaceEditorForSource("auto")}>
+                    Edit Auto Interface
+                  </ActionButton>
+                  <ActionButton help="Create an editable draft from the saved manual interface." onClick={() => openInterfaceEditorForSource("manual")}>
+                    Edit Manual Interface
+                  </ActionButton>
+                </div>
+                <ActionButton className="link-button" help="Close the source chooser." onClick={() => setInterfaceSourceChooserOpen(false)}>
+                  Cancel
+                </ActionButton>
+              </div>
+            )}
             <div className="selection-readout">
               <span>Parts {interfaceParts.length}</span>
               <ActionButton className="link-button" help={buttonHelp.clearParts} onClick={clearInterfaceParts}>
                 Clear
               </ActionButton>
             </div>
+          </div>
+        </div>
+      )}
+
+      {interfaceEditorOpen && (
+        <div className="floating-window interface-editor-window" role="dialog" aria-labelledby="interfaceEditorWindowTitle" style={interfaceEditorWindowStyle}>
+          <div
+            className="floating-window-header"
+            onPointerDown={beginInterfaceEditorWindowDrag}
+            onPointerMove={dragInterfaceEditorWindow}
+            onPointerUp={endInterfaceEditorWindowDrag}
+            onPointerCancel={endInterfaceEditorWindowDrag}
+          >
+            <h2 id="interfaceEditorWindowTitle">Hybrid Interface Editor</h2>
+            <button className="floating-window-close" type="button" aria-label="Close interface editor window" onClick={() => setInterfaceEditorOpen(false)}>
+              x
+            </button>
+          </div>
+          <div className="floating-window-body">
+            <p className="tool-note">Refine the automatic interface draft, then save it as the manual interface for ICRG.</p>
+            <div className="selection-readout">
+              <span>{interfaceDraft?.summary?.anchor_count ?? 0} anchors</span>
+              <span>{interfaceDraft?.summary?.effective_count ?? 0} interface points</span>
+            </div>
+            <div className="button-row">
+              <ActionButton disabled={!interfaceDraft?.summary?.can_undo} help={buttonHelp.undoDraft} disabledHelp="There are no draft edits to undo." onClick={undoInterfaceDraftEdit}>
+                Undo Edit
+              </ActionButton>
+              <ActionButton disabled={!interfaceDraft} help={buttonHelp.clearDraft} disabledHelp="No draft is active." onClick={discardInterfaceDraft}>
+                Clear Draft
+              </ActionButton>
+            </div>
+            <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.previewDraft} disabledHelp="Create a draft first." onClick={previewInterfaceDraft}>
+              Preview
+            </ActionButton>
+            <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.saveDraftManual} disabledHelp="Create a draft first." onClick={saveDraftAsManualInterface}>
+              <Save size={16} /> Save as Manual Interface
+            </ActionButton>
+            <ActionButton className="wide" help="Close the editor window while leaving the draft available in the session." onClick={() => setInterfaceEditorOpen(false)}>
+              Close
+            </ActionButton>
           </div>
         </div>
       )}

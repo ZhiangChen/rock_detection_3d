@@ -25,6 +25,7 @@ type PointCloudViewerProps = {
   onPickPoint: (index: number) => void;
   onUnpickPoint: (index: number) => void;
   pickedIndices: number[];
+  pickedColor?: number;
   pointSize: number;
   normalDisplayScale: number;
   manualRemoval?: ManualRemovalState;
@@ -295,7 +296,7 @@ function makeMeshGeometry(view: ViewerPayload) {
   return geometry;
 }
 
-export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndices, pointSize, normalDisplayScale, manualRemoval }: PointCloudViewerProps) {
+export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndices, pickedColor, pointSize, normalDisplayScale, manualRemoval }: PointCloudViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onPickRef = useRef(onPickPoint);
   const onUnpickRef = useRef(onUnpickPoint);
@@ -392,7 +393,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
       if (box.isEmpty()) {
         box.setFromArray(Array.from(geometry.getAttribute("position").array));
       }
-      addPickedMarkers(localGroup, view, pickedIndices);
+      addPickedMarkers(localGroup, view, pickedIndices, pickedColor);
       if (manualRemoval?.active) {
         addPickedMarkers(localGroup, view, manualRemoval.selectedIndices, 0xffd43b);
       }
@@ -807,6 +808,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     view,
     pointSize,
     pickedIndices,
+    pickedColor,
     normalDisplayScale,
     manualRemoval?.active,
     manualRemoval?.drawing,

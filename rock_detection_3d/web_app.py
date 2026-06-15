@@ -29,7 +29,7 @@ RUNS_DIR = REPO_ROOT / "web_runs"
 WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
 WEB_STATIC_DIR = MODULE_DIR / "web_static"
 ALLOWED_POINT_CLOUD_SUFFIXES = {".las", ".laz"}
-APP_BUILD = "20260613-trackball1"
+APP_BUILD = "20260614-interface-editor1"
 
 
 class ManualSeedsRequest(BaseModel):
@@ -45,6 +45,31 @@ class InterfacePart(BaseModel):
 class InterfaceRequest(BaseModel):
     parts: list[InterfacePart]
     close_loop: bool = True
+
+
+class DraftBrushRequest(BaseModel):
+    mode: Literal["add", "remove"]
+    selected_indices: list[int] = Field(default_factory=list)
+    stroke_indices: list[int] = Field(default_factory=list)
+    target_part_index: int | None = None
+    target_edge_index: int | None = None
+    target_anchor_index: int | None = None
+    target_source_index: int | None = None
+    start_target_part_index: int | None = None
+    start_target_edge_index: int | None = None
+    start_target_anchor_index: int | None = None
+    start_target_edge_t: float | None = None
+    start_target_source_index: int | None = None
+    end_target_part_index: int | None = None
+    end_target_edge_index: int | None = None
+    end_target_anchor_index: int | None = None
+    end_target_edge_t: float | None = None
+    end_target_source_index: int | None = None
+    replace_direction: Literal["forward", "opposite"] | None = None
+
+
+class InterfaceDraftSourceRequest(BaseModel):
+    source: Literal["auto", "manual"]
 
 
 class SegmentRequest(BaseModel):
@@ -287,10 +312,109 @@ def clear_interface_preview(session_id: str) -> dict[str, str]:
     )
 
 
+@app.post("/api/sessions/{session_id}/interface/draft/from-auto")
+def create_interface_draft_from_auto(session_id: str) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "create_interface_draft_from_auto",
+        lambda workflow: workflow.create_interface_draft_from_auto(),
+    )
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/from-source")
+def create_interface_draft_from_source(session_id: str, request: InterfaceDraftSourceRequest) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "create_interface_draft_from_source",
+        lambda workflow: workflow.create_interface_draft_from_source(request.source),
+    )
+
+
+@app.get("/api/sessions/{session_id}/interface/draft")
+def get_interface_draft(session_id: str) -> dict[str, Any]:
+    record = _get_session(session_id)
+    try:
+        with record.lock:
+            return record.workflow.get_interface_draft()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/anchors")
+def update_interface_draft_anchors(session_id: str, request: InterfaceRequest) -> dict[str, str]:
+    parts = [part.model_dump() for part in request.parts]
+    return _submit_job(
+        session_id,
+        "update_interface_draft_anchors",
+        lambda workflow: workflow.update_interface_draft_anchors(parts, request.close_loop),
+    )
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/brush")
+def brush_interface_draft(session_id: str, request: DraftBrushRequest) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "brush_interface_draft",
+        lambda workflow: workflow.brush_interface_draft(
+            request.mode,
+            request.selected_indices,
+            request.stroke_indices,
+            request.target_part_index,
+            request.target_edge_index,
+            request.target_anchor_index,
+            request.target_source_index,
+            request.start_target_part_index,
+            request.start_target_edge_index,
+            request.start_target_anchor_index,
+            request.start_target_edge_t,
+            request.start_target_source_index,
+            request.end_target_part_index,
+            request.end_target_edge_index,
+            request.end_target_anchor_index,
+            request.end_target_edge_t,
+            request.end_target_source_index,
+            request.replace_direction,
+        ),
+    )
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/undo")
+def undo_interface_draft(session_id: str) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "undo_interface_draft",
+        lambda workflow: workflow.undo_interface_draft(),
+    )
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/clear")
+def clear_interface_draft(session_id: str) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "clear_interface_draft",
+        lambda workflow: workflow.clear_interface_draft(),
+    )
+
+
+@app.post("/api/sessions/{session_id}/interface/draft/commit")
+def commit_interface_draft(session_id: str) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "commit_interface_draft",
+        lambda workflow: workflow.commit_interface_draft(),
+    )
+
+
 @app.post("/api/sessions/{session_id}/segment")
 def segment(session_id: str, request: SegmentRequest) -> dict[str, str]:
     params = {key: value for key, value in request.model_dump().items() if value is not None}
     return _submit_job(session_id, "segment", lambda workflow: workflow.segment(params))
+
+
+@app.post("/api/sessions/{session_id}/segment/icrg")
+def segment_icrg(session_id: str, request: SegmentRequest) -> dict[str, str]:
+    params = {key: value for key, value in request.model_dump().items() if value is not None}
+    return _submit_job(session_id, "segment_icrg", lambda workflow: workflow.segment_icrg(params))
 
 
 @app.post("/api/sessions/{session_id}/mesh/prepare")
