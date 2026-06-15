@@ -1,4 +1,4 @@
-const REQUIRED_RUNTIME_BUILD = "20260614-interface-editor1";
+const REQUIRED_RUNTIME_BUILD = "20260615-interface-width1";
 
 const state = {
   session: null,
@@ -10,7 +10,7 @@ const state = {
   pedestalSeeds: [],
   interfacePoints: [],
   interfaceParts: [],
-  rotationX: -0.72,
+  rotationX: 0.72,
   rotationY: 0.62,
   rotationMatrix: null,
   trackballVector: null,
@@ -72,8 +72,6 @@ const state = {
   manualRemovalDrawMode: false,
   manualRemovalPolygon: [],
   manualRemovalSelected: [],
-  interfaceEditorWindowDragging: false,
-  interfaceEditorWindowDragOffset: null,
   interfaceEditorOpen: false,
   interfaceEditorMode: "anchors",
   interfaceEditorStroke: [],
@@ -108,12 +106,12 @@ function initElements() {
     "rockCount", "pedestalCount", "interfaceCount", "partsCount", "pointSize", "pickRock", "pickPedestal",
     "pickInterface", "autoSeeds", "clearCurrentPick",
     "interfaceWindow", "interfaceWindowHandle", "closeInterfaceWindow", "partLateral", "closeLoop", "stagePart",
-    "interpolateInterface", "saveInterface", "editAutoInterface", "interfaceSourceChooser",
-    "editAutoDraft", "editManualDraft", "cancelInterfaceSource", "clearParts",
-    "interfaceEditorOverlay", "interfaceEditorWindow", "interfaceEditorWindowHandle", "closeInterfaceEditorWindow",
+    "interpolateInterface", "saveInterface", "interfaceSourceChooser",
+    "editAutoDraft", "editManualDraft", "clearParts",
+    "interfaceEditorOverlay", "interfaceEditorWindow",
     "editorAnchorMode", "editorBrushAddMode", "editorBrushRemoveMode", "editorUndo",
-    "editorSaveManual", "editorClose", "editorReadout", "editorBrushRadius", "editorBrushRadiusValue",
-    "editorShowOrder",
+    "editorSaveManual", "editorReadout", "editorBrushSettings", "editorBrushRadius", "editorBrushRadiusValue",
+    "editorOrderRow", "editorShowOrder",
     "smoothness", "curvature", "proximity", "voxel",
     "neighbors", "distance", "runSegment", "runICRG", "prepareMesh", "removeNoise", "undoNoise",
     "manualRemoval", "manualRemovalOverlay", "manualRemovalWindow", "manualRemovalWindowHandle",
@@ -330,9 +328,6 @@ function updateStatus() {
   }
   if (el.manualRemoval) {
     el.manualRemoval.disabled = !status.mesh_prepared;
-  }
-  if (el.editAutoInterface) {
-    el.editAutoInterface.disabled = !status.auto_interface_ready && !status.manual_interface_ready;
   }
   updateManualRemovalUI({ redraw: false });
   updateInterfaceEditorUI({ redraw: false });
@@ -2077,22 +2072,57 @@ function interfaceEditorBrushReplacementLabel() {
   return `Redraw overlapped local section in Part ${start.partIndex + 1}`;
 }
 
+function interfaceDraftSegmentInfo() {
+  const draft = state.interfaceDraft;
+  if (!draft) {
+    return {
+      segmentCount: 0,
+      closeLabel: "open path",
+      pointCounts: [],
+      pointsText: "No segments"
+    };
+  }
+  const metadata = draft.metadata || {};
+  const metadataParts = Array.isArray(metadata.parts) ? metadata.parts : [];
+  const fallbackParts = Array.isArray(draft.parts) ? draft.parts : [];
+  const parts = metadataParts.length ? metadataParts : fallbackParts;
+  const pointCounts = parts.map((part) => {
+    if (Number.isFinite(part?.num_points)) {
+      return Number(part.num_points);
+    }
+    if (Array.isArray(part?.point_indices)) {
+      return part.point_indices.length;
+    }
+    if (Array.isArray(part?.dense_points)) {
+      return part.dense_points.length;
+    }
+    if (Array.isArray(part?.selected_indices)) {
+      return part.selected_indices.length;
+    }
+    return 0;
+  });
+  const segmentCount = pointCounts.length;
+  const closeLoop = Boolean(typeof metadata.close_loop === "boolean" ? metadata.close_loop : draft.close_loop);
+  const closeLabel = closeLoop ? "closed loop" : "open path";
+  const countLabel = segmentCount === 1 ? "1 segment" : `${segmentCount.toLocaleString()} segments`;
+  const pointText = pointCounts.length
+    ? pointCounts.map((count, index) => `S${index + 1}: ${count.toLocaleString()} pts`).join(" | ")
+    : "No segments";
+  return {
+    segmentCount,
+    closeLabel,
+    pointCounts,
+    pointsText: `Points per segment: ${pointText}`
+  };
+}
+
 function updateInterfaceEditorReadout() {
   if (!el.editorReadout) {
     return;
   }
   const draftReady = Boolean(state.interfaceDraft);
-  const brushMode = state.interfaceEditorMode === "brush_add" || state.interfaceEditorMode === "brush_remove";
-  const summary = state.interfaceDraft?.summary;
-  const anchorCount = summary?.anchor_count ?? draftAnchorIndices().length;
-  const effectiveCount = summary?.effective_count ?? 0;
-  const selectedText = brushMode
-    ? `${state.interfaceEditorSelected.length.toLocaleString()} brush selected`
-    : `${anchorCount} anchors`;
-  const segment = interfaceEditorBrushReplacementLabel() || interfaceEditorActiveSegmentLabel();
-  el.editorReadout.textContent = draftReady
-    ? `${selectedText} - ${effectiveCount.toLocaleString()} interface points${segment ? ` - ${segment}` : ""}`
-    : "No draft";
+  const info = interfaceDraftSegmentInfo();
+  el.editorReadout.textContent = draftReady ? info.pointsText : "No draft";
 }
 
 function updateInterfaceEditorActiveSegmentFromEvent(event, options = {}) {
@@ -2217,6 +2247,8 @@ function showInterfaceEditorWindow() {
     return;
   }
   state.interfaceEditorOpen = true;
+  showInterfaceWindow();
+  hideInterfaceSourceChooser();
   el.interfaceEditorWindow.classList.remove("hidden");
   el.interfaceEditorWindow.setAttribute("aria-hidden", "false");
   updateInterfaceEditorUI();
@@ -2237,54 +2269,8 @@ function hideInterfaceEditorWindow() {
   state.interfaceAnchorDrag = null;
   el.interfaceEditorWindow.classList.add("hidden");
   el.interfaceEditorWindow.setAttribute("aria-hidden", "true");
+  showInterfaceSourceChooser();
   updateInterfaceEditorUI();
-}
-
-function moveInterfaceEditorWindow(clientX, clientY) {
-  if (!state.interfaceEditorWindowDragOffset || !el.interfaceEditorWindow) {
-    return;
-  }
-  const margin = 8;
-  const rect = el.interfaceEditorWindow.getBoundingClientRect();
-  const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
-  const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
-  const left = clamp(clientX - state.interfaceEditorWindowDragOffset[0], margin, maxLeft);
-  const top = clamp(clientY - state.interfaceEditorWindowDragOffset[1], margin, maxTop);
-  el.interfaceEditorWindow.style.left = `${left}px`;
-  el.interfaceEditorWindow.style.top = `${top}px`;
-  el.interfaceEditorWindow.style.right = "auto";
-}
-
-function startInterfaceEditorWindowDrag(event) {
-  if (!el.interfaceEditorWindow || event.button !== 0) {
-    return;
-  }
-  if (event.target?.closest?.("button")) {
-    return;
-  }
-  const rect = el.interfaceEditorWindow.getBoundingClientRect();
-  state.interfaceEditorWindowDragging = true;
-  state.interfaceEditorWindowDragOffset = [event.clientX - rect.left, event.clientY - rect.top];
-  el.interfaceEditorWindowHandle.setPointerCapture(event.pointerId);
-  event.preventDefault();
-}
-
-function dragInterfaceEditorWindow(event) {
-  if (!state.interfaceEditorWindowDragging) {
-    return;
-  }
-  moveInterfaceEditorWindow(event.clientX, event.clientY);
-}
-
-function stopInterfaceEditorWindowDrag(event) {
-  if (!state.interfaceEditorWindowDragging) {
-    return;
-  }
-  state.interfaceEditorWindowDragging = false;
-  state.interfaceEditorWindowDragOffset = null;
-  if (el.interfaceEditorWindowHandle?.hasPointerCapture?.(event.pointerId)) {
-    el.interfaceEditorWindowHandle.releasePointerCapture(event.pointerId);
-  }
 }
 
 function setInterfaceEditorMode(mode) {
@@ -2330,13 +2316,21 @@ function collectInterfaceEditorSelection() {
 
 function updateInterfaceEditorUI(options = {}) {
   const redraw = options.redraw !== false;
-  const available = Boolean(state.session?.status?.auto_interface_ready || state.session?.status?.manual_interface_ready);
+  const hasAuto = Boolean(state.session?.status?.auto_interface_ready);
+  const hasManual = Boolean(state.session?.status?.manual_interface_ready);
   const draftReady = Boolean(state.interfaceDraft);
   const brushMode = state.interfaceEditorMode === "brush_add" || state.interfaceEditorMode === "brush_remove";
-  if (el.editAutoInterface) {
-    el.editAutoInterface.disabled = !available;
+  if (el.interfaceSourceChooser) {
+    el.interfaceSourceChooser.classList.toggle("hidden", draftReady);
+  }
+  if (el.editAutoDraft) {
+    el.editAutoDraft.disabled = !hasAuto;
+  }
+  if (el.editManualDraft) {
+    el.editManualDraft.disabled = !hasManual;
   }
   if (el.editorAnchorMode) {
+    el.editorAnchorMode.disabled = !draftReady;
     el.editorAnchorMode.classList.toggle("active", state.interfaceEditorMode === "anchors");
   }
   if (el.editorBrushAddMode) {
@@ -2348,14 +2342,20 @@ function updateInterfaceEditorUI(options = {}) {
     el.editorBrushRemoveMode.classList.toggle("active", state.interfaceEditorMode === "brush_remove");
   }
   if (el.editorUndo) {
-    el.editorUndo.disabled = !draftReady || !state.interfaceDraft?.summary?.can_undo;
+    el.editorUndo.disabled = !draftReady;
   }
   if (el.editorBrushRadius) {
     el.editorBrushRadius.disabled = !brushMode;
     state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
   }
+  if (el.editorBrushSettings) {
+    el.editorBrushSettings.classList.toggle("hidden", !brushMode);
+  }
   if (el.editorBrushRadiusValue) {
     el.editorBrushRadiusValue.textContent = `${Math.round(Number(el.editorBrushRadius?.value || state.interfaceBrushRadius || 12))} px`;
+  }
+  if (el.editorOrderRow) {
+    el.editorOrderRow.classList.toggle("hidden", !draftReady || state.interfaceEditorMode !== "anchors");
   }
   if (el.editorShowOrder) {
     el.editorShowOrder.checked = Boolean(state.interfaceEditorShowOrder);
@@ -2369,20 +2369,6 @@ function updateInterfaceEditorUI(options = {}) {
     uploadMarkersToGPU();
     draw();
   }
-}
-
-async function openInterfaceEditor() {
-  const hasAuto = Boolean(state.session?.status?.auto_interface_ready);
-  const hasManual = Boolean(state.session?.status?.manual_interface_ready);
-  if (!hasAuto && !hasManual) {
-    showToast("Run regular region growing or save a manual interface before editing.", true);
-    return;
-  }
-  if (hasAuto && hasManual) {
-    showInterfaceSourceChooser();
-    return;
-  }
-  await openInterfaceEditorForSource(hasManual ? "manual" : "auto");
 }
 
 function showInterfaceSourceChooser() {
@@ -2664,6 +2650,10 @@ async function applyInterfaceBrushEdit() {
 
 async function undoInterfaceDraftEdit() {
   if (!state.interfaceDraft) {
+    await refreshInterfaceDraft();
+  }
+  if (!state.interfaceDraft) {
+    showToast("Create an interface draft before undoing edits.", true);
     return;
   }
   const job = await runAction(
@@ -2678,6 +2668,7 @@ async function undoInterfaceDraftEdit() {
     await refreshInterfaceDraft();
   }
   state.interfaceEditorStroke = [];
+  state.interfaceEditorStrokeIndices = [];
   state.interfaceEditorSelected = [];
   state.interfaceEditorBrushTargetSegment = null;
   state.interfaceEditorBrushStartSegment = null;
@@ -4216,7 +4207,10 @@ function bindEvents() {
   el.pickRock.addEventListener("click", () => setPickMode("rock"));
   el.pickPedestal.addEventListener("click", () => setPickMode("pedestal"));
   el.pickInterface.addEventListener("click", () => setPickMode("interface"));
-  el.closeInterfaceWindow.addEventListener("click", hideInterfaceWindow);
+  el.closeInterfaceWindow.addEventListener("click", async () => {
+    await closeInterfaceEditorDiscardingDraft();
+    hideInterfaceWindow();
+  });
   el.interfaceWindowHandle.addEventListener("pointerdown", startInterfaceWindowDrag);
   el.interfaceWindowHandle.addEventListener("pointermove", dragInterfaceWindow);
   el.interfaceWindowHandle.addEventListener("pointerup", stopInterfaceWindowDrag);
@@ -4237,22 +4231,14 @@ function bindEvents() {
   el.stagePart.addEventListener("click", stagePart);
   el.interpolateInterface.addEventListener("click", interpolateInterface);
   el.saveInterface.addEventListener("click", saveInterface);
-  el.editAutoInterface.addEventListener("click", openInterfaceEditor);
   el.editAutoDraft.addEventListener("click", () => openInterfaceEditorForSource("auto"));
   el.editManualDraft.addEventListener("click", () => openInterfaceEditorForSource("manual"));
-  el.cancelInterfaceSource.addEventListener("click", hideInterfaceSourceChooser);
   el.clearParts.addEventListener("click", clearInterfaceParts);
-  el.closeInterfaceEditorWindow.addEventListener("click", closeInterfaceEditorDiscardingDraft);
-  el.interfaceEditorWindowHandle.addEventListener("pointerdown", startInterfaceEditorWindowDrag);
-  el.interfaceEditorWindowHandle.addEventListener("pointermove", dragInterfaceEditorWindow);
-  el.interfaceEditorWindowHandle.addEventListener("pointerup", stopInterfaceEditorWindowDrag);
-  el.interfaceEditorWindowHandle.addEventListener("pointercancel", stopInterfaceEditorWindowDrag);
   el.editorAnchorMode.addEventListener("click", () => setInterfaceEditorMode("anchors"));
   el.editorBrushAddMode.addEventListener("click", () => setInterfaceEditorMode("brush_add"));
   el.editorBrushRemoveMode.addEventListener("click", () => setInterfaceEditorMode("brush_remove"));
   el.editorUndo.addEventListener("click", undoInterfaceDraftEdit);
   el.editorSaveManual.addEventListener("click", commitInterfaceDraft);
-  el.editorClose.addEventListener("click", closeInterfaceEditorDiscardingDraft);
   el.editorBrushRadius.addEventListener("input", () => {
     state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
     updateInterfaceEditorUI();

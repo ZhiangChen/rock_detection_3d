@@ -78,7 +78,7 @@ function fitCameraToBox(
 
 function defaultRotationQuaternion() {
   const matrix = new THREE.Matrix4()
-    .makeRotationX(-0.72)
+    .makeRotationX(0.72)
     .multiply(new THREE.Matrix4().makeRotationY(0.62));
   return new THREE.Quaternion().setFromRotationMatrix(matrix);
 }

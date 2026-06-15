@@ -2240,6 +2240,7 @@ class WebWorkflowSession:
     def _serialize_interface_draft(self) -> dict[str, Any]:
         draft = self.interface_edit_draft or {}
         return {
+            "source": draft.get("source"),
             "parts": deepcopy(draft.get("parts", []) or []),
             "close_loop": bool(draft.get("close_loop", True)),
             "include_indices": list(draft.get("include_indices", []) or []),

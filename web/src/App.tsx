@@ -60,6 +60,53 @@ type ScreenPoint = {
   y: number;
 };
 
+type InterfaceMetadataPart = {
+  num_points?: number;
+  point_indices?: number[];
+  dense_points?: unknown[];
+  selected_indices?: number[];
+};
+
+type InterfaceMetadata = {
+  parts?: InterfaceMetadataPart[];
+  close_loop?: boolean;
+};
+
+function interfaceDraftSegmentInfo(draft: InterfaceDraft | null) {
+  if (!draft) {
+    return {
+      pointsText: "No segments"
+    };
+  }
+  const metadata = (draft.metadata && typeof draft.metadata === "object" ? draft.metadata : {}) as InterfaceMetadata;
+  const metadataParts = Array.isArray(metadata.parts) ? metadata.parts : [];
+  const fallbackParts = Array.isArray(draft.parts) ? draft.parts : [];
+  const parts: InterfaceMetadataPart[] = metadataParts.length
+    ? metadataParts
+    : fallbackParts.map((part) => ({ selected_indices: part.selected_indices }));
+  const pointCounts = parts.map((part) => {
+    if (Number.isFinite(part.num_points)) {
+      return Number(part.num_points);
+    }
+    if (Array.isArray(part.point_indices)) {
+      return part.point_indices.length;
+    }
+    if (Array.isArray(part.dense_points)) {
+      return part.dense_points.length;
+    }
+    if (Array.isArray(part.selected_indices)) {
+      return part.selected_indices.length;
+    }
+    return 0;
+  });
+  const pointsText = pointCounts.length
+    ? pointCounts.map((count, index) => `S${index + 1}: ${count.toLocaleString()} pts`).join(" | ")
+    : "No segments";
+  return {
+    pointsText: `Points per segment: ${pointsText}`
+  };
+}
+
 const defaultSegmentParams: SegmentParams = {
   smoothness_threshold: 0.9,
   curvature_threshold: 0.1,
@@ -122,8 +169,6 @@ const buttonHelp = {
   stagePart: "Store the current interface picks as one contact segment so you can pick another segment.",
   interpolateInterface: "Preview the dense interface path before saving it for segmentation.",
   saveInterface: "Finalize the interpolated interface constraints for region growing.",
-  editAutoInterface: "Edit an automatic or saved manual interface as a sparse draft for ICRG.",
-  previewDraft: "Refresh the dense preview from the current draft anchors.",
   undoDraft: "Undo the most recent draft edit.",
   clearDraft: "Discard the editable draft without changing the saved manual interface.",
   saveDraftManual: "Commit this refined draft as the manual interface used by Run ICRG.",
@@ -320,11 +365,9 @@ export default function App() {
   const [interfaceWindowOpen, setInterfaceWindowOpen] = useState(false);
   const [interfaceWindowPosition, setInterfaceWindowPosition] = useState<{ left: number; top: number } | null>(null);
   const interfaceWindowDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
-  const [interfaceSourceChooserOpen, setInterfaceSourceChooserOpen] = useState(false);
   const [interfaceEditorOpen, setInterfaceEditorOpen] = useState(false);
   const [interfaceDraft, setInterfaceDraft] = useState<InterfaceDraft | null>(null);
-  const [interfaceEditorWindowPosition, setInterfaceEditorWindowPosition] = useState<{ left: number; top: number } | null>(null);
-  const interfaceEditorWindowDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
+  const interfaceDraftSegments = useMemo(() => interfaceDraftSegmentInfo(interfaceDraft), [interfaceDraft]);
   const [manualRemovalOpen, setManualRemovalOpen] = useState(false);
   const [manualRemovalDrawing, setManualRemovalDrawing] = useState(false);
   const [manualRemovalPolygon, setManualRemovalPolygon] = useState<ScreenPoint[]>([]);
@@ -526,7 +569,6 @@ export default function App() {
       setInterfacePoints([]);
       setInterfaceDraft(null);
       setInterfaceEditorOpen(false);
-      setInterfaceSourceChooserOpen(false);
       setCurrentPartLateral(false);
       clearManualRemoval();
       await refreshView("raw", summary);
@@ -629,49 +671,6 @@ export default function App() {
     }
   }
 
-  function beginInterfaceEditorWindowDrag(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.button !== 0) {
-      return;
-    }
-    if ((event.target as HTMLElement).closest("button")) {
-      return;
-    }
-    const panel = event.currentTarget.closest(".floating-window") as HTMLElement | null;
-    if (!panel) {
-      return;
-    }
-    const rect = panel.getBoundingClientRect();
-    interfaceEditorWindowDragRef.current = {
-      offsetX: event.clientX - rect.left,
-      offsetY: event.clientY - rect.top
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  }
-
-  function dragInterfaceEditorWindow(event: ReactPointerEvent<HTMLDivElement>) {
-    const drag = interfaceEditorWindowDragRef.current;
-    if (!drag) {
-      return;
-    }
-    const panel = event.currentTarget.closest(".floating-window") as HTMLElement | null;
-    const rect = panel?.getBoundingClientRect();
-    const width = rect?.width ?? 390;
-    const height = rect?.height ?? 280;
-    const margin = 8;
-    setInterfaceEditorWindowPosition({
-      left: clamp(event.clientX - drag.offsetX, margin, Math.max(margin, window.innerWidth - width - margin)),
-      top: clamp(event.clientY - drag.offsetY, margin, Math.max(margin, window.innerHeight - height - margin))
-    });
-  }
-
-  function endInterfaceEditorWindowDrag(event: ReactPointerEvent<HTMLDivElement>) {
-    interfaceEditorWindowDragRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  }
-
   function stageInterfacePart() {
     if (interfacePoints.length < 2) {
       setError("Interface parts need at least two points.");
@@ -744,25 +743,10 @@ export default function App() {
     );
   }
 
-  async function openInterfaceEditor() {
-    const hasAuto = Boolean(session?.status.auto_interface_ready);
-    const hasManual = Boolean(session?.status.manual_interface_ready);
-    if (!hasAuto && !hasManual) {
-      setError("Run regular region growing or save a manual interface before editing.");
-      return;
-    }
-    if (hasAuto && hasManual) {
-      setInterfaceSourceChooserOpen(true);
-      return;
-    }
-    await openInterfaceEditorForSource(hasManual ? "manual" : "auto");
-  }
-
   async function openInterfaceEditorForSource(source: "auto" | "manual") {
     if (!session) {
       return;
     }
-    setInterfaceSourceChooserOpen(false);
     setBusyLabel("Creating interface draft");
     setError(null);
     try {
@@ -787,27 +771,8 @@ export default function App() {
     }
   }
 
-  async function previewInterfaceDraft() {
-    if (!session || !interfaceDraft) {
-      return;
-    }
-    const job = await runWorkflowAction(
-      "Previewing interface draft",
-      `/api/sessions/${session.session_id}/interface/draft/anchors`,
-      { parts: interfaceDraft.parts, close_loop: interfaceDraft.close_loop },
-      "interface"
-    );
-    const result = job?.result as { draft?: InterfaceDraft } | undefined;
-    if (result?.draft) {
-      setInterfaceDraft(result.draft);
-    } else if (job) {
-      const draftResponse = await getInterfaceDraft(session.session_id);
-      setInterfaceDraft(draftResponse.draft);
-    }
-  }
-
   async function undoInterfaceDraftEdit() {
-    if (!session || !interfaceDraft) {
+    if (!session) {
       return;
     }
     setBusyLabel("Undoing interface edit");
@@ -839,6 +804,7 @@ export default function App() {
       const job = await pollJob(submitted.job_id);
       const summary = await refreshSession(extractSummary(job) ?? undefined);
       setInterfaceDraft(null);
+      setInterfaceEditorOpen(false);
       if (summary) {
         await refreshView("interface", summary);
       }
@@ -954,9 +920,6 @@ export default function App() {
     : undefined;
   const manualRemovalWindowStyle: CSSProperties | undefined = manualRemovalWindowPosition
     ? { left: manualRemovalWindowPosition.left, top: manualRemovalWindowPosition.top, right: "auto" }
-    : undefined;
-  const interfaceEditorWindowStyle: CSSProperties | undefined = interfaceEditorWindowPosition
-    ? { left: interfaceEditorWindowPosition.left, top: interfaceEditorWindowPosition.top, right: "auto" }
     : undefined;
 
   return (
@@ -1414,7 +1377,7 @@ export default function App() {
       </aside>
 
       {interfaceWindowOpen && (
-        <div className="floating-window" role="dialog" aria-labelledby="interfaceWindowTitle" style={interfaceWindowStyle}>
+        <div className="floating-window interface-window" role="dialog" aria-labelledby="interfaceWindowTitle" style={interfaceWindowStyle}>
           <div
             className="floating-window-header"
             onPointerDown={beginInterfaceWindowDrag}
@@ -1427,107 +1390,97 @@ export default function App() {
               x
             </button>
           </div>
-          <div className="floating-window-body">
-            <label className="check-field">
-              <input
-                type="checkbox"
-                checked={currentPartLateral}
-                onChange={(event) => setCurrentPartLateral(event.target.checked)}
-              />
-              <span className="field-label">
-                <span>Lateral part</span>
-                <InfoTip title="Lateral part">{helpText.lateral}</InfoTip>
-              </span>
-            </label>
-            <label className="check-field">
-              <input type="checkbox" checked={closeLoop} onChange={(event) => setCloseLoop(event.target.checked)} />
-              <span className="field-label">
-                <span>Close loop</span>
-                <InfoTip title="Close loop">{helpText.closeLoop}</InfoTip>
-              </span>
-            </label>
-            <div className="button-row">
-              <ActionButton disabled={interfacePoints.length < 2} help={buttonHelp.stagePart} disabledHelp="Pick at least two interface points first." onClick={stageInterfacePart}>
-                <Layers3 size={16} /> Stage Part
-              </ActionButton>
-              <ActionButton disabled={!session?.status.point_cloud_loaded} help={buttonHelp.interpolateInterface} disabledHelp="Upload a point cloud first." onClick={interpolateInterface}>
-                <Sparkles size={16} /> Interpolate Path
-              </ActionButton>
-            </div>
-            <ActionButton className="wide" disabled={!session?.status.point_cloud_loaded} help={buttonHelp.saveInterface} disabledHelp="Upload a point cloud first." onClick={saveInterface}>
-              <Save size={16} /> Save Interface
-            </ActionButton>
-            <ActionButton
-              className="wide"
-              disabled={!session?.status.auto_interface_ready && !session?.status.manual_interface_ready}
-              help={buttonHelp.editAutoInterface}
-              disabledHelp="Run regular region growing or save a manual interface first."
-              onClick={openInterfaceEditor}
-            >
-              <Sparkles size={16} /> Edit Interface
-            </ActionButton>
-            {interfaceSourceChooserOpen && (
-              <div className="source-choice">
-                <div className="button-row">
-                  <ActionButton help="Create an editable draft from the latest automatic interface." onClick={() => openInterfaceEditorForSource("auto")}>
-                    Edit Auto Interface
-                  </ActionButton>
-                  <ActionButton help="Create an editable draft from the saved manual interface." onClick={() => openInterfaceEditorForSource("manual")}>
-                    Edit Manual Interface
+          <div className="floating-window-body interface-window-body">
+            <section className="interface-panel-section">
+              <div className="section-title-row">
+                <h3>Manual Interface</h3>
+                <div className="selection-readout inline-readout">
+                  <span>Parts {interfaceParts.length}</span>
+                  <ActionButton className="link-button" help={buttonHelp.clearParts} onClick={clearInterfaceParts}>
+                    Clear
                   </ActionButton>
                 </div>
-                <ActionButton className="link-button" help="Close the source chooser." onClick={() => setInterfaceSourceChooserOpen(false)}>
-                  Cancel
+              </div>
+              <div className="interface-options-grid">
+                <label className="check-field">
+                  <input
+                    type="checkbox"
+                    checked={currentPartLateral}
+                    onChange={(event) => setCurrentPartLateral(event.target.checked)}
+                  />
+                  <span className="field-label">
+                    <span>Lateral part</span>
+                    <InfoTip title="Lateral part">{helpText.lateral}</InfoTip>
+                  </span>
+                </label>
+                <label className="check-field">
+                  <input type="checkbox" checked={closeLoop} onChange={(event) => setCloseLoop(event.target.checked)} />
+                  <span className="field-label">
+                    <span>Close loop</span>
+                    <InfoTip title="Close loop">{helpText.closeLoop}</InfoTip>
+                  </span>
+                </label>
+              </div>
+              <div className="button-row">
+                <ActionButton disabled={interfacePoints.length < 2} help={buttonHelp.stagePart} disabledHelp="Pick at least two interface points first." onClick={stageInterfacePart}>
+                  <Layers3 size={16} /> Stage Part
+                </ActionButton>
+                <ActionButton disabled={!session?.status.point_cloud_loaded} help={buttonHelp.interpolateInterface} disabledHelp="Upload a point cloud first." onClick={interpolateInterface}>
+                  <Sparkles size={16} /> Interpolate Path
                 </ActionButton>
               </div>
-            )}
-            <div className="selection-readout">
-              <span>Parts {interfaceParts.length}</span>
-              <ActionButton className="link-button" help={buttonHelp.clearParts} onClick={clearInterfaceParts}>
-                Clear
+              <ActionButton className="wide" disabled={!session?.status.point_cloud_loaded} help={buttonHelp.saveInterface} disabledHelp="Upload a point cloud first." onClick={saveInterface}>
+                <Save size={16} /> Save Interface
               </ActionButton>
-            </div>
-          </div>
-        </div>
-      )}
+            </section>
 
-      {interfaceEditorOpen && (
-        <div className="floating-window interface-editor-window" role="dialog" aria-labelledby="interfaceEditorWindowTitle" style={interfaceEditorWindowStyle}>
-          <div
-            className="floating-window-header"
-            onPointerDown={beginInterfaceEditorWindowDrag}
-            onPointerMove={dragInterfaceEditorWindow}
-            onPointerUp={endInterfaceEditorWindowDrag}
-            onPointerCancel={endInterfaceEditorWindowDrag}
-          >
-            <h2 id="interfaceEditorWindowTitle">Hybrid Interface Editor</h2>
-            <button className="floating-window-close" type="button" aria-label="Close interface editor window" onClick={() => setInterfaceEditorOpen(false)}>
-              x
-            </button>
-          </div>
-          <div className="floating-window-body">
-            <p className="tool-note">Refine the automatic interface draft, then save it as the manual interface for ICRG.</p>
-            <div className="selection-readout">
-              <span>{interfaceDraft?.summary?.anchor_count ?? 0} anchors</span>
-              <span>{interfaceDraft?.summary?.effective_count ?? 0} interface points</span>
-            </div>
-            <div className="button-row">
-              <ActionButton disabled={!interfaceDraft?.summary?.can_undo} help={buttonHelp.undoDraft} disabledHelp="There are no draft edits to undo." onClick={undoInterfaceDraftEdit}>
-                Undo Edit
-              </ActionButton>
-              <ActionButton disabled={!interfaceDraft} help={buttonHelp.clearDraft} disabledHelp="No draft is active." onClick={discardInterfaceDraft}>
-                Clear Draft
-              </ActionButton>
-            </div>
-            <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.previewDraft} disabledHelp="Create a draft first." onClick={previewInterfaceDraft}>
-              Preview
-            </ActionButton>
-            <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.saveDraftManual} disabledHelp="Create a draft first." onClick={saveDraftAsManualInterface}>
-              <Save size={16} /> Save as Manual Interface
-            </ActionButton>
-            <ActionButton className="wide" help="Close the editor window while leaving the draft available in the session." onClick={() => setInterfaceEditorOpen(false)}>
-              Close
-            </ActionButton>
+            <section className="interface-panel-section hybrid-edit-section">
+              <div className="section-title-row">
+                <h3>Hybrid Interface Edit</h3>
+              </div>
+              <p className="tool-note">Start from an existing interface, edit it as a temporary draft, then save it as the manual interface for ICRG.</p>
+              {!interfaceEditorOpen && (
+                <div className="source-choice">
+                  <div className="step-label">Start draft from</div>
+                  <div className="button-row">
+                    <ActionButton
+                      disabled={!session?.status.auto_interface_ready}
+                      disabledHelp="Run regular region growing first."
+                      help="Create an editable draft from the latest automatic interface."
+                      onClick={() => openInterfaceEditorForSource("auto")}
+                    >
+                      Start From Auto
+                    </ActionButton>
+                    <ActionButton
+                      disabled={!session?.status.manual_interface_ready}
+                      disabledHelp="Save a manual interface first."
+                      help="Create an editable draft from the saved manual interface."
+                      onClick={() => openInterfaceEditorForSource("manual")}
+                    >
+                      Start From Manual
+                    </ActionButton>
+                  </div>
+                </div>
+              )}
+              {interfaceEditorOpen && (
+                <div className="interface-editor-panel">
+                  <div className="editor-step">
+                    <div className="step-label">Segment points</div>
+                    <div className="selection-readout">
+                      <span>{interfaceDraftSegments.pointsText}</span>
+                    </div>
+                  </div>
+                  <div className="button-row">
+                    <ActionButton disabled={!interfaceDraft} help={buttonHelp.undoDraft} disabledHelp="Create a draft first." onClick={undoInterfaceDraftEdit}>
+                      Undo Edit
+                    </ActionButton>
+                    <ActionButton disabled={!interfaceDraft} help={buttonHelp.saveDraftManual} disabledHelp="Create a draft first." onClick={saveDraftAsManualInterface}>
+                      <Save size={16} /> Save as Manual
+                    </ActionButton>
+                  </div>
+                </div>
+              )}
+            </section>
           </div>
         </div>
       )}

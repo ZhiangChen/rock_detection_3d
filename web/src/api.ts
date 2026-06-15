@@ -142,6 +142,7 @@ export type InterfaceDraftSummary = {
 };
 
 export type InterfaceDraft = {
+  source?: "auto" | "manual" | null;
   parts: InterfacePartRequest[];
   close_loop: boolean;
   include_indices: number[];
