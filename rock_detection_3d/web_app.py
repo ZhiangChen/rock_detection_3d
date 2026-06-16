@@ -29,7 +29,7 @@ RUNS_DIR = REPO_ROOT / "web_runs"
 WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
 WEB_STATIC_DIR = MODULE_DIR / "web_static"
 ALLOWED_POINT_CLOUD_SUFFIXES = {".las", ".laz"}
-APP_BUILD = "20260615-threshold-help"
+APP_BUILD = "20260615-panel-scroll"
 
 
 class ManualSeedsRequest(BaseModel):

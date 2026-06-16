@@ -67,6 +67,40 @@ The `rock_detection_3d` module is not just a backend segmentation library. It al
 
 <img src="rock_detection_3d/images/gui.png" height="360">
 
+### Browser-Based Web Tool
+
+The repository also includes a browser-based web tool for the `rock_detection_3d` workflow. It is the recommended interactive interface for current development because it exposes the full segmentation workflow in one place:
+
+- import and export `.rd3dproj` project archives,
+- upload LAS/LAZ point clouds,
+- select rock and pedestal seeds,
+- generate and refine automatic/manual interface constraints,
+- run regular region growing and interface-constrained region growing (ICRG),
+- inspect voxel-stage RG results, final dense segmentation, seed branches, and interface overlays,
+- prepare meshes, reconstruct surfaces, run analysis, and download available outputs.
+
+Install the 3D/web dependencies first:
+
+```bash
+pip install -r rock_detection_3d/requirements.txt
+```
+
+Launch the web tool from the repository root:
+
+```bash
+python -m uvicorn rock_detection_3d.web_app:app --host 127.0.0.1 --port 8010
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8010/
+```
+
+Port `8010` is used here to avoid conflicts with other local services that commonly use port `8000`. If needed, choose another open port and open the matching URL.
+
+For the recommended web-tool workflow and parameter-tuning guidance, see [docs/web_tool_workflow.md](docs/web_tool_workflow.md).
+
 ### Part 2: Learning-Based Methods
 
 This repository also includes a learning-based pipeline for autonomous 3D rock detection. At a high level, this branch combines learned 2D rock mapping from orthomosaics with learned 3D point-cloud segmentation on cropped rock subsets. It is the more dataset-driven alternative to the GUI-centered non-learning workflow.
@@ -167,6 +201,7 @@ Additional dataset-format notes are available in [notebooks/data/README.md](/Use
 
 - [rock_detection_3d/README.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/README.md): detailed notes on the unsupervised 3D segmentation workflow.
 - [rock_detection_3d/GUI_TUTORIAL.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/GUI_TUTORIAL.md): detailed guide to the interactive GUI.
+- [docs/web_tool_workflow.md](docs/web_tool_workflow.md): recommended browser web-tool workflow and parameter-tuning guidance.
 - [learning_based_README.md](/Users/zhiang/Projects/rock_detection_3d/learning_based_README.md): learning-based training and inference workflow.
 
 ## Data Requirements

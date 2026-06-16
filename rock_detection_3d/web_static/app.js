@@ -1,4 +1,4 @@
-const REQUIRED_RUNTIME_BUILD = "20260615-threshold-help";
+const REQUIRED_RUNTIME_BUILD = "20260615-panel-scroll";
 
 const MEASUREMENT_COLORS = [
   [1.0, 0.76, 0.12],
