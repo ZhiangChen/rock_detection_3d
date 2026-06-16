@@ -106,6 +106,42 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.project-panel {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.project-panel .button-row {
+  grid-template-columns: 1fr;
+}
+
+.project-file-button {
+  position: relative;
+  min-height: 34px;
+  border: 1px solid #c6ccc4;
+  border-radius: 6px;
+  background: #fff;
+  color: #202427;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.project-file-button:hover {
+  border-color: #2e766f;
+  background: #f5faf7;
+}
+
+.project-file-button input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
 .upload {
   position: relative;
   min-height: 38px;
@@ -173,6 +209,83 @@ h1 {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 7px;
+}
+
+.measurement-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.measurement-readout {
+  min-height: 34px;
+  padding: 8px 9px;
+  border: 1px solid #ccd5cf;
+  border-radius: 6px;
+  background: #fff;
+  color: #33413c;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.measurement-readout.active {
+  border-color: #2e766f;
+  background: #eef8f4;
+  color: #214d48;
+}
+
+.measurement-points {
+  display: grid;
+  gap: 6px;
+}
+
+.measurement-points > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid #dce0d8;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.measurement-points span {
+  color: #657065;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.measurement-points strong {
+  min-height: 16px;
+  color: #2f3833;
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.controls.measurement-disabled {
+  position: relative;
+}
+
+.controls.measurement-disabled::before {
+  content: "Measurement mode active";
+  position: sticky;
+  top: -14px;
+  z-index: 3;
+  min-height: 32px;
+  margin: -14px -14px 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #c8d7d1;
+  background: #e2f1ec;
+  color: #214d48;
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.controls.measurement-disabled .panel {
+  opacity: 0.48;
 }
 
 .inline-fields {
@@ -292,6 +405,81 @@ h1 {
   height: 100%;
   display: block;
   cursor: crosshair;
+}
+
+.branch-legend {
+  position: absolute;
+  top: 72px;
+  right: 14px;
+  z-index: 11;
+  width: min(260px, calc(100% - 28px));
+  max-height: min(360px, calc(100% - 96px));
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid #cbd4ce;
+  border-radius: 6px;
+  background: rgba(250, 252, 248, 0.94);
+  box-shadow: 0 10px 24px rgba(32, 36, 39, 0.12);
+}
+
+.branch-legend-title {
+  margin-bottom: 7px;
+  color: #3e4741;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.branch-color-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.branch-color-toggle button {
+  min-height: 28px;
+  padding: 4px 6px;
+  font-size: 11px;
+}
+
+.branch-color-toggle button.active {
+  border-color: #2e766f;
+  background: #e5f4ee;
+  color: #214d48;
+  font-weight: 650;
+}
+
+.branch-legend-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 0;
+  color: #2f3833;
+  font-size: 12px;
+}
+
+.branch-swatch {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(32, 36, 39, 0.28);
+  border-radius: 50%;
+}
+
+.branch-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-legend-row strong {
+  color: #59635d;
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
 }
 
 .manual-removal-overlay {

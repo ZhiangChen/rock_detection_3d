@@ -6,6 +6,7 @@ export type WorkflowStatus = {
   interface_draft_ready: boolean;
   interface_ready: boolean;
   segmentation_ready: boolean;
+  voxel_segmentation_ready?: boolean;
   mesh_prepared: boolean;
   mesh_completed: boolean;
   analysis_completed: boolean;
@@ -111,6 +112,7 @@ export type SegmentParams = {
   voxel_size: number;
   neighbor_count: number;
   distance_threshold: number;
+  label_propagation_distance: number;
 };
 
 export type DenoiseParams = {
@@ -119,6 +121,40 @@ export type DenoiseParams = {
   sor_std_ratio: number;
   dbscan_eps: number;
   dbscan_min_points: number;
+};
+
+export type ProjectUiState = {
+  project_filename?: string | null;
+  active_view?: string;
+  pick_mode?: string;
+  point_size?: number;
+  segment_params?: SegmentParams;
+  denoise_params?: DenoiseParams;
+  normal_method?: "pymeshlab" | "open3d";
+  normal_k?: number;
+  normal_display_scale?: number;
+  mesh_depth?: number;
+  hover_tips_enabled?: boolean;
+  interface_points?: number[];
+  interface_parts?: InterfacePartRequest[];
+  current_part_lateral?: boolean;
+  close_loop?: boolean;
+};
+
+export type ProjectExportRequest = {
+  filename?: string | null;
+  ui_state: ProjectUiState;
+};
+
+export type ProjectExportResponse = {
+  blob: Blob;
+  filename: string;
+};
+
+export type ProjectImportResponse = {
+  summary: SessionSummary;
+  ui_state?: ProjectUiState;
+  project_filename?: string | null;
 };
 
 export type InterfacePartRequest = {
@@ -175,6 +211,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(message);
   }
   return response.json() as Promise<T>;
+}
+
+function filenameFromContentDisposition(value: string | null, fallback: string) {
+  if (!value) {
+    return fallback;
+  }
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+  }
+  const asciiMatch = value.match(/filename="?([^";]+)"?/i);
+  return asciiMatch?.[1] ?? fallback;
 }
 
 export async function createSession(): Promise<SessionSummary> {
@@ -269,4 +317,35 @@ export async function manualRemovePreparedPoints(sessionId: string, selectedIndi
 
 export function downloadUrl(sessionId: string, kind: string): string {
   return `${API_BASE}/api/sessions/${sessionId}/downloads/${kind}`;
+}
+
+export async function exportProject(sessionId: string, body: ProjectExportRequest): Promise<ProjectExportResponse> {
+  const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/project/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const payload = await response.json();
+      message = payload.detail ?? message;
+    } catch {
+      // Keep status text.
+    }
+    throw new Error(message);
+  }
+  return {
+    blob: await response.blob(),
+    filename: filenameFromContentDisposition(response.headers.get("Content-Disposition"), body.filename || "rock_detection_project.rd3dproj")
+  };
+}
+
+export async function importProject(sessionId: string, file: File): Promise<ProjectImportResponse> {
+  const data = new FormData();
+  data.append("file", file);
+  return request<ProjectImportResponse>(`/api/sessions/${sessionId}/project/import`, {
+    method: "POST",
+    body: data
+  });
 }

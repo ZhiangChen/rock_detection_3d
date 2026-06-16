@@ -8,15 +8,20 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import json
+import re
 import shutil
 import sys
 import tempfile
 import traceback
+import zipfile
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import laspy
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
@@ -34,6 +39,18 @@ from utils import filter_point_cloud
 
 INTERFACE_GREEN = (0.0, 1.0, 0.0)
 INTERFACE_PART_COLOR_CYCLE = [INTERFACE_GREEN]
+BRANCH_COLOR_PALETTE = [
+    [0.93, 0.18, 0.14],
+    [0.10, 0.36, 0.95],
+    [0.96, 0.62, 0.05],
+    [0.00, 0.62, 0.45],
+    [0.55, 0.28, 0.90],
+    [0.90, 0.20, 0.58],
+    [0.42, 0.70, 0.12],
+    [0.13, 0.66, 0.86],
+    [0.75, 0.38, 0.00],
+    [0.35, 0.35, 0.35],
+]
 
 NORMAL_VECTOR_SCALE_FRACTION = 0.01
 VIEW_NORMAL_RADIUS = 0.05
@@ -70,12 +87,17 @@ DEFAULT_CONFIG = {
         "voxel_size": 0.02,
         "neighbor_count": 50,
         "distance_threshold": 0.05,
+        "label_propagation_distance": 0.05,
     },
     "normals": {
         "method": "pymeshlab",
         "k": 200,
     },
 }
+
+PROJECT_FORMAT = "rock_detection_3d.project"
+PROJECT_SCHEMA_VERSION = 1
+PROJECT_ARCHIVE_SUFFIX = ".rd3dproj"
 
 
 def _deep_update(base: dict[str, Any], upd: dict[str, Any] | None) -> dict[str, Any]:
@@ -146,6 +168,80 @@ def _make_point_cloud(points: np.ndarray, colors: np.ndarray | None = None) -> o
         colors = np.full((len(points), 3), 0.5, dtype=float)
     pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=float))
     return pcd
+
+
+def _make_point_cloud_with_normals(
+    points: np.ndarray,
+    colors: np.ndarray | None = None,
+    normals: np.ndarray | None = None,
+) -> o3d.geometry.PointCloud:
+    pcd = _make_point_cloud(points, colors)
+    normal_array = np.asarray(normals, dtype=float) if normals is not None else None
+    point_array = np.asarray(points)
+    if normal_array is not None and normal_array.shape == point_array.shape:
+        pcd.normals = o3d.utility.Vector3dVector(normal_array)
+    return pcd
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
+def _safe_filename(name: str | None, default: str, suffix: str | None = None) -> str:
+    raw_name = Path(str(name or default)).name.strip() or default
+    if suffix and raw_name.lower().endswith(suffix.lower()):
+        stem = raw_name[: -len(suffix)]
+    else:
+        stem = Path(raw_name).stem if Path(raw_name).suffix else raw_name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or default
+    return f"{stem}{suffix or Path(raw_name).suffix}"
+
+
+def _safe_archive_name(name: str | None, default: str) -> str:
+    raw_name = Path(str(name or default)).name.strip() or default
+    suffix = Path(raw_name).suffix
+    stem = Path(raw_name).stem if suffix else raw_name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or Path(default).stem
+    return f"{stem}{suffix}"
+
+
+def _validate_archive_members(names: list[str]) -> None:
+    for name in names:
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts or "\\" in name:
+            raise ValueError(f"Project archive contains an unsafe path: {name}")
+
+
+def _npz_array(data: np.lib.npyio.NpzFile, key: str) -> np.ndarray | None:
+    if key not in data.files:
+        return None
+    array = data[key]
+    if array.size == 0:
+        return np.empty(array.shape, dtype=array.dtype)
+    return np.asarray(array)
+
+
+def _metadata_dense_parts(metadata: dict[str, Any] | None) -> list[np.ndarray]:
+    dense_parts: list[np.ndarray] = []
+    for part in (metadata or {}).get("parts", []) or []:
+        dense = np.asarray(part.get("dense_points", []), dtype=float)
+        if dense.ndim == 2 and dense.shape[1] == 3:
+            dense_parts.append(dense)
+    return dense_parts
+
+
+def _metadata_lateral_flags(metadata: dict[str, Any] | None) -> list[bool]:
+    return [bool(part.get("is_lateral", False)) for part in (metadata or {}).get("parts", []) or []]
 
 
 def _dense_basal_points(
@@ -241,6 +337,7 @@ class WorkflowStatus:
     interface_draft_ready: bool = False
     interface_ready: bool = False
     segmentation_ready: bool = False
+    voxel_segmentation_ready: bool = False
     mesh_prepared: bool = False
     mesh_completed: bool = False
     analysis_completed: bool = False
@@ -327,10 +424,21 @@ class WebWorkflowSession:
             "palette": [],
         }
         self.interface_source: Literal["manual", "auto"] | None = None
+        self.display_interface_source: Literal["manual", "auto"] | None = None
         self.interface_edit_draft: dict[str, Any] | None = None
         self.segmenter: RegionGrowingSegmentation | None = None
         self.segmented_pcd: o3d.geometry.PointCloud | None = None
         self.segmented_labels: np.ndarray | None = None
+        self.segmented_branch_ids: np.ndarray | None = None
+        self.segmented_branches: list[dict[str, Any]] = []
+        self.region_growing_dense_labels: np.ndarray | None = None
+        self.region_growing_dense_branch_ids: np.ndarray | None = None
+        self.voxel_segmented_points: np.ndarray | None = None
+        self.voxel_segmented_colors: np.ndarray | None = None
+        self.voxel_segmented_normals: np.ndarray | None = None
+        self.voxel_segmented_labels: np.ndarray | None = None
+        self.voxel_segmented_branch_ids: np.ndarray | None = None
+        self.voxel_segmented_branches: list[dict[str, Any]] = []
         self.prepared_mesh_data: dict[str, Any] | None = None
         self.normals_display_ready = False
         self.noise_removal_history: list[dict[str, Any]] = []
@@ -351,6 +459,7 @@ class WebWorkflowSession:
                 "pedestal": self.pedestal_seeds,
             },
             "interface_source": self.interface_source,
+            "display_interface_source": self.display_interface_source,
             "manual_interface_ready": self.status.manual_interface_ready,
             "auto_interface_ready": self.status.auto_interface_ready,
             "interface_draft_ready": self.status.interface_draft_ready,
@@ -362,6 +471,582 @@ class WebWorkflowSession:
                 "analysis": self.analysis_csv_path,
             },
         }
+
+    def _project_status_from_dict(self, status_data: dict[str, Any] | None) -> None:
+        self.status = WorkflowStatus()
+        for key, value in (status_data or {}).items():
+            if hasattr(self.status, key):
+                setattr(self.status, key, value)
+
+    def _add_point_state(
+        self,
+        arrays: dict[str, np.ndarray],
+        prefix: str,
+        points: np.ndarray | None,
+        colors: np.ndarray | None,
+        normals: np.ndarray | None = None,
+    ) -> None:
+        point_array = np.asarray(points, dtype=np.float64) if points is not None else np.empty((0, 3), dtype=np.float64)
+        color_array = np.asarray(colors, dtype=np.float64) if colors is not None else np.empty((0, 3), dtype=np.float64)
+        normal_array = np.asarray(normals, dtype=np.float64) if normals is not None else np.empty((0, 3), dtype=np.float64)
+        arrays[f"{prefix}_points"] = point_array
+        arrays[f"{prefix}_colors"] = color_array
+        arrays[f"{prefix}_normals"] = normal_array
+
+    def _write_working_state_npz(self, path: Path) -> None:
+        arrays: dict[str, np.ndarray] = {}
+        if self.pcd is not None:
+            self._add_point_state(
+                arrays,
+                "pcd",
+                np.asarray(self.pcd.points),
+                np.asarray(self.pcd.colors),
+                np.asarray(self.pcd.normals) if self.pcd.has_normals() else None,
+            )
+        self._add_point_state(arrays, "raw_view", self.raw_view_points, self.raw_view_colors, self.raw_view_normals)
+        self._add_point_state(arrays, "seed_view", self.seed_view_points, self.seed_view_colors, self.seed_view_normals)
+        self._add_point_state(arrays, "interface_view", self.interface_view_points, self.interface_view_colors, self.interface_view_normals)
+        self._add_point_state(
+            arrays,
+            "interface_preview_view",
+            self.interface_preview_view_points,
+            self.interface_preview_view_colors,
+            self.interface_preview_view_normals,
+        )
+        np.savez_compressed(path, **arrays)
+
+    def _write_segmented_state_npz(self, path: Path) -> None:
+        arrays: dict[str, np.ndarray] = {}
+        if self.segmented_pcd is not None:
+            self._add_point_state(
+                arrays,
+                "segmented",
+                np.asarray(self.segmented_pcd.points),
+                np.asarray(self.segmented_pcd.colors),
+                np.asarray(self.segmented_pcd.normals) if self.segmented_pcd.has_normals() else None,
+            )
+        arrays["labels"] = (
+            np.asarray(self.segmented_labels, dtype=np.int32)
+            if self.segmented_labels is not None
+            else np.empty((0,), dtype=np.int32)
+        )
+        arrays["segmented_branch_ids"] = (
+            np.asarray(self.segmented_branch_ids, dtype=np.int32)
+            if self.segmented_branch_ids is not None
+            else np.empty((0,), dtype=np.int32)
+        )
+        arrays["segmented_branches_json"] = np.asarray([json.dumps(self.segmented_branches or [])])
+        self._add_point_state(
+            arrays,
+            "voxel_segmented",
+            self.voxel_segmented_points,
+            self.voxel_segmented_colors,
+            self.voxel_segmented_normals,
+        )
+        arrays["voxel_labels"] = (
+            np.asarray(self.voxel_segmented_labels, dtype=np.int32)
+            if self.voxel_segmented_labels is not None
+            else np.empty((0,), dtype=np.int32)
+        )
+        arrays["voxel_branch_ids"] = (
+            np.asarray(self.voxel_segmented_branch_ids, dtype=np.int32)
+            if self.voxel_segmented_branch_ids is not None
+            else np.empty((0,), dtype=np.int32)
+        )
+        arrays["voxel_branches_json"] = np.asarray([json.dumps(self.voxel_segmented_branches or [])])
+        np.savez_compressed(path, **arrays)
+
+    def _write_prepared_mesh_npz(self, path: Path) -> None:
+        arrays: dict[str, np.ndarray] = {}
+        if self.prepared_mesh_data:
+            rock_pcd = self.prepared_mesh_data["rock_pcd"]
+            bottom_pcd = self.prepared_mesh_data["bottom_pcd"]
+            self._add_point_state(
+                arrays,
+                "rock",
+                np.asarray(rock_pcd.points),
+                np.asarray(rock_pcd.colors),
+                np.asarray(rock_pcd.normals) if rock_pcd.has_normals() else None,
+            )
+            self._add_point_state(
+                arrays,
+                "bottom",
+                np.asarray(bottom_pcd.points),
+                np.asarray(bottom_pcd.colors),
+                np.asarray(bottom_pcd.normals) if bottom_pcd.has_normals() else None,
+            )
+            self._add_point_state(
+                arrays,
+                "combined",
+                self.prepared_mesh_data.get("combined_points"),
+                self.prepared_mesh_data.get("combined_colors"),
+                self.prepared_mesh_data.get("combined_normals"),
+            )
+        np.savez_compressed(path, **arrays)
+
+    def _restore_point_state(self, data: np.lib.npyio.NpzFile, prefix: str) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        points = _npz_array(data, f"{prefix}_points")
+        if points is None or points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            return None, None, None
+        colors = _npz_array(data, f"{prefix}_colors")
+        normals = _npz_array(data, f"{prefix}_normals")
+        if colors is None or colors.shape != points.shape:
+            colors = np.full(points.shape, 0.5, dtype=float)
+        if normals is not None and normals.shape != points.shape:
+            normals = None
+        return points, colors, normals
+
+    def _restore_working_state_npz(self, path: Path) -> None:
+        with np.load(path, allow_pickle=False) as data:
+            points, colors, normals = self._restore_point_state(data, "pcd")
+            if points is not None:
+                self.pcd = _make_point_cloud_with_normals(points, colors, normals)
+            for prefix, attr_prefix in [
+                ("raw_view", "raw_view"),
+                ("seed_view", "seed_view"),
+                ("interface_view", "interface_view"),
+                ("interface_preview_view", "interface_preview_view"),
+            ]:
+                view_points, view_colors, view_normals = self._restore_point_state(data, prefix)
+                setattr(self, f"{attr_prefix}_points", view_points)
+                setattr(self, f"{attr_prefix}_colors", view_colors)
+                setattr(self, f"{attr_prefix}_normals", view_normals)
+        if self.pcd is not None and (self.raw_view_points is None or self.raw_view_colors is None):
+            self._snapshot_raw_view()
+
+    def _restore_segmented_state_npz(self, path: Path) -> None:
+        with np.load(path, allow_pickle=False) as data:
+            points, colors, normals = self._restore_point_state(data, "segmented")
+            if points is not None:
+                self.segmented_pcd = _make_point_cloud_with_normals(points, colors, normals)
+            labels = _npz_array(data, "labels")
+            if labels is not None and labels.ndim == 1 and len(labels):
+                self.segmented_labels = np.asarray(labels, dtype=int)
+            segmented_branch_ids = _npz_array(data, "segmented_branch_ids")
+            if (
+                segmented_branch_ids is not None
+                and segmented_branch_ids.ndim == 1
+                and points is not None
+                and len(segmented_branch_ids) == len(points)
+            ):
+                self.segmented_branch_ids = np.asarray(segmented_branch_ids, dtype=int)
+            segmented_branches_json = _npz_array(data, "segmented_branches_json")
+            if segmented_branches_json is not None and segmented_branches_json.size:
+                try:
+                    self.segmented_branches = json.loads(str(segmented_branches_json.reshape(-1)[0]))
+                except (TypeError, json.JSONDecodeError):
+                    self.segmented_branches = []
+            voxel_points, voxel_colors, voxel_normals = self._restore_point_state(data, "voxel_segmented")
+            if voxel_points is not None:
+                self.voxel_segmented_points = voxel_points
+                self.voxel_segmented_colors = voxel_colors
+                self.voxel_segmented_normals = voxel_normals
+            voxel_labels = _npz_array(data, "voxel_labels")
+            if voxel_labels is not None and voxel_labels.ndim == 1 and len(voxel_labels):
+                self.voxel_segmented_labels = np.asarray(voxel_labels, dtype=int)
+            voxel_branch_ids = _npz_array(data, "voxel_branch_ids")
+            if (
+                voxel_branch_ids is not None
+                and voxel_branch_ids.ndim == 1
+                and voxel_points is not None
+                and len(voxel_branch_ids) == len(voxel_points)
+            ):
+                self.voxel_segmented_branch_ids = np.asarray(voxel_branch_ids, dtype=int)
+            branches_json = _npz_array(data, "voxel_branches_json")
+            if branches_json is not None and branches_json.size:
+                try:
+                    self.voxel_segmented_branches = json.loads(str(branches_json.reshape(-1)[0]))
+                except (TypeError, json.JSONDecodeError):
+                    self.voxel_segmented_branches = []
+
+    def _restore_prepared_mesh_npz(self, path: Path) -> None:
+        with np.load(path, allow_pickle=False) as data:
+            rock_points, rock_colors, rock_normals = self._restore_point_state(data, "rock")
+            bottom_points, bottom_colors, bottom_normals = self._restore_point_state(data, "bottom")
+            if rock_points is None or bottom_points is None:
+                return
+            rock_pcd = _make_point_cloud_with_normals(rock_points, rock_colors, rock_normals)
+            bottom_pcd = _make_point_cloud_with_normals(bottom_points, bottom_colors, bottom_normals)
+            combined_points, combined_colors, combined_normals = self._restore_point_state(data, "combined")
+            if combined_points is None:
+                combined_points = np.vstack((rock_points, bottom_points))
+                combined_colors = np.vstack((
+                    np.full((len(rock_points), 3), [1.0, 0.0, 0.0]),
+                    np.full((len(bottom_points), 3), [0.0, 1.0, 0.0]),
+                ))
+                rock_normal_array = np.asarray(rock_pcd.normals) if rock_pcd.has_normals() else np.zeros_like(rock_points)
+                bottom_normal_array = np.asarray(bottom_pcd.normals) if bottom_pcd.has_normals() else np.zeros_like(bottom_points)
+                combined_normals = np.vstack((rock_normal_array, bottom_normal_array))
+            self.prepared_mesh_data = {
+                "rock_pcd": rock_pcd,
+                "bottom_pcd": bottom_pcd,
+                "combined_points": combined_points,
+                "combined_colors": combined_colors,
+                "combined_normals": combined_normals,
+                "preparation_result": None,
+            }
+
+    def _write_marker_las(self, path: Path) -> None:
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=float)
+        header = laspy.LasHeader(point_format=3, version="1.2")
+        las = laspy.LasData(header)
+        las.x = points[:, 0] + self.file_handler.x_mean
+        las.y = points[:, 1] + self.file_handler.y_mean
+        las.z = points[:, 2] + self.file_handler.z_mean
+
+        red = np.full(len(points), 32768, dtype=np.uint16)
+        green = np.full(len(points), 32768, dtype=np.uint16)
+        blue = np.full(len(points), 32768, dtype=np.uint16)
+        intensity = np.zeros(len(points), dtype=np.uint16)
+        classification = np.zeros(len(points), dtype=np.uint8)
+
+        def mark(indices: list[int] | np.ndarray | None, rgb: tuple[int, int, int], class_value: int, intensity_value: int) -> None:
+            if indices is None:
+                return
+            valid = np.asarray(indices, dtype=int)
+            valid = valid[(valid >= 0) & (valid < len(points))]
+            if len(valid) == 0:
+                return
+            red[valid] = rgb[0]
+            green[valid] = rgb[1]
+            blue[valid] = rgb[2]
+            classification[valid] = class_value
+            intensity[valid] = intensity_value
+
+        mark(self.rock_seeds, (65535, 0, 0), 1, 1)
+        mark(self.pedestal_seeds, (0, 0, 65535), 2, 2)
+        mark(self.basal_points, (0, 65535, 0), 9, 3)
+        if self.manual_basal_points is not None:
+            mark(self.manual_basal_points, (0, 65535, 0), 9, 4)
+        if self.auto_basal_points is not None:
+            mark(self.auto_basal_points, (0, 49152, 32768), 9, 5)
+
+        las.red = red
+        las.green = green
+        las.blue = blue
+        las.intensity = intensity
+        las.classification = classification
+        path.parent.mkdir(parents=True, exist_ok=True)
+        las.write(path)
+
+    def _project_manifest(self, ui_state: dict[str, Any] | None, artifacts: dict[str, Any], app_build: str | None) -> dict[str, Any]:
+        return _to_jsonable({
+            "format": PROJECT_FORMAT,
+            "schema_version": PROJECT_SCHEMA_VERSION,
+            "app_build": app_build,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "project_filename": _safe_filename(
+                (ui_state or {}).get("project_filename"),
+                self.current_pbr_file or "rock_detection_project",
+                PROJECT_ARCHIVE_SUFFIX,
+            ),
+            "ui_state": ui_state or {},
+            "workflow_state": {
+                "current_file": self.current_pbr_file,
+                "epsg_code": self.epsg_code,
+                "point_count": len(self.pcd.points) if self.pcd is not None else 0,
+                "status": self.status.__dict__,
+                "seeds": {
+                    "rock": self.rock_seeds,
+                    "pedestal": self.pedestal_seeds,
+                },
+                "interface_source": self.interface_source,
+                "display_interface_source": self.display_interface_source,
+                "manual_basal_points": self.manual_basal_points,
+                "auto_basal_points": self.auto_basal_points,
+                "basal_points": self.basal_points,
+                "manual_basal_parts_metadata": self.manual_basal_parts_metadata,
+                "auto_basal_parts_metadata": self.auto_basal_parts_metadata,
+                "basal_parts_metadata": self.basal_parts_metadata,
+                "interface_preview_metadata": self.interface_preview_metadata,
+                "interface_edit_draft": self._serialize_interface_draft() if self.interface_edit_draft else None,
+                "normals_display_ready": self.normals_display_ready,
+                "summary": self.summary(),
+            },
+            "artifacts": artifacts,
+            "provenance": {
+                "last_segmentation_mode": self.status.last_segmentation_mode,
+                "analysis_completed": self.status.analysis_completed,
+                "mesh_completed": self.status.mesh_completed,
+                "mesh_prepared": self.status.mesh_prepared,
+            },
+        })
+
+    def export_project(
+        self,
+        ui_state: dict[str, Any] | None = None,
+        filename: str | None = None,
+        app_build: str | None = None,
+    ) -> Path:
+        if self.pcd is None:
+            raise ValueError("Load a point cloud before saving a project.")
+
+        project_filename = _safe_filename(filename or (ui_state or {}).get("project_filename"), self.current_pbr_file or "rock_detection_project", PROJECT_ARCHIVE_SUFFIX)
+        project_dir = self.output_dir / "projects"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = project_dir / project_filename
+        artifacts: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_dir = Path(temp_name)
+            working_state = temp_dir / "working_point_cloud.npz"
+            self._write_working_state_npz(working_state)
+            artifacts["working_state"] = {"path": "state/working_point_cloud.npz"}
+
+            marker_las = temp_dir / "seeds_interface.las"
+            self._write_marker_las(marker_las)
+            artifacts["seeds_interface"] = {"path": "assets/intermediate/seeds_interface.las"}
+
+            segmented_state: Path | None = None
+            if (
+                self.segmented_pcd is not None
+                or self.segmented_labels is not None
+                or self.voxel_segmented_points is not None
+                or self.voxel_segmented_labels is not None
+            ):
+                segmented_state = temp_dir / "segmented_state.npz"
+                self._write_segmented_state_npz(segmented_state)
+                artifacts["segmented_state"] = {"path": "state/segmented_state.npz"}
+
+            prepared_state: Path | None = None
+            if self.prepared_mesh_data:
+                prepared_state = temp_dir / "prepared_mesh.npz"
+                self._write_prepared_mesh_npz(prepared_state)
+                artifacts["prepared_mesh_state"] = {"path": "state/prepared_mesh.npz"}
+
+            raw_member = None
+            if self.input_path is not None and Path(self.input_path).exists():
+                raw_name = _safe_archive_name(Path(self.input_path).name, "raw_point_cloud.las")
+                raw_member = f"assets/raw/{raw_name}"
+                artifacts["raw_point_cloud"] = {"path": raw_member, "filename": raw_name}
+
+            if self.segmented_pcd_file_path and Path(self.segmented_pcd_file_path).exists():
+                segmented_name = _safe_archive_name(Path(self.segmented_pcd_file_path).name, "segmented.las")
+                artifacts["segmented_point_cloud"] = {"path": f"assets/segmented/{segmented_name}", "filename": segmented_name}
+            if self.mesh_path and Path(self.mesh_path).exists():
+                mesh_name = _safe_archive_name(Path(self.mesh_path).name, "mesh.ply")
+                artifacts["mesh"] = {"path": f"assets/mesh/{mesh_name}", "filename": mesh_name}
+            if self.analysis_csv_path and Path(self.analysis_csv_path).exists():
+                analysis_name = _safe_archive_name(Path(self.analysis_csv_path).name, "analysis.csv")
+                artifacts["analysis"] = {"path": f"assets/analysis/{analysis_name}", "filename": analysis_name}
+
+            manifest = self._project_manifest({**(ui_state or {}), "project_filename": project_filename}, artifacts, app_build)
+
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("project.json", json.dumps(manifest, indent=2))
+                archive.write(working_state, artifacts["working_state"]["path"])
+                archive.write(marker_las, artifacts["seeds_interface"]["path"])
+                if segmented_state is not None:
+                    archive.write(segmented_state, artifacts["segmented_state"]["path"])
+                if prepared_state is not None:
+                    archive.write(prepared_state, artifacts["prepared_mesh_state"]["path"])
+                if raw_member and self.input_path is not None:
+                    archive.write(Path(self.input_path), raw_member)
+                if "segmented_point_cloud" in artifacts:
+                    archive.write(Path(self.segmented_pcd_file_path), artifacts["segmented_point_cloud"]["path"])
+                if "mesh" in artifacts:
+                    archive.write(Path(self.mesh_path), artifacts["mesh"]["path"])
+                if "analysis" in artifacts:
+                    archive.write(Path(self.analysis_csv_path), artifacts["analysis"]["path"])
+
+        return archive_path
+
+    def _copy_project_member(
+        self,
+        archive: zipfile.ZipFile,
+        member: str | None,
+        target_dir: Path,
+        default_name: str,
+    ) -> Path | None:
+        if not member or member not in archive.namelist():
+            return None
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / _safe_archive_name(Path(member).name, default_name)
+        with archive.open(member) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return target
+
+    def _restore_interface_state(self, workflow_state: dict[str, Any]) -> None:
+        self.rock_seeds = [int(idx) for idx in workflow_state.get("seeds", {}).get("rock", [])]
+        self.pedestal_seeds = [int(idx) for idx in workflow_state.get("seeds", {}).get("pedestal", [])]
+        self.interface_source = workflow_state.get("interface_source")
+        self.display_interface_source = workflow_state.get("display_interface_source")
+
+        def index_array(key: str) -> np.ndarray | None:
+            value = workflow_state.get(key)
+            if value is None:
+                return None
+            return np.asarray(value, dtype=int)
+
+        self.manual_basal_points = index_array("manual_basal_points")
+        self.auto_basal_points = index_array("auto_basal_points")
+        self.basal_points = index_array("basal_points")
+        self.manual_basal_parts_metadata = deepcopy(workflow_state.get("manual_basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.auto_basal_parts_metadata = deepcopy(workflow_state.get("auto_basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.basal_parts_metadata = deepcopy(workflow_state.get("basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.interface_preview_metadata = deepcopy(workflow_state.get("interface_preview_metadata"))
+        self.manual_dense_basal_parts = _metadata_dense_parts(self.manual_basal_parts_metadata)
+        self.manual_dense_basal_parts_is_lateral = _metadata_lateral_flags(self.manual_basal_parts_metadata)
+        self.dense_basal_parts = _metadata_dense_parts(self.basal_parts_metadata)
+        self.dense_basal_parts_is_lateral = _metadata_lateral_flags(self.basal_parts_metadata)
+        if self._has_manual_interface():
+            self.display_interface_source = "manual"
+        elif self.auto_basal_points is not None and len(self.auto_basal_points) > 0:
+            self.display_interface_source = "auto"
+
+        draft = workflow_state.get("interface_edit_draft")
+        if draft:
+            self.interface_edit_draft = {
+                "source": draft.get("source"),
+                "parts": deepcopy(draft.get("parts", []) or []),
+                "close_loop": bool(draft.get("close_loop", True)),
+                "include_indices": list(draft.get("include_indices", []) or []),
+                "exclude_indices": list(draft.get("exclude_indices", []) or []),
+                "effective_indices": list(draft.get("effective_indices", []) or []),
+                "preview_metadata": deepcopy(draft.get("metadata", {}) or {}),
+                "history": [],
+            }
+        self.normals_display_ready = bool(workflow_state.get("normals_display_ready", False))
+
+    def import_project(self, archive_path: Path) -> dict[str, Any]:
+        try:
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                names = archive.namelist()
+                _validate_archive_members(names)
+                if "project.json" not in names:
+                    raise ValueError("Project archive does not contain project.json.")
+                manifest = json.loads(archive.read("project.json").decode("utf-8"))
+                if manifest.get("format") != PROJECT_FORMAT:
+                    raise ValueError("This file is not a Rock Detection 3D project.")
+                if int(manifest.get("schema_version", 0)) != PROJECT_SCHEMA_VERSION:
+                    raise ValueError(f"Unsupported project schema version: {manifest.get('schema_version')}.")
+
+                artifacts = manifest.get("artifacts", {}) or {}
+                workflow_state = manifest.get("workflow_state", {}) or {}
+
+                self.reset_runtime()
+                raw_path = self._copy_project_member(
+                    archive,
+                    (artifacts.get("raw_point_cloud") or {}).get("path"),
+                    self.upload_dir,
+                    "raw_point_cloud.las",
+                )
+                if raw_path is not None:
+                    self.input_path = raw_path
+                    self.current_pbr_file = workflow_state.get("current_file") or raw_path.stem
+                    self.pcd, _, loaded_epsg = self.file_handler.load_las_as_open3d_point_cloud(raw_path)
+                    self.epsg_code = workflow_state.get("epsg_code", loaded_epsg)
+                    self._snapshot_raw_view()
+
+                with tempfile.TemporaryDirectory() as temp_name:
+                    temp_dir = Path(temp_name)
+                    working_state = self._copy_project_member(
+                        archive,
+                        (artifacts.get("working_state") or {}).get("path"),
+                        temp_dir,
+                        "working_point_cloud.npz",
+                    )
+                    if working_state is not None:
+                        self._restore_working_state_npz(working_state)
+
+                    segmented_state = self._copy_project_member(
+                        archive,
+                        (artifacts.get("segmented_state") or {}).get("path"),
+                        temp_dir,
+                        "segmented_state.npz",
+                    )
+                    if segmented_state is not None:
+                        self._restore_segmented_state_npz(segmented_state)
+
+                    prepared_state = self._copy_project_member(
+                        archive,
+                        (artifacts.get("prepared_mesh_state") or {}).get("path"),
+                        temp_dir,
+                        "prepared_mesh.npz",
+                    )
+                    if prepared_state is not None:
+                        self._restore_prepared_mesh_npz(prepared_state)
+
+                if self.pcd is None:
+                    raise ValueError("Project archive does not include restorable point-cloud data.")
+
+                self.current_pbr_file = workflow_state.get("current_file") or self.current_pbr_file or "point_cloud"
+                self.epsg_code = workflow_state.get("epsg_code", self.epsg_code)
+                self._restore_interface_state(workflow_state)
+                self._project_status_from_dict(workflow_state.get("status"))
+
+                segmented_path = self._copy_project_member(
+                    archive,
+                    (artifacts.get("segmented_point_cloud") or {}).get("path"),
+                    self.output_dir,
+                    f"{self.current_pbr_file}_segmented.las",
+                )
+                self.segmented_pcd_file_path = str(segmented_path) if segmented_path is not None else None
+
+                mesh_path = self._copy_project_member(
+                    archive,
+                    (artifacts.get("mesh") or {}).get("path"),
+                    self.output_dir,
+                    f"{self.current_pbr_file}_mesh.ply",
+                )
+                if mesh_path is not None:
+                    self.mesh_path = str(mesh_path)
+                    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+                    if mesh is not None and len(mesh.triangles) > 0:
+                        self.mesh_processor.reconstructed_mesh = mesh
+
+                analysis_path = self._copy_project_member(
+                    archive,
+                    (artifacts.get("analysis") or {}).get("path"),
+                    self.output_dir,
+                    f"{self.current_pbr_file}_analysis.csv",
+                )
+                self.analysis_csv_path = str(analysis_path) if analysis_path is not None else None
+
+                if self.segmented_pcd is None or self.segmented_labels is None:
+                    self.status.segmentation_ready = False
+                if self.voxel_segmented_points is None or self.voxel_segmented_labels is None:
+                    self.status.voxel_segmentation_ready = False
+                else:
+                    self.status.voxel_segmentation_ready = True
+                if not self.prepared_mesh_data:
+                    self.status.mesh_prepared = False
+                if not self.mesh_path:
+                    self.status.mesh_completed = False
+                if not self.analysis_csv_path:
+                    self.status.analysis_completed = False
+                self.status.point_cloud_loaded = True
+                self.status.seeds_ready = bool(self.rock_seeds and self.pedestal_seeds)
+                self.status.manual_interface_ready = self._has_manual_interface()
+                self.status.auto_interface_ready = bool(self.status.auto_interface_ready or self._has_auto_interface())
+                self.status.interface_ready = bool(self.status.manual_interface_ready or self.status.auto_interface_ready or (self.basal_points is not None and len(self.basal_points)))
+
+                return {
+                    "summary": self.summary(),
+                    "ui_state": manifest.get("ui_state", {}) or {},
+                    "project_filename": manifest.get("project_filename") or _safe_filename(self.current_pbr_file, "rock_detection_project", PROJECT_ARCHIVE_SUFFIX),
+                }
+        except zipfile.BadZipFile as exc:
+            raise ValueError("Project file is not a valid ZIP archive.") from exc
 
     def load_point_cloud(self, file_path: Path) -> dict[str, Any]:
         self.reset_runtime()
@@ -388,7 +1073,7 @@ class WebWorkflowSession:
     def _snapshot_seed_view(self) -> None:
         pcd = self._require_pcd()
         self.seed_view_points = np.asarray(pcd.points).copy()
-        self.seed_view_colors = np.asarray(pcd.colors).copy()
+        self.seed_view_colors = np.full((len(self.seed_view_points), 3), 0.5, dtype=float)
         self.seed_view_normals = self._ensure_view_normals(pcd).copy()
 
     def _snapshot_interface_view(self) -> None:
@@ -502,7 +1187,6 @@ class WebWorkflowSession:
         point_count = len(pcd.points)
         self.rock_seeds = [self._validate_index(idx, point_count, "rock seed") for idx in rock_seed_indices]
         self.pedestal_seeds = [self._validate_index(idx, point_count, "pedestal seed") for idx in pedestal_seed_indices]
-        pcd.colors = o3d.utility.Vector3dVector(np.full((point_count, 3), 0.5, dtype=float))
         self._snapshot_seed_view()
         self.status.seeds_ready = bool(self.rock_seeds and self.pedestal_seeds)
         return self.summary()
@@ -2496,6 +3180,7 @@ class WebWorkflowSession:
         self.dense_basal_parts_is_lateral = [bool(part.get("is_lateral")) for part in metadata.get("parts", [])]
         self.basal_parts_metadata = deepcopy(metadata)
         self.interface_source = "manual"
+        self.display_interface_source = "manual"
         self.interface_edit_draft = None
         self.status.interface_draft_ready = False
         self.status.manual_interface_ready = True
@@ -2525,6 +3210,7 @@ class WebWorkflowSession:
         self.dense_basal_parts_is_lateral = [bool(part["is_lateral"]) for part in metadata["parts"]]
         self.basal_parts_metadata = metadata
         self.interface_source = "manual"
+        self.display_interface_source = "manual"
         self._clear_interface_preview_state()
         self.status.manual_interface_ready = True
         self.status.interface_ready = True
@@ -2606,12 +3292,382 @@ class WebWorkflowSession:
             colors[point_indices] = color
         return colors
 
+    def _interface_path_indices_from_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        point_count: int | None = None,
+    ) -> np.ndarray:
+        if not metadata:
+            return np.asarray([], dtype=int)
+        indices: list[int] = []
+        for part in metadata.get("parts", []) or []:
+            part_indices = part.get("point_indices", []) or part.get("selected_indices", []) or []
+            indices.extend(int(idx) for idx in part_indices)
+        if not indices:
+            return np.asarray([], dtype=int)
+        path_indices = np.asarray(indices, dtype=int)
+        if point_count is not None:
+            path_indices = path_indices[(path_indices >= 0) & (path_indices < point_count)]
+        return np.unique(path_indices.astype(int))
+
+    @staticmethod
+    def _sample_interface_indices(indices: np.ndarray, max_count: int = 500) -> np.ndarray:
+        unique = np.unique(np.asarray(indices, dtype=int).reshape(-1))
+        if len(unique) <= max_count:
+            return unique
+        sample_positions = np.linspace(0, len(unique) - 1, max_count).round().astype(int)
+        return unique[sample_positions]
+
+    def _display_interface_state(
+        self,
+        *,
+        metadata_override: dict[str, Any] | None = None,
+        source_override: Literal["manual", "auto"] | None = None,
+    ) -> dict[str, Any] | None:
+        if metadata_override is not None:
+            indices = self._interface_path_indices_from_metadata(
+                metadata_override,
+                point_count=len(self.pcd.points) if self.pcd is not None else None,
+            )
+            return {
+                "source": source_override or self.display_interface_source or self.interface_source or "manual",
+                "metadata": metadata_override,
+                "indices": indices,
+            }
+
+        preferred_sources: list[Literal["manual", "auto"]] = []
+        if self.display_interface_source in {"manual", "auto"}:
+            preferred_sources.append(self.display_interface_source)
+        preferred_sources.extend(["manual", "auto"])
+
+        for source in dict.fromkeys(preferred_sources):
+            if source == "manual" and self._has_manual_interface():
+                return {
+                    "source": "manual",
+                    "metadata": self.manual_basal_parts_metadata,
+                    "indices": self._interface_path_indices_from_metadata(
+                        self.manual_basal_parts_metadata,
+                        point_count=len(self.pcd.points) if self.pcd is not None else None,
+                    ),
+                }
+            if source == "auto" and self._has_auto_interface():
+                indices = np.asarray(self.auto_basal_points, dtype=int).reshape(-1)
+                if self.pcd is not None:
+                    indices = indices[(indices >= 0) & (indices < len(self.pcd.points))]
+                return {
+                    "source": "auto",
+                    "metadata": self.auto_basal_parts_metadata,
+                    "indices": np.unique(indices.astype(int)),
+                }
+        return None
+
+    def _interface_overlay_markers(
+        self,
+        state: dict[str, Any] | None = None,
+        *,
+        max_markers: int = 500,
+    ) -> list[dict[str, Any]]:
+        if self.pcd is None:
+            return []
+        overlay = state if state is not None else self._display_interface_state()
+        if not overlay:
+            return []
+
+        points = np.asarray(self.pcd.points)
+        metadata = overlay.get("metadata") or {}
+        source = str(overlay.get("source") or "interface")
+        markers: list[dict[str, Any]] = []
+
+        for part in metadata.get("parts", []) or []:
+            color = part.get("color") or list(INTERFACE_GREEN)
+            point_indices = np.asarray(part.get("point_indices", []) or part.get("selected_indices", []) or [], dtype=int)
+            if len(point_indices):
+                valid = point_indices[(point_indices >= 0) & (point_indices < len(points))]
+                for idx in self._sample_interface_indices(valid, max_count=max_markers):
+                    markers.append({
+                        "index": int(idx),
+                        "point": points[int(idx)].astype(float).tolist(),
+                        "color": color,
+                        "label": f"Interface {part.get('id', source)}",
+                    })
+            elif part.get("dense_points"):
+                dense_points = np.asarray(part.get("dense_points"), dtype=float)
+                if dense_points.ndim == 2 and dense_points.shape[1] == 3:
+                    stride = max(1, int(np.ceil(len(dense_points) / max_markers)))
+                    for dense_idx, point in enumerate(dense_points[::stride]):
+                        markers.append({
+                            "index": -1,
+                            "point": point.astype(float).tolist(),
+                            "color": color,
+                            "label": f"Interface {part.get('id', source)}",
+                        })
+            if len(markers) >= max_markers:
+                return markers[:max_markers]
+        if markers:
+            return markers
+
+        indices = np.asarray(overlay.get("indices", []), dtype=int)
+        valid_indices = indices[(indices >= 0) & (indices < len(points))]
+        color = list(INTERFACE_GREEN)
+        label = "Interface auto" if source == "auto" else "Interface manual"
+        for idx in self._sample_interface_indices(valid_indices, max_count=max_markers - len(markers)):
+            markers.append({
+                "index": int(idx),
+                "point": points[int(idx)].astype(float).tolist(),
+                "color": color,
+                "label": label,
+            })
+        return markers
+
+    def _overlay_interface_colors(
+        self,
+        colors: np.ndarray,
+        source_indices: np.ndarray | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> np.ndarray:
+        color_array = np.asarray(colors, dtype=float).copy()
+        overlay = state if state is not None else self._display_interface_state()
+        if not overlay:
+            return color_array
+        interface_indices = np.asarray(overlay.get("indices", []), dtype=int).reshape(-1)
+        if len(interface_indices) == 0:
+            return color_array
+
+        if source_indices is None:
+            valid = interface_indices[(interface_indices >= 0) & (interface_indices < len(color_array))]
+            if len(valid):
+                color_array[valid] = np.asarray(INTERFACE_GREEN, dtype=float)
+            return color_array
+
+        source_array = np.asarray(source_indices, dtype=int).reshape(-1)
+        if len(source_array) != len(color_array):
+            return color_array
+        interface_set = set(int(idx) for idx in interface_indices if int(idx) >= 0)
+        if not interface_set:
+            return color_array
+        mask = np.fromiter((int(idx) in interface_set for idx in source_array), dtype=bool, count=len(source_array))
+        if np.any(mask):
+            color_array[mask] = np.asarray(INTERFACE_GREEN, dtype=float)
+        return color_array
+
+    def _markers_with_interface(
+        self,
+        markers: list[dict[str, Any]] | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [*(markers or []), *self._interface_overlay_markers(state)]
+
+    @staticmethod
+    def _colors_from_segmentation_labels(labels: np.ndarray | None, point_count: int) -> np.ndarray:
+        colors = np.full((point_count, 3), 0.5, dtype=float)
+        if labels is None:
+            return colors
+        label_array = np.asarray(labels, dtype=int)
+        usable = min(point_count, len(label_array))
+        if usable == 0:
+            return colors
+        color_slice = colors[:usable]
+        label_slice = label_array[:usable]
+        color_slice[label_slice == 1] = [1.0, 0.0, 0.0]
+        color_slice[label_slice == 0] = [0.0, 0.0, 1.0]
+        return colors
+
+    @staticmethod
+    def _colors_from_branch_ids(
+        labels: np.ndarray | None,
+        branch_ids: np.ndarray | None,
+        branches: list[dict[str, Any]] | None,
+        point_count: int,
+    ) -> np.ndarray:
+        colors = WebWorkflowSession._colors_from_segmentation_labels(labels, point_count)
+        if branch_ids is None:
+            return colors
+        branch_array = np.asarray(branch_ids, dtype=int)
+        if branch_array.ndim != 1 or len(branch_array) != point_count:
+            return colors
+        metadata_by_id: dict[int, dict[str, Any]] = {}
+        for branch in branches or []:
+            try:
+                branch_id = int(branch.get("branch_id"))
+            except (TypeError, ValueError):
+                continue
+            metadata_by_id[branch_id] = branch
+        for branch_id in np.unique(branch_array[branch_array >= 0]):
+            branch = metadata_by_id.get(int(branch_id), {})
+            color = np.asarray(
+                branch.get("color") or BRANCH_COLOR_PALETTE[int(branch_id) % len(BRANCH_COLOR_PALETTE)],
+                dtype=float,
+            )
+            if color.shape != (3,):
+                color = np.asarray(BRANCH_COLOR_PALETTE[int(branch_id) % len(BRANCH_COLOR_PALETTE)], dtype=float)
+            colors[branch_array == int(branch_id)] = np.clip(color, 0.0, 1.0)
+        return colors
+
+    def _snapshot_voxel_segmentation(self) -> None:
+        if self.segmenter is None:
+            return
+        points = getattr(self.segmenter, "voxel_region_points", None)
+        labels = getattr(self.segmenter, "voxel_region_labels", None)
+        if points is None or labels is None:
+            self.status.voxel_segmentation_ready = False
+            return
+        point_array = np.asarray(points, dtype=float)
+        label_array = np.asarray(labels, dtype=int)
+        if point_array.ndim != 2 or point_array.shape[1] != 3 or len(point_array) == 0:
+            self.status.voxel_segmentation_ready = False
+            return
+        normals = getattr(self.segmenter, "voxel_region_normals", None)
+        normal_array = np.asarray(normals, dtype=float) if normals is not None else None
+        if normal_array is not None and normal_array.shape != point_array.shape:
+            normal_array = None
+        branch_ids = getattr(self.segmenter, "voxel_region_branch_ids", None)
+        branch_array = np.asarray(branch_ids, dtype=int) if branch_ids is not None else None
+        if branch_array is not None and (branch_array.ndim != 1 or len(branch_array) != len(point_array)):
+            branch_array = None
+        branches = deepcopy(getattr(self.segmenter, "voxel_region_branches", []) or [])
+        self.voxel_segmented_points = point_array.copy()
+        self.voxel_segmented_labels = label_array.copy()
+        self.voxel_segmented_branch_ids = branch_array.copy() if branch_array is not None else None
+        self.voxel_segmented_branches = branches
+        self.voxel_segmented_colors = self._colors_from_branch_ids(
+            label_array,
+            self.voxel_segmented_branch_ids,
+            self.voxel_segmented_branches,
+            len(point_array),
+        )
+        self.voxel_segmented_normals = normal_array.copy() if normal_array is not None else None
+        self.status.voxel_segmentation_ready = True
+
+    @staticmethod
+    def _branch_summaries_for(
+        branch_ids: np.ndarray | None,
+        branches: list[dict[str, Any]] | None,
+        point_count: int,
+    ) -> list[dict[str, Any]]:
+        if branch_ids is None:
+            return []
+        branch_array = np.asarray(branch_ids, dtype=int)
+        if branch_array.ndim != 1 or len(branch_array) != point_count:
+            return []
+
+        summaries: list[dict[str, Any]] = []
+        metadata_by_id: dict[int, dict[str, Any]] = {}
+        for branch in branches or []:
+            try:
+                branch_id = int(branch.get("branch_id"))
+            except (TypeError, ValueError):
+                continue
+            metadata_by_id[branch_id] = branch
+
+        for branch_id in sorted(int(value) for value in np.unique(branch_array) if int(value) >= 0):
+            metadata = dict(metadata_by_id.get(branch_id, {}))
+            metadata.setdefault("branch_id", branch_id)
+            metadata.setdefault("label", f"Seed {branch_id + 1}")
+            metadata.setdefault("seed_index", branch_id)
+            metadata.setdefault("class_label", "seed")
+            metadata.setdefault("region_index", None)
+            metadata.setdefault("color", BRANCH_COLOR_PALETTE[branch_id % len(BRANCH_COLOR_PALETTE)])
+            metadata["node_count"] = int(np.sum(branch_array == branch_id))
+            summaries.append(metadata)
+        return summaries
+
+    def _voxel_branch_summaries(self) -> list[dict[str, Any]]:
+        point_count = 0 if self.voxel_segmented_points is None else len(self.voxel_segmented_points)
+        return self._branch_summaries_for(
+            self.voxel_segmented_branch_ids,
+            self.voxel_segmented_branches,
+            point_count,
+        )
+
+    def _segmented_branch_summaries(self) -> list[dict[str, Any]]:
+        point_count = 0
+        if self.segmented_pcd is not None:
+            point_count = len(self.segmented_pcd.points)
+        elif self.pcd is not None:
+            point_count = len(self.pcd.points)
+        return self._branch_summaries_for(
+            self.segmented_branch_ids,
+            self.segmented_branches,
+            point_count,
+        )
+
+    def _voxel_seed_markers(self) -> list[dict[str, Any]]:
+        if self.voxel_segmented_points is None or len(self.voxel_segmented_points) == 0:
+            return []
+
+        voxel_points = np.asarray(self.voxel_segmented_points, dtype=float)
+        markers: list[dict[str, Any]] = []
+        branch_summaries = self._voxel_branch_summaries()
+        if branch_summaries:
+            for branch in branch_summaries:
+                try:
+                    idx = int(branch.get("seed_index"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(voxel_points):
+                    color = branch.get("color") or BRANCH_COLOR_PALETTE[int(branch["branch_id"]) % len(BRANCH_COLOR_PALETTE)]
+                    markers.append({
+                        "index": idx,
+                        "point": voxel_points[idx].astype(float).tolist(),
+                        "color": color,
+                        "label": f"{branch.get('label', 'Seed')} ({int(branch.get('node_count', 0))} nodes)",
+                    })
+            return markers
+
+        def seed_indices_from_segmenter(name: str) -> np.ndarray | None:
+            if self.segmenter is None:
+                return None
+            seeds = getattr(self.segmenter, name, None)
+            if seeds is None:
+                return None
+            indices = np.asarray(seeds, dtype=int).reshape(-1)
+            valid = indices[(indices >= 0) & (indices < len(voxel_points))]
+            return np.unique(valid.astype(int))
+
+        def nearest_voxel_indices(source_indices: list[int]) -> np.ndarray:
+            if self.pcd is None or not source_indices:
+                return np.asarray([], dtype=int)
+            dense_points = np.asarray(self.pcd.points)
+            source = np.asarray(source_indices, dtype=int)
+            source = source[(source >= 0) & (source < len(dense_points))]
+            if len(source) == 0:
+                return np.asarray([], dtype=int)
+            tree = cKDTree(voxel_points)
+            _, nearest = tree.query(dense_points[source], k=1)
+            return np.unique(np.asarray(nearest, dtype=int))
+
+        def add_markers(indices: np.ndarray | None, color: list[float], label: str) -> None:
+            if indices is None or len(indices) == 0:
+                return
+            for idx in indices:
+                point = voxel_points[int(idx)]
+                markers.append({
+                    "index": int(idx),
+                    "point": point.astype(float).tolist(),
+                    "color": color,
+                    "label": label,
+                })
+
+        rock_indices = seed_indices_from_segmenter("rock_seeds")
+        pedestal_indices = seed_indices_from_segmenter("pedestal_seeds")
+        if rock_indices is None:
+            rock_indices = nearest_voxel_indices(self.rock_seeds)
+        if pedestal_indices is None:
+            pedestal_indices = nearest_voxel_indices(self.pedestal_seeds)
+
+        add_markers(rock_indices, [1, 0.05, 0.02], "Rock seed")
+        add_markers(pedestal_indices, [0.0, 0.24, 1.0], "Pedestal seed")
+        return markers
+
     def _has_manual_interface(self) -> bool:
         return (
             self.manual_basal_points is not None
             and len(self.manual_basal_points) > 0
             and bool((self.manual_basal_parts_metadata or {}).get("parts"))
         )
+
+    def _has_auto_interface(self) -> bool:
+        return self.auto_basal_points is not None and len(self.auto_basal_points) > 0
 
     def _manual_basal_coords_for_segmentation(self) -> np.ndarray | None:
         if not self._has_manual_interface() or self.manual_basal_points is None or len(self.manual_basal_points) == 0:
@@ -2626,6 +3682,7 @@ class WebWorkflowSession:
         self.dense_basal_parts_is_lateral = list(self.manual_dense_basal_parts_is_lateral)
         self.basal_parts_metadata = deepcopy(self.manual_basal_parts_metadata)
         self.interface_source = "manual"
+        self.display_interface_source = "manual"
         self.status.interface_ready = True
 
     def _active_basal_export_data(self) -> dict[str, Any] | np.ndarray | None:
@@ -2641,18 +3698,22 @@ class WebWorkflowSession:
         self.status.mesh_completed = False
         self.status.analysis_completed = False
 
-    def _set_automatic_interface_from_segmentation(self) -> np.ndarray:
-        if self.segmented_labels is None:
+    def _set_automatic_interface_from_segmentation(self, labels: np.ndarray | None = None) -> np.ndarray:
+        label_source = labels if labels is not None else self.segmented_labels
+        if label_source is None:
             raise ValueError("Run segmentation before detecting an automatic interface.")
         pcd = self._require_pcd()
         points = np.asarray(pcd.points)
+        label_array = np.asarray(label_source, dtype=int).reshape(-1)
+        if len(label_array) != len(points):
+            raise ValueError("Automatic interface labels do not match the point cloud.")
         colors = np.asarray(pcd.colors)
         if colors.shape != points.shape:
             colors = np.full((len(points), 3), 0.5, dtype=float)
         else:
             colors = colors.copy()
 
-        basal_mask = np.asarray(self.detect_basal_points_optimized(points, self.segmented_labels), dtype=bool)
+        basal_mask = np.asarray(self.detect_basal_points_optimized(points, label_array), dtype=bool)
         basal_indices = np.flatnonzero(basal_mask)
         if len(basal_indices):
             colors[basal_indices] = np.asarray(INTERFACE_GREEN, dtype=float)
@@ -2676,6 +3737,7 @@ class WebWorkflowSession:
         }
         self.auto_basal_parts_metadata = deepcopy(self.basal_parts_metadata)
         self.interface_source = "auto"
+        self.display_interface_source = "auto"
         self.status.interface_ready = bool(len(basal_indices))
         self.status.auto_interface_ready = bool(len(basal_indices))
         self.interface_edit_draft = None
@@ -2688,7 +3750,30 @@ class WebWorkflowSession:
     def segment_icrg(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._run_segmentation(params, use_manual_interface=True)
 
-    def _run_segmentation(self, params: dict[str, Any] | None = None, *, use_manual_interface: bool) -> dict[str, Any]:
+    def segment_region_growing(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._run_segmentation(
+            params,
+            use_manual_interface=False,
+            complete_label_propagation=False,
+        )
+
+    def segment_icrg_region_growing(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._run_segmentation(
+            params,
+            use_manual_interface=True,
+            complete_label_propagation=False,
+        )
+
+    def label_propagation(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._complete_label_propagation(params)
+
+    def _run_segmentation(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        use_manual_interface: bool,
+        complete_label_propagation: bool = True,
+    ) -> dict[str, Any]:
         pcd = self._require_pcd()
         if not self.rock_seeds or not self.pedestal_seeds:
             raise ValueError("Seed selection is required before segmentation.")
@@ -2709,6 +3794,32 @@ class WebWorkflowSession:
             basal_coords = None
         used_manual_interface_constraint = basal_coords is not None
         segmentation_mode: Literal["rg", "icrg"] = "icrg" if used_manual_interface_constraint else "rg"
+        self.voxel_segmented_points = None
+        self.voxel_segmented_colors = None
+        self.voxel_segmented_normals = None
+        self.voxel_segmented_labels = None
+        self.voxel_segmented_branch_ids = None
+        self.voxel_segmented_branches = []
+        self.segmented_branch_ids = None
+        self.segmented_branches = []
+        self.segmented_pcd = None
+        self.segmented_labels = None
+        self.region_growing_dense_labels = None
+        self.region_growing_dense_branch_ids = None
+        self.segmented_pcd_file_path = None
+        self.status.voxel_segmentation_ready = False
+        self.status.segmentation_ready = False
+        self.status.last_segmentation_mode = segmentation_mode
+        self.status.mesh_prepared = False
+        self.status.mesh_completed = False
+        self.status.analysis_completed = False
+        self.prepared_mesh_data = None
+        self.normals_display_ready = False
+        self.noise_removal_history = []
+        self.mesh_processor.reconstructed_mesh = None
+        self.mesh_processor.temp_mesh_path = None
+        self.mesh_path = None
+        self.analysis_csv_path = None
 
         self.segmenter = RegionGrowingSegmentation(
             pcd,
@@ -2725,10 +3836,62 @@ class WebWorkflowSession:
             stepwise_visualize=False,
         )
         self.segmenter.segment()
-        self.segmenter.conditional_label_propagation()
+        self._snapshot_voxel_segmentation()
+        self.region_growing_dense_labels = np.asarray(self.segmenter.labels, dtype=int).copy()
+        branch_ids = getattr(self.segmenter, "branch_ids", None)
+        self.region_growing_dense_branch_ids = (
+            np.asarray(branch_ids, dtype=int).copy() if branch_ids is not None else None
+        )
+
+        if not complete_label_propagation:
+            auto_interface_indices = np.asarray([], dtype=int)
+            if not used_manual_interface_constraint:
+                auto_interface_indices = self._set_automatic_interface_from_segmentation(
+                    self.region_growing_dense_labels
+                )
+            voxel_labels = np.asarray(self.voxel_segmented_labels, dtype=int)
+            return {
+                "label_counts": {
+                    "unlabeled": int(np.sum(voxel_labels == -1)),
+                    "pedestal": int(np.sum(voxel_labels == 0)),
+                    "rock": int(np.sum(voxel_labels == 1)),
+                },
+                "used_manual_interface_constraint": used_manual_interface_constraint,
+                "segmentation_mode": segmentation_mode,
+                "auto_interface_generated": bool(len(auto_interface_indices)),
+                "auto_interface_point_count": int(len(auto_interface_indices)),
+                "view": "voxel_segmented",
+                "summary": self.summary(),
+            }
+
+        return self._complete_label_propagation(params)
+
+    def _complete_label_propagation(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.segmenter is None or self.region_growing_dense_labels is None:
+            raise ValueError("Run region growing before label propagation.")
+        params = params or {}
+        segmentation_mode: Literal["rg", "icrg"] = self.status.last_segmentation_mode or "rg"
+        used_manual_interface_constraint = segmentation_mode == "icrg"
+        label_propagation_distance = float(params.get(
+            "label_propagation_distance",
+            _deep_get(self.config, "region_growing.label_propagation_distance", 0.05),
+        ))
+
+        self.segmenter.labels = self.region_growing_dense_labels.copy()
+        if self.region_growing_dense_branch_ids is not None:
+            self.segmenter.branch_ids = self.region_growing_dense_branch_ids.copy()
+        self.segmenter.conditional_label_propagation(
+            distance_threshold=label_propagation_distance
+        )
         colored_pcd = self.segmenter.color_point_cloud()
         labels = np.asarray(self.segmenter.labels)
         labels[labels == -1] = 0
+        branch_ids = getattr(self.segmenter, "branch_ids", None)
+        branch_array = np.asarray(branch_ids, dtype=int) if branch_ids is not None else None
+        if branch_array is not None and (branch_array.ndim != 1 or len(branch_array) != len(labels)):
+            branch_array = None
+        self.segmented_branch_ids = branch_array.copy() if branch_array is not None else None
+        self.segmented_branches = deepcopy(getattr(self.segmenter, "_branch_summary")() if hasattr(self.segmenter, "_branch_summary") else [])
 
         self.pcd = colored_pcd
         self._ensure_view_normals(self.pcd)
@@ -3170,7 +4333,12 @@ class WebWorkflowSession:
             "summary": self.summary(),
         }
 
-    def viewer_payload(self, view_name: str, mesh_url: str | None = None) -> dict[str, Any]:
+    def viewer_payload(
+        self,
+        view_name: str,
+        mesh_url: str | None = None,
+        color_mode: str | None = None,
+    ) -> dict[str, Any]:
         if view_name == "mesh":
             if not self.mesh_path:
                 raise ValueError("No reconstructed mesh is available.")
@@ -3183,11 +4351,13 @@ class WebWorkflowSession:
             if self.raw_view_points is None or self.raw_view_colors is None:
                 pcd = self._require_pcd()
                 self._snapshot_raw_view()
+            indices = np.arange(len(self.raw_view_points), dtype=int)
+            interface_state = self._display_interface_state()
             return self._point_payload(
                 self.raw_view_points,
-                self.raw_view_colors,
-                np.arange(len(self.raw_view_points), dtype=int),
-                markers=[],
+                self._overlay_interface_colors(self.raw_view_colors, indices, interface_state),
+                indices,
+                markers=self._markers_with_interface([], interface_state),
                 normals=self._cached_normals_for_points(self.raw_view_points, self.raw_view_normals),
             )
         elif view_name == "seeds":
@@ -3199,11 +4369,16 @@ class WebWorkflowSession:
                 points = np.asarray(pcd.points)
                 colors = np.asarray(pcd.colors)
                 normals = self._ensure_view_normals(pcd)
+            indices = np.arange(len(points), dtype=int)
+            interface_state = self._display_interface_state()
             return self._point_payload(
                 points,
-                colors,
-                np.arange(len(points), dtype=int),
-                markers=self._current_markers(include_interface=False),
+                self._overlay_interface_colors(colors, indices, interface_state),
+                indices,
+                markers=self._markers_with_interface(
+                    self._current_markers(include_interface=False),
+                    interface_state,
+                ),
                 normals=self._cached_normals_for_points(points, normals),
             )
         elif view_name == "interface":
@@ -3212,11 +4387,16 @@ class WebWorkflowSession:
                 colors = self.interface_preview_view_colors
                 normals = self.interface_preview_view_normals
                 interface_metadata = self.interface_preview_metadata
+                interface_state = self._display_interface_state(
+                    metadata_override=interface_metadata,
+                    source_override=self.interface_source,
+                )
             else:
                 points = self.interface_view_points
                 colors = self.interface_view_colors
                 normals = self.interface_view_normals
                 interface_metadata = self.basal_parts_metadata
+                interface_state = self._display_interface_state()
             if points is None or colors is None:
                 points = self.seed_view_points if self.seed_view_points is not None else self.raw_view_points
                 colors = self.seed_view_colors if self.seed_view_colors is not None else self.raw_view_colors
@@ -3226,11 +4406,15 @@ class WebWorkflowSession:
                 points = np.asarray(pcd.points)
                 colors = np.asarray(pcd.colors)
                 normals = self._ensure_view_normals(pcd)
+            indices = np.arange(len(points), dtype=int)
             payload = self._point_payload(
                 points,
-                colors,
-                np.arange(len(points), dtype=int),
-                markers=self._current_markers(include_interface=True, interface_metadata=interface_metadata),
+                self._overlay_interface_colors(colors, indices, interface_state),
+                indices,
+                markers=self._markers_with_interface(
+                    self._current_markers(include_interface=False),
+                    interface_state,
+                ),
                 normals=self._cached_normals_for_points(points, normals),
             )
             interface_points, interface_normals = self._interface_normal_arrays(interface_metadata)
@@ -3248,8 +4432,75 @@ class WebWorkflowSession:
                     scale_fraction=NORMAL_VECTOR_SCALE_FRACTION,
                 )
             return payload
+        elif view_name == "voxel_segmented":
+            if self.voxel_segmented_points is None or self.voxel_segmented_colors is None:
+                raise ValueError("No voxelized segmentation result is available.")
+            interface_state = self._display_interface_state()
+            payload = self._point_payload(
+                self.voxel_segmented_points,
+                self.voxel_segmented_colors,
+                np.arange(len(self.voxel_segmented_points), dtype=int),
+                markers=self._markers_with_interface(self._voxel_seed_markers(), interface_state),
+                normals=self.voxel_segmented_normals,
+            )
+            if self.voxel_segmented_labels is not None:
+                labels = np.asarray(self.voxel_segmented_labels, dtype=int)
+                payload["label_counts"] = {
+                    "unlabeled": int(np.sum(labels == -1)),
+                    "pedestal": int(np.sum(labels == 0)),
+                    "rock": int(np.sum(labels == 1)),
+                }
+            seed_branches = self._voxel_branch_summaries()
+            if seed_branches:
+                payload["seed_branches"] = seed_branches
+            return payload
         elif view_name == "segmented":
             pcd = self.segmented_pcd
+            if pcd is not None and color_mode == "multi_seed" and self.segmented_branch_ids is not None:
+                points = np.asarray(pcd.points)
+                colors = self._colors_from_branch_ids(
+                    self.segmented_labels,
+                    self.segmented_branch_ids,
+                    self.segmented_branches,
+                    len(points),
+                )
+                indices = np.arange(len(points), dtype=int)
+                interface_state = self._display_interface_state()
+                colors = self._overlay_interface_colors(colors, indices, interface_state)
+                payload = self._point_payload(
+                    points,
+                    colors,
+                    indices,
+                    markers=self._markers_with_interface([], interface_state),
+                    normals=self._ensure_view_normals(pcd),
+                )
+                seed_branches = self._segmented_branch_summaries()
+                if seed_branches:
+                    payload["seed_branches"] = seed_branches
+                payload["segmented_color_mode"] = "multi_seed"
+                return payload
+            if pcd is not None:
+                points = np.asarray(pcd.points)
+                colors = np.asarray(pcd.colors)
+                if colors.shape != points.shape:
+                    colors = np.full((len(points), 3), 0.5, dtype=float)
+                else:
+                    colors = colors.copy()
+                indices = np.arange(len(points), dtype=int)
+                interface_state = self._display_interface_state()
+                colors = self._overlay_interface_colors(colors, indices, interface_state)
+                payload = self._point_payload(
+                    points,
+                    colors,
+                    indices,
+                    markers=self._markers_with_interface([], interface_state),
+                    normals=self._ensure_view_normals(pcd),
+                )
+                seed_branches = self._segmented_branch_summaries()
+                if seed_branches:
+                    payload["seed_branches"] = seed_branches
+                payload["segmented_color_mode"] = "two_color"
+                return payload
             markers = []
         elif view_name == "mesh_prepared":
             if not self.prepared_mesh_data:
@@ -3258,7 +4509,7 @@ class WebWorkflowSession:
                 self.prepared_mesh_data["combined_points"],
                 self.prepared_mesh_data["combined_colors"],
                 np.arange(len(self.prepared_mesh_data["combined_points"]), dtype=int),
-                markers=[],
+                markers=self._markers_with_interface([]),
                 normals=self.prepared_mesh_data.get("combined_normals"),
             )
             payload["rock_point_count"] = int(len(self.prepared_mesh_data["rock_pcd"].points))
@@ -3275,18 +4526,24 @@ class WebWorkflowSession:
             return payload
         else:
             pcd = self._require_pcd()
-            markers = self._current_markers()
+            markers = self._markers_with_interface(self._current_markers(include_interface=False))
 
         if pcd is None:
             raise ValueError(f"View '{view_name}' is not available yet.")
 
-        return self._point_payload(
+        payload = self._point_payload(
             np.asarray(pcd.points),
             np.asarray(pcd.colors),
             np.arange(len(pcd.points), dtype=int),
             markers=markers,
             normals=self._ensure_view_normals(pcd),
         )
+        if view_name == "segmented":
+            seed_branches = self._segmented_branch_summaries()
+            if seed_branches:
+                payload["seed_branches"] = seed_branches
+            payload["segmented_color_mode"] = "two_color"
+        return payload
 
     def _point_payload(
         self,

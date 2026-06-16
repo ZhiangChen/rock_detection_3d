@@ -9,6 +9,20 @@ from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_
 import time
 
 
+BRANCH_COLOR_PALETTE = [
+    [0.93, 0.18, 0.14],
+    [0.10, 0.36, 0.95],
+    [0.96, 0.62, 0.05],
+    [0.00, 0.62, 0.45],
+    [0.55, 0.28, 0.90],
+    [0.90, 0.20, 0.58],
+    [0.42, 0.70, 0.12],
+    [0.13, 0.66, 0.86],
+    [0.75, 0.38, 0.00],
+    [0.35, 0.35, 0.35],
+]
+
+
 def load_las_as_open3d_point_cloud(las_file_path, evaluate=False):
     """
     Load a LAS file and convert it to an Open3D point cloud.
@@ -123,17 +137,19 @@ class RegionGrowingSegmentation:
             self.rock_seeds = rock_seeds
             self.pedestal_seeds = pedestal_seeds
 
-        # Estimate normals
+        self.num_neighbors = self._bounded_neighbor_count(num_neighbors, len(self.pcd.points))
+
+        # Estimate normals used by the smoothness and curvature tests.
         radius_normal = voxel_size * 5
         self.pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=radius_normal, max_nn=50
+                radius=radius_normal, max_nn=self.num_neighbors
             )
         )
-        self.pcd.orient_normals_consistent_tangent_plane(k=10)
+        orientation_neighbors = max(1, min(self.num_neighbors, max(len(self.pcd.points) - 1, 1)))
+        self.pcd.orient_normals_consistent_tangent_plane(k=orientation_neighbors)
         self.pcd.normals = o3d.utility.Vector3dVector(-np.asarray(self.pcd.normals))
 
-        self.num_neighbors = num_neighbors
         self.smoothness_threshold = smoothness_threshold
         self.distance_threshold = distance_threshold
         self.curvature_threshold = curvature_threshold
@@ -141,17 +157,197 @@ class RegionGrowingSegmentation:
         self.use_curvature = use_curvature
         self.basal_points = basal_points
         self.basal_proximity_threshold = basal_proximity_threshold
-        self.basal_proximity_check = (
-            True if np.any(self.basal_points) else False
-        )  # Enable the proximity check if basal points are provided, otherwise keep it disabled
+        self.basal_proximity_check = self._has_basal_constraint_points(
+            self.basal_points
+        )
         self.stepwise_visualize = stepwise_visualize
+        self.voxel_region_points = None
+        self.voxel_region_normals = None
+        self.voxel_region_labels = None
+        self.voxel_region_branch_ids = None
+        self.voxel_region_branches = []
 
         self.labels = np.array([-1] * len(self.pcd.points))
+        self.branch_ids = np.array([-1] * len(self.pcd.points), dtype=np.int32)
+        self.branch_metadata = []
+        self.rock_seeds = self._normalize_seed_indices(getattr(self, "rock_seeds", rock_seeds))
+        self.pedestal_seeds = self._normalize_seed_indices(getattr(self, "pedestal_seeds", pedestal_seeds))
         print(f"Points before downsampling: {len(self.original_pcd.points)}")
         print(f"Points after downsampling: {len(self.labels)}")  # -1 indicates unlabeled
         self.normals = np.asarray(self.pcd.normals)
         self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
         print("Performing region growing with", self.smoothness_threshold, "smoothness threshold", self.curvature_threshold, "curvature threshold") 
+
+    def _normalize_seed_indices(self, seeds):
+        """
+        Return a sorted array of unique valid seed indices for the current working cloud.
+        """
+        if seeds is None:
+            return None
+        seed_array = np.asarray(seeds, dtype=int).reshape(-1)
+        if seed_array.size == 0:
+            return np.asarray([], dtype=int)
+        point_count = len(self.pcd.points)
+        valid = seed_array[(seed_array >= 0) & (seed_array < point_count)]
+        return np.unique(valid.astype(int))
+
+    @staticmethod
+    def _bounded_neighbor_count(num_neighbors, point_count):
+        try:
+            requested = int(num_neighbors)
+        except (TypeError, ValueError):
+            requested = 50
+        requested = max(1, requested)
+        if point_count <= 0:
+            return requested
+        return max(1, min(requested, int(point_count)))
+
+    @staticmethod
+    def _has_basal_constraint_points(basal_points):
+        if basal_points is None:
+            return False
+        return np.asarray(basal_points).size > 0
+
+    def _initialize_seed_labels(self):
+        """
+        Treat user-provided rock and pedestal seeds as hard constraints before
+        either region starts growing.
+        """
+        rock_seeds = self._normalize_seed_indices(self.rock_seeds)
+        pedestal_seeds = self._normalize_seed_indices(self.pedestal_seeds)
+        if rock_seeds is None or len(rock_seeds) == 0:
+            raise ValueError("No valid rock seeds provided")
+        if pedestal_seeds is None or len(pedestal_seeds) == 0:
+            raise ValueError("No valid pedestal seeds provided")
+
+        overlap = np.intersect1d(rock_seeds, pedestal_seeds)
+        if len(overlap):
+            raise ValueError(
+                "Rock and pedestal seeds overlap after voxel transfer. "
+                "Choose seeds farther apart or use a smaller voxel size."
+            )
+
+        self.rock_seeds = rock_seeds
+        self.pedestal_seeds = pedestal_seeds
+        self.labels[rock_seeds] = 1
+        self.labels[pedestal_seeds] = 0
+        self.branch_ids[:] = -1
+        self.branch_metadata = []
+
+        def assign_branch_metadata(seeds, region_index, class_label, label_prefix):
+            for local_index, seed_index in enumerate(seeds, start=1):
+                branch_id = len(self.branch_metadata)
+                self.branch_ids[int(seed_index)] = branch_id
+                self.branch_metadata.append(
+                    {
+                        "branch_id": int(branch_id),
+                        "seed_index": int(seed_index),
+                        "region_index": int(region_index),
+                        "class_label": class_label,
+                        "label": f"{label_prefix} seed {local_index}",
+                        "color": BRANCH_COLOR_PALETTE[branch_id % len(BRANCH_COLOR_PALETTE)],
+                    }
+                )
+
+        assign_branch_metadata(rock_seeds, 1, "rock", "Rock")
+        assign_branch_metadata(pedestal_seeds, 0, "pedestal", "Pedestal")
+
+    def _branch_summary(self):
+        summaries = []
+        for branch in self.branch_metadata:
+            branch_id = int(branch["branch_id"])
+            summary = dict(branch)
+            summary["node_count"] = int(np.sum(self.branch_ids == branch_id))
+            summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _majority_vote(values, default=-1):
+        values = np.asarray(values, dtype=int).reshape(-1)
+        values = values[values >= 0]
+        if len(values) == 0:
+            return int(default)
+        return int(np.bincount(values).argmax())
+
+    @staticmethod
+    def _distance_weighted_vote(values, distances, default=-1, epsilon=1e-12):
+        values = np.asarray(values, dtype=int).reshape(-1)
+        distances = np.asarray(distances, dtype=float).reshape(-1)
+        if values.shape != distances.shape:
+            raise ValueError("values and distances must have the same shape")
+
+        valid = (values >= 0) & np.isfinite(distances)
+        if not np.any(valid):
+            return int(default)
+
+        values = values[valid]
+        distances = np.maximum(distances[valid], 0.0)
+        weights = 1.0 / np.maximum(distances, epsilon)
+
+        candidates = []
+        for value in np.unique(values):
+            value_mask = values == value
+            candidates.append(
+                (
+                    int(value),
+                    float(np.sum(weights[value_mask])),
+                    float(np.min(distances[value_mask])),
+                )
+            )
+
+        max_weight = max(candidate[1] for candidate in candidates)
+        tied_by_weight = [
+            candidate
+            for candidate in candidates
+            if np.isclose(candidate[1], max_weight, rtol=1e-12, atol=1e-12)
+        ]
+        closest_distance = min(candidate[2] for candidate in tied_by_weight)
+        tied_by_distance = [
+            candidate
+            for candidate in tied_by_weight
+            if np.isclose(candidate[2], closest_distance, rtol=1e-12, atol=1e-12)
+        ]
+        return min(candidate[0] for candidate in tied_by_distance)
+
+    def _majority_branch_for_neighbors(self, neighbor_indices, selected_label=None):
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            return -1
+        neighbor_indices = np.asarray(neighbor_indices, dtype=int).reshape(-1)
+        if len(neighbor_indices) == 0:
+            return -1
+        valid = (neighbor_indices >= 0) & (neighbor_indices < len(self.branch_ids))
+        neighbor_indices = neighbor_indices[valid]
+        if len(neighbor_indices) == 0:
+            return -1
+        branch_values = self.branch_ids[neighbor_indices]
+        branch_mask = branch_values >= 0
+        if selected_label is not None:
+            branch_mask &= self.labels[neighbor_indices] == int(selected_label)
+        return self._majority_vote(branch_values[branch_mask], default=-1)
+
+    def _distance_weighted_branch_for_neighbors(self, neighbor_indices, distances, selected_label=None):
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            return -1
+        neighbor_indices = np.asarray(neighbor_indices, dtype=int).reshape(-1)
+        distances = np.asarray(distances, dtype=float).reshape(-1)
+        if neighbor_indices.shape != distances.shape:
+            raise ValueError("neighbor_indices and distances must have the same shape")
+        if len(neighbor_indices) == 0:
+            return -1
+        valid = (neighbor_indices >= 0) & (neighbor_indices < len(self.branch_ids))
+        neighbor_indices = neighbor_indices[valid]
+        distances = distances[valid]
+        if len(neighbor_indices) == 0:
+            return -1
+        branch_values = self.branch_ids[neighbor_indices]
+        branch_mask = branch_values >= 0
+        if selected_label is not None:
+            branch_mask &= self.labels[neighbor_indices] == int(selected_label)
+        return self._distance_weighted_vote(
+            branch_values[branch_mask],
+            distances[branch_mask],
+            default=-1,
+        )
 
     def precompute_neighbors(self):
         """
@@ -236,11 +432,13 @@ class RegionGrowingSegmentation:
         Perform region growing segmentation starting from the given seeds.
         """
 
-        # Initialize the queue with the starting points (seeds) for region growing
-        queue = deque(starting_queue)
+        seed_indices = self._normalize_seed_indices(starting_queue)
+        if seed_indices is None or len(seed_indices) == 0:
+            return
 
-        # Label the initial point (seed) with the current region index
-        self.labels[starting_queue[0]] = region_index
+        # Label every seed for this region, then start growing from all of them.
+        self.labels[seed_indices] = region_index
+        queue = deque(seed_indices.tolist())
 
         points_marked = 0
 
@@ -255,6 +453,8 @@ class RegionGrowingSegmentation:
 
             # Get the next point from the queue
             current_index = queue.popleft()
+            if self.labels[current_index] != region_index:
+                continue
             current_point = np.asarray(self.pcd.points)[current_index]
 
             # Check if basal proximity check is enabled and compute distance to nearest basal point
@@ -319,6 +519,7 @@ class RegionGrowingSegmentation:
                     self.use_smoothness and min_dot_product >= self.smoothness_threshold
                 ) or (self.use_curvature and curvature < self.curvature_threshold):
                     self.labels[neighbor_index] = region_index
+                    self.branch_ids[neighbor_index] = self.branch_ids[current_index]
                     queue.append(neighbor_index)
 
         print(f"Points marked: {points_marked}")
@@ -354,10 +555,16 @@ class RegionGrowingSegmentation:
             self.pedestal_seeds = [bottommost_point_index]
 
         neighbors = self.precompute_neighbors()
+        self._initialize_seed_labels()
 
         # Grow the region starting from rock and pedestal seeds
         self.grow_region(self.rock_seeds, region_index=1, neighbors=neighbors)
         self.grow_region(self.pedestal_seeds, region_index=0, neighbors=neighbors)
+        self.voxel_region_points = np.asarray(self.pcd.points).copy()
+        self.voxel_region_normals = np.asarray(self.pcd.normals).copy() if self.pcd.has_normals() else None
+        self.voxel_region_labels = self.labels.copy()
+        self.voxel_region_branch_ids = self.branch_ids.copy()
+        self.voxel_region_branches = self._branch_summary()
 
         # Transfer labels back to original dense point cloud if downsampling was used
         if hasattr(self, 'original_pcd'):
@@ -366,6 +573,11 @@ class RegionGrowingSegmentation:
                 self.original_pcd, 
                 self.pcd, 
                 self.labels
+            )
+            self.branch_ids = self.transfer_labels_to_dense(
+                self.original_pcd,
+                self.pcd,
+                self.branch_ids,
             )
             # Update the point cloud and KD-tree to use the original dense point cloud
             self.pcd = self.original_pcd
@@ -404,6 +616,8 @@ class RegionGrowingSegmentation:
         """
         points = np.asarray(self.pcd.points)
         tree = self.pcd_tree
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            self.branch_ids = np.full(len(self.labels), -1, dtype=np.int32)
 
         unlabeled_indices = np.where(self.labels == -1)[0]
         print(f"Starting label propagation with {len(unlabeled_indices)} unlabeled points")
@@ -416,15 +630,29 @@ class RegionGrowingSegmentation:
         while len(unlabeled_indices) > 0:
             for index in unlabeled_indices:
                 # Find the neighbors within a certain radius
-                [k, idx, _] = tree.search_radius_vector_3d(
+                [k, idx, squared_distances] = tree.search_radius_vector_3d(
                     points[index], distance_threshold
+                )
+                idx = np.asarray(idx, dtype=int)
+                distances = np.sqrt(
+                    np.maximum(np.asarray(squared_distances, dtype=float), 0.0)
                 )
                 neighbor_labels = self.labels[idx]
                 # Filter out the unlabeled neighbors
                 labeled_neighbors = neighbor_labels[neighbor_labels != -1]
                 if len(labeled_neighbors) > 0:
-                    # Assign the most common label among the neighbors
-                    self.labels[index] = np.bincount(labeled_neighbors).argmax()
+                    selected_label = self._distance_weighted_vote(
+                        neighbor_labels,
+                        distances,
+                    )
+                    self.labels[index] = selected_label
+                    selected_branch = self._distance_weighted_branch_for_neighbors(
+                        idx,
+                        distances,
+                        selected_label,
+                    )
+                    if selected_branch >= 0:
+                        self.branch_ids[index] = selected_branch
                     points_processed += 1
 
                     if self.stepwise_visualize and points_processed % 10 == 0:
@@ -466,20 +694,31 @@ class RegionGrowingSegmentation:
                 labeled_points = points[labeled_indices]
                 unlabeled_points = points[unlabeled_indices]
                 
-                # Use sklearn NearestNeighbors to search among labeled points only
-                # Use k=10 for majority voting (more robust than single nearest neighbor)
+                # Use sklearn NearestNeighbors to search among labeled points only.
+                # Use k=10 for distance-weighted voting.
                 k = min(10, len(labeled_indices))
                 nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(labeled_points)
                 distances, indices = nbrs.kneighbors(unlabeled_points)
                 
-                # Assign labels based on majority vote among k nearest labeled neighbors
+                # Assign labels based on distance-weighted votes among k nearest labeled neighbors.
                 for i, unlabeled_idx in enumerate(unlabeled_indices):
-                    neighbor_labels = self.labels[labeled_indices[indices[i]]]
-                    # Majority vote
-                    self.labels[unlabeled_idx] = np.bincount(neighbor_labels).argmax()
+                    neighbor_indices = labeled_indices[indices[i]]
+                    neighbor_labels = self.labels[neighbor_indices]
+                    selected_label = self._distance_weighted_vote(
+                        neighbor_labels,
+                        distances[i],
+                    )
+                    self.labels[unlabeled_idx] = selected_label
+                    selected_branch = self._distance_weighted_branch_for_neighbors(
+                        neighbor_indices,
+                        distances[i],
+                        selected_label,
+                    )
+                    if selected_branch >= 0:
+                        self.branch_ids[unlabeled_idx] = selected_branch
                 
                 final_unlabeled = np.sum(self.labels == -1)
-                print(f"Final assignment complete. Assigned {len(unlabeled_indices)} points using k={k} voting. {final_unlabeled} points still unlabeled (if any)")
+                print(f"Final assignment complete. Assigned {len(unlabeled_indices)} points using k={k} distance-weighted voting. {final_unlabeled} points still unlabeled (if any)")
 
         return self.labels
 

@@ -1,4 +1,9 @@
-const REQUIRED_RUNTIME_BUILD = "20260615-interface-width1";
+const REQUIRED_RUNTIME_BUILD = "20260615-threshold-help";
+
+const MEASUREMENT_COLORS = [
+  [1.0, 0.76, 0.12],
+  [0.0, 0.78, 1.0]
+];
 
 const state = {
   session: null,
@@ -31,6 +36,8 @@ const state = {
   pickColorBuffer: null,
   normalPositionBuffer: null,
   normalColorBuffer: null,
+  measurementLinePositionBuffer: null,
+  measurementLineColorBuffer: null,
   markerPositionBuffer: null,
   markerColorBuffer: null,
   markerHaloPositionBuffer: null,
@@ -48,6 +55,7 @@ const state = {
   markerHaloColors: null,
   pointCount: 0,
   normalLineCount: 0,
+  measurementLineCount: 0,
   markerCount: 0,
   markerHaloCount: 0,
   meshVertexCount: 0,
@@ -89,7 +97,14 @@ const state = {
   seedSaveInFlight: false,
   seedSaveQueued: false,
   seedSavePromise: null,
-  seedSaveSignature: ""
+  seedSaveSignature: "",
+  projectFilename: "rock_detection_project.rd3dproj",
+  projectHasSaveTarget: false,
+  projectSaveHandle: null,
+  segmentedColorMode: "two_color",
+  measurementActive: false,
+  measurementPoints: [],
+  measurementDistance: null
 };
 
 const el = {};
@@ -100,20 +115,22 @@ function $(id) {
 
 function initElements() {
   [
-    "currentFile", "fileInput", "statusList", "activeViewLabel", "viewMeta", "viewer", "toast",
+    "currentFile", "fileInput", "importProjectInput", "saveProject", "saveProjectAs",
+    "statusList", "activeViewLabel", "viewMeta", "viewer", "branchLegend", "toast",
     "infoTooltip",
-    "toggleTips",
+    "toggleTips", "measurementToggle", "measurementClear", "measurementReadout", "measurementPointA", "measurementPointB",
     "rockCount", "pedestalCount", "interfaceCount", "partsCount", "pointSize", "pickRock", "pickPedestal",
     "pickInterface", "autoSeeds", "clearCurrentPick",
     "interfaceWindow", "interfaceWindowHandle", "closeInterfaceWindow", "partLateral", "closeLoop", "stagePart",
     "interpolateInterface", "saveInterface", "interfaceSourceChooser",
     "editAutoDraft", "editManualDraft", "clearParts",
     "interfaceEditorOverlay", "interfaceEditorWindow",
-    "editorAnchorMode", "editorBrushAddMode", "editorBrushRemoveMode", "editorUndo",
+    "editorAnchorMode", "editorBrushAddMode", "editorBrushRemoveMode", "editorUndo", "editorQuit",
     "editorSaveManual", "editorReadout", "editorBrushSettings", "editorBrushRadius", "editorBrushRadiusValue",
     "editorOrderRow", "editorShowOrder",
     "smoothness", "curvature", "proximity", "voxel",
-    "neighbors", "distance", "runSegment", "runICRG", "prepareMesh", "removeNoise", "undoNoise",
+    "neighbors", "distance", "labelPropagationDistance", "runSegment", "runICRG", "runLabelPropagation",
+    "prepareMesh", "removeNoise", "undoNoise",
     "manualRemoval", "manualRemovalOverlay", "manualRemovalWindow", "manualRemovalWindowHandle",
     "closeManualRemovalWindow", "manualRemovalDraw", "manualRemovalUndoVertex", "manualRemovalClear",
     "manualRemovalApply", "manualRemovalClose", "manualRemovalCount",
@@ -138,6 +155,162 @@ async function api(path, options = {}) {
     throw new Error(message);
   }
   return response.json();
+}
+
+function projectFilenameFromName(name) {
+  const fallback = "rock_detection_project";
+  const raw = String(name || fallback).trim();
+  const withoutExtension = raw.replace(/\.(las|laz|rd3dproj|zip)$/i, "");
+  const safeStem = withoutExtension.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._-]+|[._-]+$/g, "") || fallback;
+  return `${safeStem}.rd3dproj`;
+}
+
+function filenameFromContentDisposition(value, fallback) {
+  if (!value) {
+    return fallback;
+  }
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+  }
+  const asciiMatch = value.match(/filename="?([^";]+)"?/i);
+  return asciiMatch?.[1] || fallback;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = projectFilenameFromName(filename);
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function chooseProjectOpenSource() {
+  if (typeof window.showOpenFilePicker !== "function") {
+    return null;
+  }
+  let handles;
+  try {
+    handles = await window.showOpenFilePicker({
+      multiple: false,
+      types: [
+        {
+          description: "Rock Detection 3D Project",
+          accept: { "application/zip": [".rd3dproj", ".zip"] }
+        }
+      ]
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return null;
+    }
+    throw error;
+  }
+  const handle = handles?.[0];
+  if (!handle) {
+    return null;
+  }
+  const file = await handle.getFile();
+  return { file, handle };
+}
+
+async function chooseProjectSaveTarget(defaultFilename) {
+  const suggestedName = projectFilenameFromName(defaultFilename);
+  if (typeof window.showSaveFilePicker === "function") {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [
+          {
+            description: "Rock Detection 3D Project",
+            accept: { "application/zip": [".rd3dproj"] }
+          }
+        ]
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        return null;
+      }
+      throw error;
+    }
+    return {
+      filename: projectFilenameFromName(handle.name || suggestedName),
+      handle
+    };
+  }
+
+  const entered = window.prompt("Project file name", suggestedName);
+  if (entered === null) {
+    return null;
+  }
+  return {
+    filename: projectFilenameFromName(entered),
+    handle: null
+  };
+}
+
+async function writeBlobToSaveHandle(handle, blob) {
+  const writable = await handle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+async function ensureProjectWritePermission(handle) {
+  if (!handle) {
+    return false;
+  }
+  const permissionOptions = { mode: "readwrite" };
+  if (typeof handle.queryPermission === "function") {
+    const current = await handle.queryPermission(permissionOptions);
+    if (current === "granted") {
+      return true;
+    }
+  }
+  if (typeof handle.requestPermission === "function") {
+    const requested = await handle.requestPermission(permissionOptions);
+    return requested === "granted";
+  }
+  return true;
+}
+
+function viewIsAvailable(summary, viewName) {
+  if (viewName === "raw" || viewName === "seeds") {
+    return Boolean(summary.status?.point_cloud_loaded);
+  }
+  if (viewName === "interface") {
+    return Boolean(summary.status?.point_cloud_loaded && (
+      summary.status?.interface_ready ||
+      summary.status?.manual_interface_ready ||
+      summary.status?.auto_interface_ready
+    ));
+  }
+  if (viewName === "segmented") {
+    return Boolean(summary.status?.segmentation_ready);
+  }
+  if (viewName === "voxel_segmented") {
+    return Boolean(summary.status?.voxel_segmentation_ready);
+  }
+  if (viewName === "mesh_prepared") {
+    return Boolean(summary.status?.mesh_prepared);
+  }
+  return Boolean(summary.status?.mesh_completed);
+}
+
+function bestAvailableView(summary, preferred) {
+  const views = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"];
+  if (preferred && views.includes(preferred) && viewIsAvailable(summary, preferred)) {
+    return preferred;
+  }
+  for (const viewName of [...views].reverse()) {
+    if (viewIsAvailable(summary, viewName)) {
+      return viewName;
+    }
+  }
+  return "raw";
 }
 
 function showToast(message, isError = false) {
@@ -326,11 +499,156 @@ function updateStatus() {
   if (el.runICRG) {
     el.runICRG.disabled = !status.seeds_ready || !status.manual_interface_ready;
   }
+  if (el.runLabelPropagation) {
+    el.runLabelPropagation.disabled = !status.voxel_segmentation_ready;
+  }
   if (el.manualRemoval) {
     el.manualRemoval.disabled = !status.mesh_prepared;
   }
+  if (el.saveProject) {
+    el.saveProject.disabled = !status.point_cloud_loaded;
+  }
+  if (el.saveProjectAs) {
+    el.saveProjectAs.disabled = !status.point_cloud_loaded;
+  }
   updateManualRemovalUI({ redraw: false });
   updateInterfaceEditorUI({ redraw: false });
+  updateMeasurementUI({ redraw: false });
+  updateSegmentedColorModeUI();
+  applyMeasurementControlLock();
+}
+
+function measurementViewAvailable() {
+  return state.view?.kind === "pointCloud";
+}
+
+function formatMeasurementNumber(value, digits = 3) {
+  return Number.isFinite(value) ? Number(value).toFixed(digits) : "--";
+}
+
+function formatMeasurementPoint(point) {
+  if (!point) {
+    return "--";
+  }
+  return `${formatMeasurementNumber(point[0])}, ${formatMeasurementNumber(point[1])}, ${formatMeasurementNumber(point[2])}`;
+}
+
+function measurementPointForSourceIndex(sourceIndex) {
+  if (!state.view || state.view.kind !== "pointCloud") {
+    return null;
+  }
+  const renderIndex = (state.view.indices || []).findIndex((idx) => idx === sourceIndex);
+  const point = renderIndex >= 0 ? state.view.points?.[renderIndex] : null;
+  return point ? point.map(Number) : null;
+}
+
+function recomputeMeasurementDistance() {
+  if (state.measurementPoints.length !== 2) {
+    state.measurementDistance = null;
+    return;
+  }
+  const a = state.measurementPoints[0].point;
+  const b = state.measurementPoints[1].point;
+  state.measurementDistance = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+}
+
+function clearMeasurementPoints(options = {}) {
+  state.measurementPoints = [];
+  state.measurementDistance = null;
+  updateMeasurementUI({ redraw: Boolean(options.redraw) });
+}
+
+function setMeasurementMode(active) {
+  const nextActive = Boolean(active);
+  if (state.measurementActive === nextActive) {
+    updateMeasurementUI();
+    return;
+  }
+  state.measurementActive = nextActive;
+  clearMeasurementPoints({ redraw: false });
+  if (!nextActive) {
+    releaseMeasurementControlLock();
+    updateStatus();
+  } else {
+    updateMeasurementUI({ redraw: false });
+    applyMeasurementControlLock();
+  }
+  draw();
+}
+
+function toggleMeasurementMode() {
+  setMeasurementMode(!state.measurementActive);
+}
+
+function updateMeasurementUI(options = {}) {
+  if (!el.measurementToggle || !el.measurementReadout) {
+    return;
+  }
+  const hasCloud = Boolean(state.session?.status?.point_cloud_loaded);
+  const pointView = measurementViewAvailable();
+  el.measurementToggle.classList.toggle("active", state.measurementActive);
+  el.measurementToggle.textContent = state.measurementActive ? "Measuring" : "Measure";
+  el.measurementToggle.disabled = !hasCloud || (!pointView && !state.measurementActive);
+  el.measurementClear.disabled = !state.measurementPoints.length;
+  el.measurementPointA.textContent = formatMeasurementPoint(state.measurementPoints[0]?.point);
+  el.measurementPointB.textContent = formatMeasurementPoint(state.measurementPoints[1]?.point);
+
+  let readout = "Load a point cloud";
+  if (hasCloud && !pointView) {
+    readout = "Measurement is available in point-cloud views.";
+  } else if (hasCloud && !state.measurementActive) {
+    readout = "Turn on Measure";
+  } else if (state.measurementPoints.length === 0) {
+    readout = "Select first point";
+  } else if (state.measurementPoints.length === 1) {
+    readout = "Select second point";
+  } else {
+    readout = `Distance: ${formatMeasurementNumber(state.measurementDistance, 4)} m`;
+  }
+  el.measurementReadout.textContent = readout;
+  el.measurementReadout.classList.toggle("active", state.measurementActive && pointView);
+  if (options.redraw) {
+    draw();
+  }
+}
+
+function applyMeasurementControlLock() {
+  if (!el.measurementToggle) {
+    return;
+  }
+  const controls = document.querySelector(".controls");
+  if (!controls) {
+    return;
+  }
+  controls.classList.toggle("measurement-disabled", state.measurementActive);
+  controls.setAttribute("aria-disabled", state.measurementActive ? "true" : "false");
+  const fields = controls.querySelectorAll("button, input, select, textarea");
+  fields.forEach((field) => {
+    if (state.measurementActive) {
+      if (!field.dataset.measurementPrevDisabled) {
+        field.dataset.measurementPrevDisabled = field.disabled ? "true" : "false";
+      }
+      field.disabled = true;
+    } else if (field.dataset.measurementPrevDisabled) {
+      field.disabled = field.dataset.measurementPrevDisabled === "true";
+      delete field.dataset.measurementPrevDisabled;
+    }
+  });
+}
+
+function releaseMeasurementControlLock() {
+  const controls = document.querySelector(".controls");
+  if (!controls) {
+    return;
+  }
+  controls.classList.remove("measurement-disabled");
+  controls.removeAttribute("aria-disabled");
+  controls.querySelectorAll("button, input, select, textarea").forEach((field) => {
+    if (field.dataset.measurementPrevDisabled) {
+      field.disabled = field.dataset.measurementPrevDisabled === "true";
+      delete field.dataset.measurementPrevDisabled;
+    }
+  });
 }
 
 function setDownload(anchor, kind, available) {
@@ -455,6 +773,194 @@ async function runAction(label, path, body, nextView, actionOptions = {}) {
   }
 }
 
+function buildProjectUiState(filename = state.projectFilename) {
+  return {
+    project_filename: projectFilenameFromName(filename),
+    active_view: state.activeView,
+    pick_mode: state.pickMode,
+    segmented_color_mode: state.segmentedColorMode,
+    point_size: Number(el.pointSize.value || 3.5),
+    segment_params: segmentParams(),
+    denoise_params: denoiseParams(),
+    normal_method: el.normalMethod.value,
+    normal_k: Number(el.normalK.value),
+    normal_display_scale: Number(el.normalScale.value || 1),
+    mesh_depth: Number(el.meshDepth.value),
+    hover_tips_enabled: state.hoverTipsEnabled,
+    interface_points: [...state.interfacePoints],
+    interface_parts: [...state.interfaceParts],
+    current_part_lateral: Boolean(el.partLateral.checked),
+    close_loop: Boolean(el.closeLoop.checked)
+  };
+}
+
+function restoreProjectUiState(uiState = {}, summary) {
+  state.projectFilename = projectFilenameFromName(uiState.project_filename || summary.current_file || "rock_detection_project");
+  state.rockSeeds = summary.seeds?.rock || [];
+  state.pedestalSeeds = summary.seeds?.pedestal || [];
+  state.seedSaveSignature = seedSaveSignature();
+  if (uiState.segment_params) {
+    el.smoothness.value = uiState.segment_params.smoothness_threshold ?? el.smoothness.value;
+    el.curvature.value = uiState.segment_params.curvature_threshold ?? el.curvature.value;
+    el.proximity.value = uiState.segment_params.basal_proximity_threshold ?? el.proximity.value;
+    el.voxel.value = uiState.segment_params.voxel_size ?? el.voxel.value;
+    el.neighbors.value = uiState.segment_params.neighbor_count ?? el.neighbors.value;
+    el.distance.value = uiState.segment_params.distance_threshold ?? el.distance.value;
+    el.labelPropagationDistance.value = uiState.segment_params.label_propagation_distance ?? el.labelPropagationDistance.value;
+  }
+  if (uiState.denoise_params) {
+    el.denoiseMethod.value = uiState.denoise_params.method ?? el.denoiseMethod.value;
+    el.sorNeighbors.value = uiState.denoise_params.sor_neighbors ?? el.sorNeighbors.value;
+    el.sorStdRatio.value = uiState.denoise_params.sor_std_ratio ?? el.sorStdRatio.value;
+    el.dbscanEps.value = uiState.denoise_params.dbscan_eps ?? el.dbscanEps.value;
+    el.dbscanMinPoints.value = uiState.denoise_params.dbscan_min_points ?? el.dbscanMinPoints.value;
+  }
+  if (uiState.normal_method) {
+    el.normalMethod.value = uiState.normal_method;
+  }
+  if (Number.isFinite(uiState.normal_k)) {
+    el.normalK.value = uiState.normal_k;
+  }
+  if (Number.isFinite(uiState.normal_display_scale)) {
+    el.normalScale.value = uiState.normal_display_scale;
+  }
+  if (Number.isFinite(uiState.mesh_depth)) {
+    el.meshDepth.value = uiState.mesh_depth;
+  }
+  if (Number.isFinite(uiState.point_size)) {
+    el.pointSize.value = uiState.point_size;
+  }
+  if (typeof uiState.hover_tips_enabled === "boolean") {
+    state.hoverTipsEnabled = uiState.hover_tips_enabled;
+    updateHoverTipsToggle();
+  }
+  if (["two_color", "multi_seed"].includes(uiState.segmented_color_mode)) {
+    state.segmentedColorMode = uiState.segmented_color_mode;
+  }
+  state.interfacePoints = Array.isArray(uiState.interface_points) ? uiState.interface_points : [];
+  state.interfaceParts = Array.isArray(uiState.interface_parts) ? uiState.interface_parts : [];
+  el.partLateral.checked = Boolean(uiState.current_part_lateral);
+  el.closeLoop.checked = typeof uiState.close_loop === "boolean" ? uiState.close_loop : true;
+  if (["rock", "pedestal", "interface"].includes(uiState.pick_mode)) {
+    setPickMode(uiState.pick_mode);
+  }
+  clearManualRemovalSelection({ redraw: false });
+  clearInterfaceEditorLocal({ redraw: false, keepDraft: false });
+  updateNormalScaleValue();
+  updateStatus();
+}
+
+async function exportProject(filename, options = {}) {
+  if (!state.session?.status?.point_cloud_loaded) {
+    return;
+  }
+  try {
+    setBusy("Saving project");
+    await flushSeedAutosave();
+    const safeFilename = projectFilenameFromName(filename);
+    const response = await fetch(`/api/sessions/${state.session.session_id}/project/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: safeFilename,
+        ui_state: buildProjectUiState(safeFilename)
+      })
+    });
+    if (!response.ok) {
+      let message = response.statusText;
+      try {
+        const payload = await response.json();
+        message = payload.detail || message;
+      } catch {
+        // Keep response status text.
+      }
+      throw new Error(message);
+    }
+    const downloadedFilename = filenameFromContentDisposition(response.headers.get("Content-Disposition"), safeFilename);
+    const blob = await response.blob();
+    if (options.saveHandle) {
+      await writeBlobToSaveHandle(options.saveHandle, blob);
+      state.projectSaveHandle = options.saveHandle;
+      state.projectFilename = projectFilenameFromName(options.saveHandle.name || downloadedFilename);
+      state.projectHasSaveTarget = true;
+    } else {
+      downloadBlob(blob, downloadedFilename);
+      state.projectSaveHandle = null;
+      state.projectFilename = projectFilenameFromName(downloadedFilename);
+      state.projectHasSaveTarget = false;
+    }
+    setBusy(null);
+  } catch (error) {
+    setError(error);
+  }
+}
+
+async function saveProject() {
+  if (!state.projectSaveHandle) {
+    await saveProjectAs();
+    return;
+  }
+  const permitted = await ensureProjectWritePermission(state.projectSaveHandle);
+  if (!permitted) {
+    showToast("Write permission was not granted. Use Save As to choose a writable project file.", true);
+    return;
+  }
+  await exportProject(state.projectFilename, { saveHandle: state.projectSaveHandle });
+}
+
+async function saveProjectAs() {
+  const target = await chooseProjectSaveTarget(state.projectFilename);
+  if (!target) {
+    return;
+  }
+  if (target.handle) {
+    const permitted = await ensureProjectWritePermission(target.handle);
+    if (!permitted) {
+      showToast("Write permission was not granted for that project file.", true);
+      return;
+    }
+  }
+  await exportProject(target.filename, {
+    saveHandle: target.handle,
+    establishSaveTarget: true
+  });
+}
+
+async function importProject(file, options = {}) {
+  if (!file || !state.session) {
+    return;
+  }
+  try {
+    setBusy("Importing project");
+    const data = new FormData();
+    data.append("file", file);
+    const imported = await api(`/api/sessions/${state.session.session_id}/project/import`, {
+      method: "POST",
+      body: data
+    });
+    state.session = imported.summary;
+    restoreProjectUiState(imported.ui_state || {}, imported.summary);
+    state.projectFilename = projectFilenameFromName(imported.project_filename || file.name);
+    state.projectSaveHandle = options.saveHandle || null;
+    state.projectHasSaveTarget = Boolean(state.projectSaveHandle);
+    state.measurementActive = false;
+    clearMeasurementPoints({ redraw: false });
+    releaseMeasurementControlLock();
+    state.zoom = 1;
+    state.panX = 0;
+    state.panY = 0;
+    resetRotationMatrix();
+    state.renderKey = null;
+    await loadView(bestAvailableView(imported.summary, imported.ui_state?.active_view));
+    setBusy(null);
+    if (!state.projectSaveHandle) {
+      showToast("Project imported. Use Save Project once to choose an overwrite target.");
+    }
+  } catch (error) {
+    setError(error);
+  }
+}
+
 async function uploadFile(file) {
   if (!file || !state.session) {
     return;
@@ -471,6 +977,12 @@ async function uploadFile(file) {
     state.pedestalSeeds = [];
     state.interfacePoints = [];
     state.interfaceParts = [];
+    state.projectFilename = projectFilenameFromName(file.name);
+    state.projectHasSaveTarget = false;
+    state.projectSaveHandle = null;
+    state.measurementActive = false;
+    clearMeasurementPoints({ redraw: false });
+    releaseMeasurementControlLock();
     clearManualRemovalSelection({ redraw: false });
     clearInterfaceEditorLocal({ redraw: false, keepDraft: false });
     state.zoom = 1;
@@ -492,14 +1004,20 @@ async function loadView(viewName) {
     return;
   }
   try {
-    const payload = await api(`/api/sessions/${state.session.session_id}/viewer/${viewName}?t=${Date.now()}`);
+    const params = new URLSearchParams({ t: String(Date.now()) });
+    if (viewName === "segmented") {
+      params.set("color_mode", state.segmentedColorMode);
+    }
+    const payload = await api(`/api/sessions/${state.session.session_id}/viewer/${viewName}?${params.toString()}`);
     if (payload.kind === "mesh") {
       await hydrateMeshView(payload);
     }
     state.view = payload;
     state.activeView = viewName;
+    clearMeasurementPoints({ redraw: false });
     el.activeViewLabel.textContent = viewName.replace("_", " ");
     updateViewMeta();
+    updateBranchLegend();
     if (viewName !== "mesh_prepared" && state.manualRemovalWindowOpen) {
       state.manualRemovalDrawMode = false;
       state.manualRemovalSelected = [];
@@ -518,6 +1036,7 @@ async function loadView(viewName) {
     document.querySelectorAll("[data-view]").forEach((button) => {
       button.classList.toggle("active", button.dataset.view === viewName);
     });
+    updateSegmentedColorModeUI();
     draw();
   } catch (error) {
     setError(error);
@@ -530,6 +1049,17 @@ function updateViewMeta() {
   }
   const pointCount = state.view?.total_points ?? state.session.point_count ?? 0;
   const parts = [`${pointCount.toLocaleString()} pts`, `EPSG ${state.session.epsg_code || "--"}`];
+  if (state.view?.label_counts) {
+    const counts = state.view.label_counts;
+    parts.push(`rock ${(counts.rock || 0).toLocaleString()}`);
+    parts.push(`support ${(counts.pedestal || 0).toLocaleString()}`);
+    if (Number.isFinite(counts.unlabeled) && counts.unlabeled > 0) {
+      parts.push(`unlabeled ${counts.unlabeled.toLocaleString()}`);
+    }
+  }
+  if (Array.isArray(state.view?.seed_branches) && state.view.seed_branches.length) {
+    parts.push(`${state.view.seed_branches.length.toLocaleString()} seed branches`);
+  }
   if (state.view?.kind === "pointCloud" && state.view.normal_segments) {
     const diagnostics = state.view.normal_diagnostics || {};
     parts.push(`${(state.view.normal_segments || []).length.toLocaleString()} normal arrows`);
@@ -541,6 +1071,93 @@ function updateViewMeta() {
     }
   }
   el.viewMeta.textContent = parts.join(" · ");
+}
+
+function updateSegmentedColorModeUI() {
+  updateBranchLegend();
+}
+
+async function setSegmentedColorMode(mode) {
+  if (state.segmentedColorMode === mode) {
+    return;
+  }
+  state.segmentedColorMode = mode;
+  updateSegmentedColorModeUI();
+  if (state.activeView === "segmented") {
+    await loadView("segmented");
+  }
+}
+
+function branchColorCss(color) {
+  const values = Array.isArray(color) && color.length === 3 ? color : [0.35, 0.35, 0.35];
+  const [r, g, b] = values.map((value) => Math.round(clamp(Number(value) || 0, 0, 1) * 255));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function updateBranchLegend() {
+  if (!el.branchLegend) {
+    return;
+  }
+  const branches = Array.isArray(state.view?.seed_branches) ? state.view.seed_branches : [];
+  const isBranchView = ["voxel_segmented", "segmented"].includes(state.activeView);
+  if (!isBranchView || !branches.length) {
+    el.branchLegend.classList.add("hidden");
+    el.branchLegend.textContent = "";
+    return;
+  }
+  el.branchLegend.classList.remove("hidden");
+  el.branchLegend.textContent = "";
+
+  const title = document.createElement("div");
+  title.className = "branch-legend-title";
+  title.textContent = "Seed branches";
+  el.branchLegend.appendChild(title);
+
+  if (state.activeView === "segmented") {
+    const toggle = document.createElement("div");
+    toggle.className = "branch-color-toggle";
+
+    const twoColor = document.createElement("button");
+    twoColor.type = "button";
+    twoColor.textContent = "Two Colors";
+    twoColor.classList.toggle("active", state.segmentedColorMode === "two_color");
+    twoColor.addEventListener("click", () => {
+      void setSegmentedColorMode("two_color");
+    });
+
+    const multiColor = document.createElement("button");
+    multiColor.type = "button";
+    multiColor.textContent = "Multiple Colors";
+    multiColor.classList.toggle("active", state.segmentedColorMode === "multi_seed");
+    multiColor.addEventListener("click", () => {
+      void setSegmentedColorMode("multi_seed");
+    });
+
+    toggle.appendChild(twoColor);
+    toggle.appendChild(multiColor);
+    el.branchLegend.appendChild(toggle);
+  }
+
+  for (const branch of branches) {
+    const row = document.createElement("div");
+    row.className = "branch-legend-row";
+
+    const swatch = document.createElement("span");
+    swatch.className = "branch-swatch";
+    swatch.style.background = branchColorCss(branch.color);
+
+    const label = document.createElement("span");
+    label.className = "branch-label";
+    label.textContent = branch.label || `Seed ${Number(branch.branch_id || 0) + 1}`;
+
+    const count = document.createElement("strong");
+    count.textContent = `${Number(branch.node_count || 0).toLocaleString()} nodes`;
+
+    row.appendChild(swatch);
+    row.appendChild(label);
+    row.appendChild(count);
+    el.branchLegend.appendChild(row);
+  }
 }
 
 async function hydrateMeshView(payload) {
@@ -2344,6 +2961,9 @@ function updateInterfaceEditorUI(options = {}) {
   if (el.editorUndo) {
     el.editorUndo.disabled = !draftReady;
   }
+  if (el.editorQuit) {
+    el.editorQuit.disabled = !draftReady;
+  }
   if (el.editorBrushRadius) {
     el.editorBrushRadius.disabled = !brushMode;
     state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
@@ -2867,7 +3487,14 @@ function segmentParams() {
     basal_proximity_threshold: Number(el.proximity.value),
     voxel_size: Number(el.voxel.value),
     neighbor_count: Number(el.neighbors.value),
-    distance_threshold: Number(el.distance.value)
+    distance_threshold: Number(el.distance.value),
+    label_propagation_distance: Number(el.labelPropagationDistance.value)
+  };
+}
+
+function labelPropagationParams() {
+  return {
+    label_propagation_distance: Number(el.labelPropagationDistance.value)
   };
 }
 
@@ -3143,6 +3770,8 @@ function ensureGL() {
   state.pickColorBuffer = gl.createBuffer();
   state.normalPositionBuffer = gl.createBuffer();
   state.normalColorBuffer = gl.createBuffer();
+  state.measurementLinePositionBuffer = gl.createBuffer();
+  state.measurementLineColorBuffer = gl.createBuffer();
   state.markerPositionBuffer = gl.createBuffer();
   state.markerColorBuffer = gl.createBuffer();
   state.markerHaloPositionBuffer = gl.createBuffer();
@@ -3503,6 +4132,7 @@ function uploadPointCloudToGPU() {
   gl.bufferData(gl.ARRAY_BUFFER, pickColors, gl.STATIC_DRAW);
   state.renderKey = state.view;
   uploadNormalSegmentsToGPU();
+  uploadMeasurementLineToGPU();
   uploadMarkersToGPU();
 }
 
@@ -3525,11 +4155,14 @@ function markerSourcePoints() {
     }
   }
 
-  pushSelection(state.rockSeeds, [1, 0.05, 0.02]);
-  pushSelection(state.pedestalSeeds, [0.0, 0.24, 1.0]);
-  pushSelection(state.interfacePoints, [0.0, 1.0, 0.0]);
-  for (const part of state.interfaceParts) {
-    pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+  const sourceIndicesMatchCurrentView = state.activeView !== "voxel_segmented";
+  if (sourceIndicesMatchCurrentView) {
+    pushSelection(state.rockSeeds, [1, 0.05, 0.02]);
+    pushSelection(state.pedestalSeeds, [0.0, 0.24, 1.0]);
+    pushSelection(state.interfacePoints, [0.0, 1.0, 0.0]);
+    for (const part of state.interfaceParts) {
+      pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+    }
   }
   if (state.activeView === "interface" && state.interfaceEditorOpen && state.interfaceDraft) {
     for (const part of state.interfaceDraft.parts || []) {
@@ -3543,11 +4176,55 @@ function markerSourcePoints() {
   if (state.activeView === "mesh_prepared" && state.manualRemovalSelected.length) {
     pushSelection(state.manualRemovalSelected, [1.0, 0.84, 0.0]);
   }
+  if (state.measurementPoints.length && measurementViewAvailable()) {
+    state.measurementPoints.forEach((measurement, idx) => {
+      points.push({
+        point: measurement.point,
+        color: MEASUREMENT_COLORS[idx] || MEASUREMENT_COLORS[0],
+        haloColor: [0.02, 0.02, 0.02]
+      });
+    });
+  }
 
   for (const marker of state.view.markers || []) {
     points.push({ point: marker.point, color: marker.color || [1, 0, 0], haloColor: [1, 1, 1] });
   }
   return points;
+}
+
+function uploadMeasurementLineToGPU() {
+  const gl = state.gl;
+  if (
+    !gl ||
+    !state.measurementLinePositionBuffer ||
+    !state.measurementLineColorBuffer ||
+    !measurementViewAvailable() ||
+    state.measurementPoints.length !== 2
+  ) {
+    state.measurementLineCount = 0;
+    if (gl && state.measurementLinePositionBuffer && state.measurementLineColorBuffer) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, state.measurementLinePositionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(), gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, state.measurementLineColorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(), gl.DYNAMIC_DRAW);
+    }
+    return;
+  }
+  const start = framePoint(state.measurementPoints[0].point);
+  const end = framePoint(state.measurementPoints[1].point);
+  const positions = new Float32Array([
+    start[0], start[1], start[2],
+    end[0], end[1], end[2]
+  ]);
+  const colors = new Float32Array([
+    1.0, 0.76, 0.12,
+    0.0, 0.78, 1.0
+  ]);
+  state.measurementLineCount = 2;
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.measurementLinePositionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.measurementLineColorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
 }
 
 function uploadMarkersToGPU() {
@@ -3826,6 +4503,7 @@ function uploadMeshToGPU() {
   state.pointCount = 0;
   state.pointNormalCount = 0;
   state.normalLineCount = 0;
+  state.measurementLineCount = 0;
   state.markerCount = 0;
   state.markerHaloCount = 0;
   state.centeredPositions = null;
@@ -3956,6 +4634,9 @@ function draw() {
   gl.disable(gl.DEPTH_TEST);
   gl.lineWidth(2);
   drawSolidBatch(gl, state.normalPositionBuffer, state.normalColorBuffer, state.normalLineCount, gl.LINES);
+  uploadMeasurementLineToGPU();
+  gl.lineWidth(3);
+  drawSolidBatch(gl, state.measurementLinePositionBuffer, state.measurementLineColorBuffer, state.measurementLineCount, gl.LINES);
   gl.enable(gl.DEPTH_TEST);
   gl.useProgram(state.program);
   gl.uniformMatrix4fv(gl.getUniformLocation(state.program, "u_matrix"), false, state.mvpMatrix);
@@ -4100,6 +4781,105 @@ function unselectFromCanvas(event) {
   }
 }
 
+function selectMeasurementFromCanvas(event) {
+  if (!state.measurementActive || !measurementViewAvailable()) {
+    updateMeasurementUI();
+    return;
+  }
+  const sourceIndex = pickSourceIndexFromCanvas(event);
+  if (sourceIndex === null || sourceIndex === undefined) {
+    draw();
+    return;
+  }
+  const point = measurementPointForSourceIndex(sourceIndex);
+  if (!point) {
+    draw();
+    return;
+  }
+  const existing = state.measurementPoints.find((measurement) => measurement.sourceIndex === sourceIndex);
+  if (existing) {
+    updateMeasurementUI({ redraw: true });
+    return;
+  }
+  const measurementPoint = { sourceIndex, point };
+  if (state.measurementPoints.length >= 2) {
+    state.measurementPoints = [measurementPoint];
+  } else {
+    state.measurementPoints.push(measurementPoint);
+  }
+  recomputeMeasurementDistance();
+  updateMeasurementUI({ redraw: true });
+}
+
+function measurementPointFromProjection(event) {
+  if (
+    !state.measurementPoints.length ||
+    !measurementViewAvailable() ||
+    !state.centeredPositions ||
+    !state.mvpMatrix
+  ) {
+    return null;
+  }
+  const selected = new Set(state.measurementPoints.map((point) => point.sourceIndex));
+  const rect = el.viewer.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const positions = state.centeredPositions;
+  const pickRadius = Math.max(18, Number(el.pointSize.value || 3.5) + 14);
+  const pickRadiusSq = pickRadius * pickRadius;
+  let bestIndex = null;
+  let bestDepth = Infinity;
+  let bestDist = Infinity;
+
+  for (let i = 0; i < state.pointCount; i += 1) {
+    const sourceIndex = state.sourceIndices[i];
+    if (!selected.has(sourceIndex)) {
+      continue;
+    }
+    const clip = transformPoint(state.mvpMatrix, positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+    if (clip[3] <= 0) {
+      continue;
+    }
+    const ndcX = clip[0] / clip[3];
+    const ndcY = clip[1] / clip[3];
+    const ndcZ = clip[2] / clip[3];
+    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) {
+      continue;
+    }
+    const sx = (ndcX * 0.5 + 0.5) * rect.width;
+    const sy = (-ndcY * 0.5 + 0.5) * rect.height;
+    const dx = sx - x;
+    const dy = sy - y;
+    const dist = dx * dx + dy * dy;
+    if (dist > pickRadiusSq) {
+      continue;
+    }
+    if (dist < bestDist - 0.001 || (Math.abs(dist - bestDist) <= 0.001 && ndcZ < bestDepth)) {
+      bestDepth = ndcZ;
+      bestDist = dist;
+      bestIndex = sourceIndex;
+    }
+  }
+  return bestIndex;
+}
+
+function unselectMeasurementFromCanvas(event) {
+  if (state.renderKey !== state.view) {
+    uploadPointCloudToGPU();
+  }
+  if (!state.mvpMatrix) {
+    state.mvpMatrix = computeMatrices(canvasSize());
+  }
+  const sourceIndex = measurementPointFromProjection(event);
+  if (sourceIndex === null) {
+    draw();
+    return;
+  }
+  state.measurementPoints = state.measurementPoints.filter((point) => point.sourceIndex !== sourceIndex);
+  recomputeMeasurementDistance();
+  updateMeasurementUI({ redraw: true });
+}
+
 function pickFromCanvas(event) {
   if (!state.view || state.view.kind !== "pointCloud" || !state.centeredPositions) {
     return;
@@ -4191,6 +4971,30 @@ function bindEvents() {
   el.toggleTips.addEventListener("click", toggleHoverTips);
   updateHoverTipsToggle();
   el.fileInput.addEventListener("change", (event) => uploadFile(event.target.files[0]));
+  el.importProjectInput.addEventListener("click", async (event) => {
+    if (typeof window.showOpenFilePicker !== "function") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      const source = await chooseProjectOpenSource();
+      if (source) {
+        await importProject(source.file, { saveHandle: source.handle });
+      }
+    } catch (error) {
+      setError(error);
+    }
+    event.target.value = "";
+  });
+  el.importProjectInput.addEventListener("change", (event) => {
+    void importProject(event.target.files[0]);
+    event.target.value = "";
+  });
+  el.saveProject.addEventListener("click", saveProject);
+  el.saveProjectAs.addEventListener("click", saveProjectAs);
+  el.measurementToggle.addEventListener("click", toggleMeasurementMode);
+  el.measurementClear.addEventListener("click", () => clearMeasurementPoints({ redraw: true }));
   el.pointSize.addEventListener("input", draw);
   el.normalScale.addEventListener("input", () => {
     updateNormalScaleValue();
@@ -4238,6 +5042,7 @@ function bindEvents() {
   el.editorBrushAddMode.addEventListener("click", () => setInterfaceEditorMode("brush_add"));
   el.editorBrushRemoveMode.addEventListener("click", () => setInterfaceEditorMode("brush_remove"));
   el.editorUndo.addEventListener("click", undoInterfaceDraftEdit);
+  el.editorQuit.addEventListener("click", closeInterfaceEditorDiscardingDraft);
   el.editorSaveManual.addEventListener("click", commitInterfaceDraft);
   el.editorBrushRadius.addEventListener("input", () => {
     state.interfaceBrushRadius = Number(el.editorBrushRadius.value || 12);
@@ -4251,17 +5056,25 @@ function bindEvents() {
     await flushSeedAutosave();
     await runAction(
       "Running region growing",
-      `/api/sessions/${state.session.session_id}/segment`,
+      `/api/sessions/${state.session.session_id}/segment/region-growing`,
       segmentParams(),
-      (result) => result?.auto_interface_generated ? "interface" : "segmented"
+      "voxel_segmented"
     );
   });
   el.runICRG.addEventListener("click", async () => {
     await flushSeedAutosave();
     await runAction(
       "Running ICRG",
-      `/api/sessions/${state.session.session_id}/segment/icrg`,
+      `/api/sessions/${state.session.session_id}/segment/icrg/region-growing`,
       segmentParams(),
+      "voxel_segmented"
+    );
+  });
+  el.runLabelPropagation.addEventListener("click", async () => {
+    await runAction(
+      "Running label propagation",
+      `/api/sessions/${state.session.session_id}/segment/label-propagation`,
+      labelPropagationParams(),
       "segmented"
     );
   });
@@ -4301,13 +5114,30 @@ function bindEvents() {
     }
     event.preventDefault();
     state.dragging = true;
+    const measurementPointView = state.measurementActive && measurementViewAvailable();
+    if (measurementPointView) {
+      if (event.shiftKey && event.button === 0) {
+        state.dragMode = "measurement_select";
+      } else if (event.shiftKey && event.button === 2) {
+        state.dragMode = "measurement_unselect";
+      } else {
+        state.dragMode = event.button === 1 || event.button === 2 ? "pan" : "rotate";
+      }
+      state.dragStart = [event.clientX, event.clientY];
+      state.lastPointer = [event.clientX, event.clientY];
+      if (state.dragMode === "rotate") {
+        applyTrackballRotation(event.clientX, event.clientY);
+      }
+      el.viewer.setPointerCapture(event.pointerId);
+      return;
+    }
     const editorActive = state.interfaceEditorOpen && state.activeView === "interface" && state.interfaceDraft;
     if (editorActive) {
       updateInterfaceEditorActiveSegmentFromEvent(event, { redraw: false });
     }
     const editorBrush = editorActive && state.interfaceEditorMode !== "anchors";
     const editorAnchors = editorActive && state.interfaceEditorMode === "anchors";
-    const nearestAnchor = editorAnchors && event.button === 0 && !event.shiftKey
+    const nearestAnchor = editorAnchors && event.button === 0 && event.shiftKey
       ? nearestDraftAnchorFromProjection(event)
       : null;
     if (state.manualRemovalDrawMode && state.activeView === "mesh_prepared" && event.button === 0) {
@@ -4411,6 +5241,10 @@ function bindEvents() {
         await removeDraftAnchor(event);
       } else if (mode === "interface_anchor_drag") {
         await moveDraftAnchor(anchorDrag, event);
+      } else if (mode === "measurement_select" && (dx * dx + dy * dy) < 25) {
+        selectMeasurementFromCanvas(event);
+      } else if (mode === "measurement_unselect" && (dx * dx + dy * dy) < 25) {
+        unselectMeasurementFromCanvas(event);
       } else if (mode === "select" && (dx * dx + dy * dy) < 25) {
         pickFromCanvas(event);
       } else if (mode === "unselect" && (dx * dx + dy * dy) < 25) {

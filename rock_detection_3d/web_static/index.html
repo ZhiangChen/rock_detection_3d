@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rock Detection 3D</title>
-    <link rel="stylesheet" href="/web-static/styles.css?v=20260615-interface-width1" />
+    <link rel="stylesheet" href="/web-static/styles.css?v=20260615-threshold-help" />
   </head>
   <body>
     <div class="shell">
@@ -16,6 +16,17 @@
             <p id="currentFile">No point cloud loaded</p>
           </div>
         </header>
+
+        <section class="project-panel">
+          <label class="project-file-button" data-help-title="Import Project" data-help-body="Load a saved .rd3dproj archive and restore its point cloud, parameters, workflow state, and available outputs.">
+            <span>Import Project</span>
+            <input id="importProjectInput" type="file" accept=".rd3dproj,.zip" />
+          </label>
+          <div class="button-row">
+            <button id="saveProject" data-help-title="Save Project" data-help-body="Overwrite the imported or previously chosen .rd3dproj file when browser file access is available. Otherwise, choose a save target first.">Save Project</button>
+            <button id="saveProjectAs" data-help-title="Save As" data-help-body="Choose a .rd3dproj file target for this project. Future Save Project clicks overwrite that chosen file when supported.">Save As</button>
+          </div>
+        </section>
 
         <label class="upload">
           <span>Upload LAS/LAZ</span>
@@ -33,11 +44,31 @@
             <button data-view="raw" data-help-title="Raw view" data-help-body="Show the uploaded point cloud with its original colors before seed or interface edits.">Raw</button>
             <button data-view="seeds" data-help-title="Seeds view" data-help-body="Show the seed-selection state, including saved rock and support seed markers.">Seeds</button>
             <button data-view="interface" data-help-title="Interface view" data-help-body="Show the previewed or saved interface constraints near the contact.">Interface</button>
+            <button data-view="voxel_segmented" data-help-title="RG result view" data-help-body="Show the immediate region-growing or ICRG labels on the voxelized point cloud before labels are transferred back to the dense cloud.">RG Result</button>
             <button data-view="segmented" data-help-title="Segmented view" data-help-body="Show the latest rock/support labels after running region growing or ICRG.">Segmented</button>
             <button data-view="mesh_prepared" data-help-title="Mesh prep view" data-help-body="Show the prepared point set used for normal estimation and mesh reconstruction.">Mesh Prep</button>
             <button data-view="mesh" data-help-title="Mesh view" data-help-body="Show mesh status after reconstruction; download the PLY from the Downloads panel.">Mesh</button>
           </div>
           <button id="toggleTips" class="tip-toggle" type="button" aria-pressed="true">Hover Tips On</button>
+        </section>
+
+        <section class="panel measurement-panel">
+          <h2>Measurement</h2>
+          <div class="button-row">
+            <button id="measurementToggle" disabled data-help-title="Measure Distance" data-help-body="Enable point-to-point measurement. Shift + left click selects points; Shift + right click removes a selected measurement point.">Measure</button>
+            <button id="measurementClear" disabled data-help-title="Clear Measurement" data-help-body="Clear the current measurement points without changing the point cloud or workflow state.">Clear</button>
+          </div>
+          <div id="measurementReadout" class="measurement-readout">Load a point cloud</div>
+          <div class="measurement-points">
+            <div>
+              <span>Point A</span>
+              <strong id="measurementPointA">--</strong>
+            </div>
+            <div>
+              <span>Point B</span>
+              <strong id="measurementPointB">--</strong>
+            </div>
+          </div>
         </section>
 
         <section class="panel">
@@ -57,6 +88,7 @@
           <div id="viewMeta"></div>
         </div>
         <canvas id="viewer"></canvas>
+        <div id="branchLegend" class="branch-legend hidden" aria-live="polite"></div>
         <canvas id="manualRemovalOverlay" class="manual-removal-overlay hidden"></canvas>
         <canvas id="interfaceEditorOverlay" class="manual-removal-overlay interface-editor-overlay hidden"></canvas>
         <div id="toast" class="toast hidden"></div>
@@ -98,21 +130,21 @@
           <label>
             <span class="label-row">
               <span>Smoothness</span>
-              <span class="info-button" tabindex="0" role="button" aria-label="Smoothness help" data-info-title="Smoothness threshold" data-info-body="Default 0.9. Higher values require more parallel normals and can reduce leakage across the rock-support contact. Lower values help rough or noisy rock surfaces grow, but can spill into support.">i</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Smoothness help" data-info-title="Smoothness threshold" data-info-body="Normal-alignment threshold for accepting a neighboring point. Lower values are more permissive and can overspill across the interface; higher values are stricter and can leave rough rock unlabeled, which later propagation may fill incorrectly.">i</span>
             </span>
             <input id="smoothness" type="number" min="0" max="1" step="0.01" value="0.9" />
           </label>
           <label>
             <span class="label-row">
               <span>Curvature</span>
-              <span class="info-button" tabindex="0" role="button" aria-label="Curvature help" data-info-title="Curvature threshold" data-info-body="Default 0.1. Lower values are stricter and favor smooth local continuity. Raise it when rough rock surfaces are being missed; lower it if growth crosses sharp contact changes.">i</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Curvature help" data-info-title="Curvature threshold" data-info-body="Local curvature threshold for accepting a neighboring point. Larger values are more permissive and can overspill across sharp interface changes; smaller values are stricter and can fragment rough surfaces or leave gaps near the contact.">i</span>
             </span>
             <input id="curvature" type="number" min="0" max="1" step="0.01" value="0.1" />
           </label>
           <label>
             <span class="label-row">
-              <span>Basal proximity</span>
-              <span class="info-button" tabindex="0" role="button" aria-label="Basal proximity help" data-info-title="Interface exclusion radius" data-info-body="The manuscript default is 0.02 m; this UI starts at 0.05 m. Increase if labels cross the contact. Decrease if too much rock near the interface stays unlabeled.">i</span>
+              <span>Interface exclusion radius</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Interface exclusion radius help" data-info-title="Interface exclusion radius" data-info-body="Used by Run ICRG with a saved manual interface. Points within this radius of the interface are excluded from growth. Increase if labels cross the contact; decrease if too much rock near the interface stays unlabeled.">i</span>
             </span>
             <input id="proximity" type="number" min="0" max="1" step="0.01" value="0.05" />
           </label>
@@ -125,24 +157,36 @@
           </label>
           <label>
             <span class="label-row">
-              <span>Neighbors</span>
-              <span class="info-button" tabindex="0" role="button" aria-label="Neighbors help" data-info-title="Neighbor count" data-info-body="Controls how many nearby points support local geometry tests. Increase for sparse or noisy scans to stabilize normals; decrease to keep small contact details from being blurred.">i</span>
-            </span>
-            <input id="neighbors" type="number" min="3" max="500" step="1" value="50" />
-          </label>
-          <label>
-            <span class="label-row">
-              <span>Distance</span>
-              <span class="info-button" tabindex="0" role="button" aria-label="Distance help" data-info-title="Neighborhood distance" data-info-body="Default radius is 0.05 m. Increase when the cloud is sparse or growth stalls across small gaps. Decrease to avoid jumps across narrow contacts or nearby supports.">i</span>
+              <span>Neighborhood radius</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Neighborhood radius help" data-info-title="Neighborhood radius" data-info-body="Maximum radius for region-growing neighbor search. Default is 0.05 m. Increase when the cloud is sparse or growth stalls across small gaps. Decrease to avoid jumps across narrow contacts or nearby supports.">i</span>
             </span>
             <input id="distance" type="number" min="0.001" max="1" step="0.001" value="0.05" />
           </label>
-          <button id="runSegment" class="wide" data-help-title="Run Region Growing" data-help-body="Segment from seeds without using interface constraints.">Run Region Growing</button>
-          <button id="runICRG" class="wide" data-help-title="Run ICRG" data-help-body="Run interface-constrained region growing using the saved manual interface.">Run ICRG</button>
+          <label>
+            <span class="label-row">
+              <span>Normal neighbors</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Normal neighbors help" data-info-title="Normal neighbors" data-info-body="Maximum neighbors for normal estimation used by the smoothness and curvature tests. Increase for sparse or noisy scans to stabilize normals; decrease to preserve sharper contact detail.">i</span>
+            </span>
+            <input id="neighbors" type="number" min="3" max="500" step="1" value="50" />
+          </label>
+          <button id="runSegment" class="wide" data-help-title="Run Region Growing" data-help-body="Run seed-based region growing and open the RG Result view. Dense label propagation is run in the next section.">Run Region Growing</button>
+          <button id="runICRG" class="wide" data-help-title="Run ICRG" data-help-body="Run interface-constrained region growing and open the RG Result view. Dense label propagation is run in the next section.">Run ICRG</button>
         </section>
 
         <section class="panel">
-          <h2>3. Mesh Preparation</h2>
+          <h2>3. Label Propagating</h2>
+          <label>
+            <span class="label-row">
+              <span>Label propagation</span>
+              <span class="info-button" tabindex="0" role="button" aria-label="Label propagation help" data-info-title="Dense label propagation radius" data-info-body="Radius for distance-weighted completion after voxel region growing. Default is 0.05 m. Increase to fill larger unlabeled gaps; decrease to reduce leakage across contacts.">i</span>
+            </span>
+            <input id="labelPropagationDistance" type="number" min="0.001" max="1" step="0.001" value="0.05" />
+          </label>
+          <button id="runLabelPropagation" class="wide" data-help-title="Run Label Propagation" data-help-body="Complete dense distance-weighted label propagation and open the Segmented view.">Run Label Propagation</button>
+        </section>
+
+        <section class="panel">
+          <h2>4. Mesh Preparation</h2>
           <button id="prepareMesh" class="wide" data-help-title="Prepare" data-help-body="Create the prepared rock point set used for normals, reconstruction, and analysis.">Prepare Mesh</button>
           <label>
             <span class="label-row">
@@ -195,7 +239,7 @@
         </section>
 
         <section class="panel">
-          <h2>4. Normals</h2>
+          <h2>5. Normals</h2>
           <label>
             <span class="label-row">
               <span>Normal method</span>
@@ -224,7 +268,7 @@
         </section>
 
         <section class="panel">
-          <h2>5. Reconstruction</h2>
+          <h2>6. Reconstruction</h2>
           <label>
             <span class="label-row">
               <span>Depth</span>
@@ -236,7 +280,7 @@
         </section>
 
         <section class="panel">
-          <h2>6. Analysis</h2>
+          <h2>7. Analysis</h2>
           <button id="analyze" class="wide" data-help-title="Analyze" data-help-body="Compute geometric metrics and make the analysis CSV available for download.">Analyze</button>
         </section>
       </aside>
@@ -294,7 +338,7 @@
               <div class="editor-step">
                 <div class="step-label">Edit mode</div>
                 <div class="segmented-control">
-                  <button id="editorAnchorMode" class="active" data-help-title="Control Path" data-help-body="Drag anchors to nearby visible points. Shift + left click inserts an anchor; Shift + right click removes the nearest anchor.">Control</button>
+                  <button id="editorAnchorMode" class="active" data-help-title="Control Path" data-help-body="Shift + left click and drag an existing anchor to move it. Shift + left click away from an anchor inserts one; Shift + right click removes the nearest anchor.">Control</button>
                   <button id="editorBrushAddMode" data-help-title="Brush Add" data-help-body="Drag an open brush stroke to redraw the interface section between the stroke endpoints. The endpoints snap to nearby dense interface points.">Brush Add</button>
                   <button id="editorBrushRemoveMode" data-help-title="Brush Remove" data-help-body="Drag an open brush stroke over visible draft interface points; releasing the mouse trims and merges the path.">Brush Remove</button>
                 </div>
@@ -319,6 +363,7 @@
                 <button id="editorUndo" data-help-title="Undo Edit" data-help-body="Undo the most recent anchor or brush edit in the draft.">Undo Edit</button>
                 <button id="editorSaveManual" data-help-title="Save as Manual Interface" data-help-body="Commit this refined draft as the manual interface used by Run ICRG.">Save as Manual</button>
               </div>
+              <button id="editorQuit" class="wide" data-help-title="Quit Editing" data-help-body="Discard this temporary draft and leave the saved manual interface unchanged.">Quit Editing</button>
             </div>
           </section>
         </div>
@@ -348,6 +393,6 @@
 
     </div>
 
-    <script src="/web-static/app.js?v=20260615-interface-width1"></script>
+    <script src="/web-static/app.js?v=20260615-threshold-help"></script>
   </body>
 </html>

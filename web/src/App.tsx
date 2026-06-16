@@ -31,16 +31,19 @@ import {
   createInterfaceDraftFromSource,
   commitInterfaceDraft,
   downloadUrl,
+  exportProject,
   getInterfaceDraft,
   getJob,
   getSession,
   getViewer,
+  importProject,
   runJob,
   undoInterfaceDraft,
   uploadPointCloud,
   type DenoiseParams,
   type InterfaceDraft,
   type JobResponse,
+  type ProjectUiState,
   type SegmentParams,
   type SessionSummary,
   type ViewerPayload
@@ -48,7 +51,7 @@ import {
 import { PointCloudViewer } from "./PointCloudViewer";
 
 type PickMode = "rock" | "pedestal" | "interface";
-type ViewName = "raw" | "seeds" | "interface" | "segmented" | "mesh_prepared" | "mesh";
+type ViewName = "raw" | "seeds" | "interface" | "voxel_segmented" | "segmented" | "mesh_prepared" | "mesh";
 
 type InterfacePartDraft = {
   selected_indices: number[];
@@ -113,7 +116,8 @@ const defaultSegmentParams: SegmentParams = {
   basal_proximity_threshold: 0.05,
   voxel_size: 0.02,
   neighbor_count: 50,
-  distance_threshold: 0.05
+  distance_threshold: 0.05,
+  label_propagation_distance: 0.05
 };
 
 const defaultDenoiseParams: DenoiseParams = {
@@ -132,17 +136,19 @@ const helpText = {
   closeLoop:
     "Keep this on when your interface points outline a closed contact boundary. Turn it off for an open contact edge or when staging separate basal and lateral interface parts.",
   smoothness:
-    "Default 0.9. Higher values require more parallel normals and can reduce leakage across the rock-support contact. Lower values help rough or noisy rock surfaces grow, but can spill into support.",
+    "Normal-alignment threshold for accepting a neighboring point. Lower values are more permissive and can overspill across the interface; higher values are stricter and can leave rough rock unlabeled, which later propagation may fill incorrectly.",
   curvature:
-    "Default 0.1. Lower values are stricter and favor smooth local continuity. Raise it when rough rock surfaces are being missed; lower it if growth crosses sharp contact changes.",
+    "Local curvature threshold for accepting a neighboring point. Larger values are more permissive and can overspill across sharp interface changes; smaller values are stricter and can fragment rough surfaces or leave gaps near the contact.",
   proximity:
-    "The manuscript default is 0.02 m; this UI starts at 0.05 m. Increase if labels cross the contact. Decrease if too much rock near the interface stays unlabeled.",
+    "Used by Run ICRG with a saved manual interface. Points within this radius of the interface are excluded from growth. Increase if labels cross the contact; decrease if too much rock near the interface stays unlabeled.",
   voxel:
     "Default 0.02 m in the manuscript for faster preprocessing. Smaller values preserve contact detail but run slower; larger values smooth noisy data but can erase small interface features.",
   neighbors:
-    "Controls how many nearby points support local geometry tests. Increase for sparse or noisy scans to stabilize normals; decrease to keep small contact details from being blurred.",
+    "Maximum neighbors for normal estimation used by the smoothness and curvature tests. Increase for sparse or noisy scans to stabilize normals; decrease to preserve sharper contact detail.",
   distance:
-    "Default radius is 0.05 m. Increase when the cloud is sparse or growth stalls across small gaps. Decrease to avoid jumps across narrow contacts or nearby supports.",
+    "Maximum radius for region-growing neighbor search. Default is 0.05 m. Increase when the cloud is sparse or growth stalls across small gaps. Decrease to avoid jumps across narrow contacts or nearby supports.",
+  labelPropagation:
+    "Radius for distance-weighted completion after voxel region growing. Default is 0.05 m. Increase to fill larger unlabeled gaps; decrease to reduce leakage across contacts.",
   normalMethod:
     "PyMeshLab is preferred in the supplement because it estimates globally consistent normals for Poisson reconstruction. Use Open3D if PyMeshLab fails or the prepared mesh looks unstable.",
   normalK:
@@ -155,12 +161,26 @@ const viewHelp: Record<ViewName, string> = {
   raw: "Show the uploaded point cloud with its original colors before seed or interface edits.",
   seeds: "Show the seed-selection state, including saved rock and support seed markers.",
   interface: "Show the previewed or saved interface constraints near the contact.",
+  voxel_segmented: "Show the immediate region-growing or ICRG labels on the voxelized point cloud before dense label propagation.",
   segmented: "Show the latest rock/support labels after running region growing or ICRG.",
   mesh_prepared: "Show the prepared point set used for normal estimation and mesh reconstruction.",
   mesh: "Show mesh status after reconstruction; download the PLY from the Downloads panel."
 };
 
+const viewLabels: Record<ViewName, string> = {
+  raw: "Raw",
+  seeds: "Seeds",
+  interface: "Interface",
+  voxel_segmented: "RG Result",
+  segmented: "Segmented",
+  mesh_prepared: "Mesh Prep",
+  mesh: "Mesh"
+};
+
 const buttonHelp = {
+  importProject: "Load a saved .rd3dproj archive and restore its point cloud, parameters, workflow state, and available outputs.",
+  saveProject: "Overwrite the imported or previously chosen .rd3dproj file when browser file access is available. Otherwise, choose a save target first.",
+  saveAsProject: "Choose a .rd3dproj file target for this project. Future Save Project clicks overwrite that chosen file when supported.",
   pickRock: "Shift + left click adds rock seed points. Shift + right click near a selected point removes it.",
   pickPedestal: "Shift + left click adds support or pedestal seed points. Shift + right click near a selected point removes it.",
   pickInterface: "Shift + left click adds interface contact points. Shift + right click near a selected point removes it.",
@@ -217,6 +237,194 @@ function removeIndex(list: number[], index: number) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function projectFilenameFromName(name: string | null | undefined) {
+  const fallback = "rock_detection_project";
+  const raw = (name || fallback).trim();
+  const withoutExtension = raw.replace(/\.(las|laz|rd3dproj|zip)$/i, "");
+  const safeStem = withoutExtension.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._-]+|[._-]+$/g, "") || fallback;
+  return `${safeStem}.rd3dproj`;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = projectFilenameFromName(filename);
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+type ProjectSaveFileHandle = {
+  name?: string;
+  getFile?: () => Promise<File>;
+  queryPermission?: (options: { mode: "readwrite" }) => Promise<PermissionState>;
+  requestPermission?: (options: { mode: "readwrite" }) => Promise<PermissionState>;
+  createWritable: () => Promise<{
+    write: (data: Blob) => Promise<void> | void;
+    close: () => Promise<void> | void;
+  }>;
+};
+
+type ProjectOpenSource = {
+  file: File;
+  handle: ProjectSaveFileHandle;
+};
+
+type ProjectSaveTarget = {
+  filename: string;
+  handle: ProjectSaveFileHandle | null;
+};
+
+async function chooseProjectOpenSource(): Promise<ProjectOpenSource | null> {
+  const pickerWindow = window as Window & {
+    showOpenFilePicker?: (options: {
+      multiple: boolean;
+      types: Array<{
+        description: string;
+        accept: Record<string, string[]>;
+      }>;
+    }) => Promise<ProjectSaveFileHandle[]>;
+  };
+
+  if (typeof pickerWindow.showOpenFilePicker !== "function") {
+    return null;
+  }
+
+  let handles: ProjectSaveFileHandle[];
+  try {
+    handles = await pickerWindow.showOpenFilePicker({
+      multiple: false,
+      types: [
+        {
+          description: "Rock Detection 3D Project",
+          accept: { "application/zip": [".rd3dproj", ".zip"] }
+        }
+      ]
+    });
+  } catch (caught) {
+    if (caught instanceof DOMException && caught.name === "AbortError") {
+      return null;
+    }
+    throw caught;
+  }
+
+  const handle = handles[0];
+  if (!handle?.getFile) {
+    return null;
+  }
+  return {
+    file: await handle.getFile(),
+    handle
+  };
+}
+
+async function chooseProjectSaveTarget(defaultFilename: string): Promise<ProjectSaveTarget | null> {
+  const suggestedName = projectFilenameFromName(defaultFilename);
+  const pickerWindow = window as Window & {
+    showSaveFilePicker?: (options: {
+      suggestedName: string;
+      types: Array<{
+        description: string;
+        accept: Record<string, string[]>;
+      }>;
+    }) => Promise<ProjectSaveFileHandle>;
+  };
+
+  if (typeof pickerWindow.showSaveFilePicker === "function") {
+    let handle: ProjectSaveFileHandle;
+    try {
+      handle = await pickerWindow.showSaveFilePicker({
+        suggestedName,
+        types: [
+          {
+            description: "Rock Detection 3D Project",
+            accept: { "application/zip": [".rd3dproj"] }
+          }
+        ]
+      });
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") {
+        return null;
+      }
+      throw caught;
+    }
+    return {
+      filename: projectFilenameFromName(handle.name || suggestedName),
+      handle
+    };
+  }
+
+  const entered = window.prompt("Project file name", suggestedName);
+  if (entered === null) {
+    return null;
+  }
+  return {
+    filename: projectFilenameFromName(entered),
+    handle: null
+  };
+}
+
+async function writeBlobToSaveHandle(handle: ProjectSaveFileHandle, blob: Blob) {
+  const writable = await handle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+async function ensureProjectWritePermission(handle: ProjectSaveFileHandle | null) {
+  if (!handle) {
+    return false;
+  }
+  const permissionOptions = { mode: "readwrite" as const };
+  if (handle.queryPermission) {
+    const current = await handle.queryPermission(permissionOptions);
+    if (current === "granted") {
+      return true;
+    }
+  }
+  if (handle.requestPermission) {
+    const requested = await handle.requestPermission(permissionOptions);
+    return requested === "granted";
+  }
+  return true;
+}
+
+function viewIsAvailable(summary: SessionSummary, viewName: ViewName) {
+  if (viewName === "raw") {
+    return summary.status.point_cloud_loaded;
+  }
+  if (viewName === "seeds") {
+    return summary.status.point_cloud_loaded;
+  }
+  if (viewName === "interface") {
+    return summary.status.point_cloud_loaded && (summary.status.interface_ready || summary.status.manual_interface_ready || summary.status.auto_interface_ready);
+  }
+  if (viewName === "segmented") {
+    return summary.status.segmentation_ready;
+  }
+  if (viewName === "voxel_segmented") {
+    return Boolean(summary.status.voxel_segmentation_ready);
+  }
+  if (viewName === "mesh_prepared") {
+    return summary.status.mesh_prepared;
+  }
+  return summary.status.mesh_completed;
+}
+
+function bestAvailableView(summary: SessionSummary, preferred?: string): ViewName {
+  const candidateViews: ViewName[] = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"];
+  if (preferred && candidateViews.includes(preferred as ViewName) && viewIsAvailable(summary, preferred as ViewName)) {
+    return preferred as ViewName;
+  }
+  for (const candidate of [...candidateViews].reverse()) {
+    if (viewIsAvailable(summary, candidate)) {
+      return candidate;
+    }
+  }
+  return "raw";
 }
 
 function StatusRow({ done, label }: { done: boolean; label: string }) {
@@ -343,6 +551,9 @@ function SliderField({
 
 export default function App() {
   const [session, setSession] = useState<SessionSummary | null>(null);
+  const [projectFilename, setProjectFilename] = useState("rock_detection_project.rd3dproj");
+  const [, setProjectHasSaveTarget] = useState(false);
+  const [projectSaveHandle, setProjectSaveHandle] = useState<ProjectSaveFileHandle | null>(null);
   const [view, setView] = useState<ViewerPayload | null>(null);
   const [activeView, setActiveView] = useState<ViewName>("raw");
   const [busyLabel, setBusyLabel] = useState<string | null>("Starting");
@@ -454,6 +665,71 @@ export default function App() {
     [session]
   );
 
+  function buildProjectUiState(filename = projectFilename): ProjectUiState {
+    return {
+      project_filename: projectFilenameFromName(filename),
+      active_view: activeView,
+      pick_mode: pickMode,
+      point_size: pointSize,
+      segment_params: segmentParams,
+      denoise_params: denoiseParams,
+      normal_method: normalMethod,
+      normal_k: normalK,
+      normal_display_scale: normalDisplayScale,
+      mesh_depth: meshDepth,
+      hover_tips_enabled: hoverTipsEnabled,
+      interface_points: interfacePoints,
+      interface_parts: interfaceParts,
+      current_part_lateral: currentPartLateral,
+      close_loop: closeLoop
+    };
+  }
+
+  function restoreProjectUiState(uiState: ProjectUiState | undefined, summary: SessionSummary) {
+    const restoredFilename = projectFilenameFromName(uiState?.project_filename || summary.current_file || "rock_detection_project");
+    setProjectFilename(restoredFilename);
+    setRockSeeds(summary.seeds.rock ?? []);
+    setPedestalSeeds(summary.seeds.pedestal ?? []);
+    seedAutosaveSignatureRef.current = JSON.stringify({
+      rock_seed_indices: summary.seeds.rock ?? [],
+      pedestal_seed_indices: summary.seeds.pedestal ?? []
+    });
+    if (uiState?.segment_params) {
+      setSegmentParams({ ...defaultSegmentParams, ...uiState.segment_params });
+    }
+    if (uiState?.denoise_params) {
+      setDenoiseParams({ ...defaultDenoiseParams, ...uiState.denoise_params });
+    }
+    if (uiState?.normal_method === "open3d" || uiState?.normal_method === "pymeshlab") {
+      setNormalMethod(uiState.normal_method);
+    }
+    if (typeof uiState?.normal_k === "number" && Number.isFinite(uiState.normal_k)) {
+      setNormalK(uiState.normal_k);
+    }
+    if (typeof uiState?.normal_display_scale === "number" && Number.isFinite(uiState.normal_display_scale)) {
+      setNormalDisplayScale(uiState.normal_display_scale);
+    }
+    if (typeof uiState?.mesh_depth === "number" && Number.isFinite(uiState.mesh_depth)) {
+      setMeshDepth(uiState.mesh_depth);
+    }
+    if (typeof uiState?.point_size === "number" && Number.isFinite(uiState.point_size)) {
+      setPointSize(uiState.point_size);
+    }
+    if (typeof uiState?.hover_tips_enabled === "boolean") {
+      setHoverTipsEnabled(uiState.hover_tips_enabled);
+    }
+    if (uiState?.pick_mode === "rock" || uiState?.pick_mode === "pedestal" || uiState?.pick_mode === "interface") {
+      setPickMode(uiState.pick_mode);
+    }
+    setInterfacePoints(Array.isArray(uiState?.interface_points) ? uiState.interface_points : []);
+    setInterfaceParts(Array.isArray(uiState?.interface_parts) ? uiState.interface_parts : []);
+    setCurrentPartLateral(Boolean(uiState?.current_part_lateral));
+    setCloseLoop(typeof uiState?.close_loop === "boolean" ? uiState.close_loop : true);
+    setInterfaceDraft(null);
+    setInterfaceEditorOpen(false);
+    clearManualRemoval();
+  }
+
   async function pollJob(jobId: string) {
     let job = await getJob(jobId);
     while (job.status === "queued" || job.status === "running") {
@@ -519,6 +795,95 @@ export default function App() {
     }
   }
 
+  async function handleProjectExport(
+    filename: string,
+    options: { saveHandle?: ProjectSaveFileHandle | null; establishSaveTarget?: boolean } = {}
+  ) {
+    if (!session?.status.point_cloud_loaded) {
+      return;
+    }
+    setBusyLabel("Saving project");
+    setError(null);
+    try {
+      if (!(await saveSeedsNow())) {
+        return;
+      }
+      const safeFilename = projectFilenameFromName(filename);
+      const exported = await exportProject(session.session_id, {
+        filename: safeFilename,
+        ui_state: buildProjectUiState(safeFilename)
+      });
+      if (options.saveHandle) {
+        await writeBlobToSaveHandle(options.saveHandle, exported.blob);
+        setProjectSaveHandle(options.saveHandle);
+        setProjectFilename(projectFilenameFromName(options.saveHandle.name || exported.filename || safeFilename));
+        setProjectHasSaveTarget(true);
+      } else {
+        downloadBlob(exported.blob, exported.filename || safeFilename);
+        setProjectSaveHandle(null);
+        setProjectFilename(projectFilenameFromName(exported.filename || safeFilename));
+        setProjectHasSaveTarget(false);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
+  }
+
+  async function handleProjectSave() {
+    if (!projectSaveHandle) {
+      await handleProjectSaveAs();
+      return;
+    }
+    const permitted = await ensureProjectWritePermission(projectSaveHandle);
+    if (!permitted) {
+      setError("Write permission was not granted. Use Save As to choose a writable project file.");
+      return;
+    }
+    await handleProjectExport(projectFilename, { saveHandle: projectSaveHandle });
+  }
+
+  async function handleProjectSaveAs() {
+    const target = await chooseProjectSaveTarget(projectFilename);
+    if (!target) {
+      return;
+    }
+    if (target.handle) {
+      const permitted = await ensureProjectWritePermission(target.handle);
+      if (!permitted) {
+        setError("Write permission was not granted for that project file.");
+        return;
+      }
+    }
+    await handleProjectExport(target.filename, {
+      saveHandle: target.handle,
+      establishSaveTarget: true
+    });
+  }
+
+  async function handleProjectImport(file: File | null, options: { saveHandle?: ProjectSaveFileHandle | null } = {}) {
+    if (!file || !session) {
+      return;
+    }
+    setBusyLabel("Importing project");
+    setError(null);
+    try {
+      const imported = await importProject(session.session_id, file);
+      await refreshSession(imported.summary);
+      restoreProjectUiState(imported.ui_state, imported.summary);
+      setProjectFilename(projectFilenameFromName(imported.project_filename || file.name));
+      setProjectSaveHandle(options.saveHandle || null);
+      setProjectHasSaveTarget(Boolean(options.saveHandle));
+      const nextView = bestAvailableView(imported.summary, imported.ui_state?.active_view);
+      await refreshView(nextView, imported.summary);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyLabel(null);
+    }
+  }
+
   useEffect(() => {
     if (!session?.status.point_cloud_loaded) {
       return undefined;
@@ -570,6 +935,9 @@ export default function App() {
       setInterfaceDraft(null);
       setInterfaceEditorOpen(false);
       setCurrentPartLateral(false);
+      setProjectFilename(projectFilenameFromName(file.name));
+      setProjectHasSaveTarget(false);
+      setProjectSaveHandle(null);
       clearManualRemoval();
       await refreshView("raw", summary);
     } catch (caught) {
@@ -933,6 +1301,59 @@ export default function App() {
           </div>
         </div>
 
+        <div className="project-actions">
+          <label className="project-file-button">
+            <FileUp size={16} />
+            <span>Import Project</span>
+            <input
+              type="file"
+              accept=".rd3dproj,.zip"
+              onClick={(event) => {
+                const pickerWindow = window as Window & { showOpenFilePicker?: unknown };
+                if (typeof pickerWindow.showOpenFilePicker !== "function") {
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                void (async () => {
+                  try {
+                    const source = await chooseProjectOpenSource();
+                    if (source) {
+                      await handleProjectImport(source.file, { saveHandle: source.handle });
+                    }
+                  } catch (caught) {
+                    setError(caught instanceof Error ? caught.message : String(caught));
+                  }
+                })();
+                event.currentTarget.value = "";
+              }}
+              onChange={(event) => {
+                void handleProjectImport(event.target.files?.[0] ?? null);
+                event.currentTarget.value = "";
+              }}
+            />
+            <span className="button-popover" role="tooltip">
+              {buttonHelp.importProject}
+            </span>
+          </label>
+          <ActionButton
+            disabled={!session?.status.point_cloud_loaded}
+            help={buttonHelp.saveProject}
+            disabledHelp="Load or import a point cloud first."
+            onClick={handleProjectSave}
+          >
+            <Save size={16} /> Save Project
+          </ActionButton>
+          <ActionButton
+            disabled={!session?.status.point_cloud_loaded}
+            help={buttonHelp.saveAsProject}
+            disabledHelp="Load or import a point cloud first."
+            onClick={handleProjectSaveAs}
+          >
+            <Download size={16} /> Save As
+          </ActionButton>
+        </div>
+
         <label className="upload-button">
           <FileUp size={18} />
           <span>Upload LAS/LAZ</span>
@@ -957,7 +1378,7 @@ export default function App() {
         <section className="panel compact">
           <h2>Views</h2>
           <div className="view-grid">
-            {(["raw", "seeds", "interface", "segmented", "mesh_prepared", "mesh"] as ViewName[]).map((name) => (
+            {(["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"] as ViewName[]).map((name) => (
               <ActionButton
                 key={name}
                 className={activeView === name ? "active" : ""}
@@ -966,7 +1387,7 @@ export default function App() {
                 disabledHelp="Upload a point cloud first."
                 onClick={() => refreshView(name)}
               >
-                {name.replace("_", " ")}
+                {viewLabels[name]}
               </ActionButton>
             ))}
           </div>
@@ -1108,7 +1529,7 @@ export default function App() {
             onChange={(value) => setSegmentParams((params) => ({ ...params, curvature_threshold: value }))}
           />
           <NumericField
-            label="Basal proximity"
+            label="Interface exclusion radius"
             help={helpText.proximity}
             value={segmentParams.basal_proximity_threshold}
             min={0}
@@ -1126,22 +1547,22 @@ export default function App() {
             onChange={(value) => setSegmentParams((params) => ({ ...params, voxel_size: value }))}
           />
           <NumericField
-            label="Neighbors"
-            help={helpText.neighbors}
-            value={segmentParams.neighbor_count}
-            min={3}
-            max={500}
-            step={1}
-            onChange={(value) => setSegmentParams((params) => ({ ...params, neighbor_count: value }))}
-          />
-          <NumericField
-            label="Distance"
+            label="Neighborhood radius"
             help={helpText.distance}
             value={segmentParams.distance_threshold}
             min={0.001}
             max={1}
             step={0.001}
             onChange={(value) => setSegmentParams((params) => ({ ...params, distance_threshold: value }))}
+          />
+          <NumericField
+            label="Normal neighbors"
+            help={helpText.neighbors}
+            value={segmentParams.neighbor_count}
+            min={3}
+            max={500}
+            step={1}
+            onChange={(value) => setSegmentParams((params) => ({ ...params, neighbor_count: value }))}
           />
           <ActionButton
             className="wide"
@@ -1154,12 +1575,9 @@ export default function App() {
               }
               await runWorkflowAction(
                 "Segmenting",
-                `/api/sessions/${session?.session_id}/segment`,
+                `/api/sessions/${session?.session_id}/segment/region-growing`,
                 segmentParams,
-                (result) => {
-                  const payload = result as { auto_interface_generated?: boolean } | undefined;
-                  return payload?.auto_interface_generated ? "interface" : "segmented";
-                }
+                "voxel_segmented"
               );
             }}
           >
@@ -1180,9 +1598,9 @@ export default function App() {
               }
               await runWorkflowAction(
                 "Running ICRG",
-                `/api/sessions/${session?.session_id}/segment/icrg`,
+                `/api/sessions/${session?.session_id}/segment/icrg/region-growing`,
                 segmentParams,
-                "segmented"
+                "voxel_segmented"
               );
             }}
           >
@@ -1191,7 +1609,34 @@ export default function App() {
         </section>
 
         <section className="panel">
-          <h2>3. Mesh Preparation</h2>
+          <h2>3. Label Propagating</h2>
+          <NumericField
+            label="Label propagation"
+            help={helpText.labelPropagation}
+            value={segmentParams.label_propagation_distance}
+            min={0.001}
+            max={1}
+            step={0.001}
+            onChange={(value) => setSegmentParams((params) => ({ ...params, label_propagation_distance: value }))}
+          />
+          <ActionButton
+            className="wide"
+            disabled={!session?.status.voxel_segmentation_ready}
+            help="Complete dense distance-weighted label propagation and open the Segmented view."
+            disabledHelp="Run region growing first."
+            onClick={() => runWorkflowAction(
+              "Running label propagation",
+              `/api/sessions/${session?.session_id}/segment/label-propagation`,
+              { label_propagation_distance: segmentParams.label_propagation_distance },
+              "segmented"
+            )}
+          >
+            <Play size={16} /> Run Label Propagation
+          </ActionButton>
+        </section>
+
+        <section className="panel">
+          <h2>4. Mesh Preparation</h2>
           <ActionButton
             className="wide"
             disabled={!session?.status.segmentation_ready}
@@ -1302,7 +1747,7 @@ export default function App() {
         </section>
 
         <section className="panel">
-          <h2>4. Normals</h2>
+          <h2>5. Normals</h2>
           <label className="field">
             <span className="field-label">
               <span>Normal method</span>
@@ -1342,7 +1787,7 @@ export default function App() {
         </section>
 
         <section className="panel">
-          <h2>5. Reconstruction</h2>
+          <h2>6. Reconstruction</h2>
           <NumericField label="Depth" help={helpText.depth} value={meshDepth} min={5} max={12} step={1} onChange={setMeshDepth} />
           <ActionButton
             className="wide"
@@ -1363,7 +1808,7 @@ export default function App() {
         </section>
 
         <section className="panel">
-          <h2>6. Analysis</h2>
+          <h2>7. Analysis</h2>
           <ActionButton
             className="wide"
             disabled={!session?.status.mesh_completed}
@@ -1478,6 +1923,9 @@ export default function App() {
                       <Save size={16} /> Save as Manual
                     </ActionButton>
                   </div>
+                  <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.clearDraft} disabledHelp="Create a draft first." onClick={discardInterfaceDraft}>
+                    Quit Editing
+                  </ActionButton>
                 </div>
               )}
             </section>

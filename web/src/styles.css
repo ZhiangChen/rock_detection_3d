@@ -111,6 +111,49 @@ a {
   overflow-wrap: anywhere;
 }
 
+.project-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.project-actions .button-help-wrap {
+  width: 100%;
+}
+
+.project-file-button {
+  position: relative;
+  min-height: 34px;
+  border: 1px solid #c6ccc4;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #202427;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.project-file-button:hover {
+  border-color: #5d7f73;
+  background: #f6faf7;
+}
+
+.project-file-button input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.project-file-button:hover .button-popover,
+.project-file-button:focus-within .button-popover {
+  display: block;
+}
+
 .upload-button {
   position: relative;
   min-height: 38px;

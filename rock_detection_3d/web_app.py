@@ -29,7 +29,7 @@ RUNS_DIR = REPO_ROOT / "web_runs"
 WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
 WEB_STATIC_DIR = MODULE_DIR / "web_static"
 ALLOWED_POINT_CLOUD_SUFFIXES = {".las", ".laz"}
-APP_BUILD = "20260615-interface-width1"
+APP_BUILD = "20260615-threshold-help"
 
 
 class ManualSeedsRequest(BaseModel):
@@ -79,6 +79,7 @@ class SegmentRequest(BaseModel):
     voxel_size: float | None = None
     neighbor_count: int | None = None
     distance_threshold: float | None = None
+    label_propagation_distance: float | None = None
 
 
 class NormalsRequest(BaseModel):
@@ -100,6 +101,11 @@ class ManualRemoveRequest(BaseModel):
 
 class ReconstructRequest(BaseModel):
     depth: int = 8
+
+
+class ProjectExportRequest(BaseModel):
+    ui_state: dict[str, Any] = Field(default_factory=dict)
+    filename: str | None = None
 
 
 class RuntimeDiagnostics(BaseModel):
@@ -249,12 +255,12 @@ def upload_point_cloud(session_id: str, file: UploadFile = File(...)) -> dict[st
 
 
 @app.get("/api/sessions/{session_id}/viewer/{view_name}")
-def get_viewer(session_id: str, view_name: str) -> dict[str, Any]:
+def get_viewer(session_id: str, view_name: str, color_mode: str | None = None) -> dict[str, Any]:
     record = _get_session(session_id)
     mesh_url = f"/api/sessions/{session_id}/downloads/mesh" if view_name == "mesh" else None
     try:
         with record.lock:
-            return record.workflow.viewer_payload(view_name, mesh_url=mesh_url)
+            return record.workflow.viewer_payload(view_name, mesh_url=mesh_url, color_mode=color_mode)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -417,6 +423,36 @@ def segment_icrg(session_id: str, request: SegmentRequest) -> dict[str, str]:
     return _submit_job(session_id, "segment_icrg", lambda workflow: workflow.segment_icrg(params))
 
 
+@app.post("/api/sessions/{session_id}/segment/region-growing")
+def segment_region_growing(session_id: str, request: SegmentRequest) -> dict[str, str]:
+    params = {key: value for key, value in request.model_dump().items() if value is not None}
+    return _submit_job(
+        session_id,
+        "segment_region_growing",
+        lambda workflow: workflow.segment_region_growing(params),
+    )
+
+
+@app.post("/api/sessions/{session_id}/segment/icrg/region-growing")
+def segment_icrg_region_growing(session_id: str, request: SegmentRequest) -> dict[str, str]:
+    params = {key: value for key, value in request.model_dump().items() if value is not None}
+    return _submit_job(
+        session_id,
+        "segment_icrg_region_growing",
+        lambda workflow: workflow.segment_icrg_region_growing(params),
+    )
+
+
+@app.post("/api/sessions/{session_id}/segment/label-propagation")
+def label_propagation(session_id: str, request: SegmentRequest) -> dict[str, str]:
+    params = {key: value for key, value in request.model_dump().items() if value is not None}
+    return _submit_job(
+        session_id,
+        "label_propagation",
+        lambda workflow: workflow.label_propagation(params),
+    )
+
+
 @app.post("/api/sessions/{session_id}/mesh/prepare")
 def prepare_mesh(session_id: str) -> dict[str, str]:
     return _submit_job(session_id, "prepare_mesh", lambda workflow: workflow.prepare_mesh())
@@ -462,6 +498,39 @@ def reconstruct_mesh(session_id: str, request: ReconstructRequest) -> dict[str, 
 @app.post("/api/sessions/{session_id}/analysis")
 def analyze(session_id: str) -> dict[str, str]:
     return _submit_job(session_id, "analysis", lambda workflow: workflow.analyze())
+
+
+@app.post("/api/sessions/{session_id}/project/export", response_model=None)
+def export_project(session_id: str, request: ProjectExportRequest) -> FileResponse:
+    record = _get_session(session_id)
+    try:
+        with record.lock:
+            path = record.workflow.export_project(
+                ui_state=request.ui_state,
+                filename=request.filename,
+                app_build=APP_BUILD,
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
+@app.post("/api/sessions/{session_id}/project/import")
+def import_project(session_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    record = _get_session(session_id)
+    filename = Path(file.filename or "project.rd3dproj").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".rd3dproj", ".zip"}:
+        raise HTTPException(status_code=400, detail="Upload a .rd3dproj project archive.")
+
+    target = record.workflow.run_dir / "imports" / filename
+    try:
+        copy_upload_to_session(file.file, target)
+        with record.lock:
+            return record.workflow.import_project(target)
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Project import failed", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/sessions/{session_id}/downloads/{kind}")
