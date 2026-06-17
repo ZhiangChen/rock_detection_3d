@@ -13,6 +13,39 @@ export type WorkflowStatus = {
   last_segmentation_mode?: "rg" | "icrg" | null;
 };
 
+export type MeshTarget = "rock" | "pedestal";
+
+export type MeshTargetState = {
+  prepared: boolean;
+  preview?: boolean;
+  available?: boolean;
+  normal_display_ready: boolean;
+  object_point_count: number;
+  interface_fill_point_count: number;
+};
+
+export type MeshReconstructionTargetState = {
+  completed: boolean;
+  path?: string | null;
+  method?: "poisson" | "local_plane_filled_holes" | string;
+  vertex_count?: number;
+  triangle_count?: number;
+};
+
+export type CombinedReconstructionTargetState = {
+  available: boolean;
+  source: "mesh" | "segmentation" | "none";
+  point_count?: number;
+  vertex_count?: number;
+  triangle_count?: number;
+  bounds?: PointBounds | null;
+};
+
+export type PointBounds = {
+  min: [number, number, number];
+  max: [number, number, number];
+};
+
 export type SessionSummary = {
   session_id: string;
   status: WorkflowStatus;
@@ -32,8 +65,16 @@ export type SessionSummary = {
   outputs: {
     segmented: string | null;
     mesh: string | null;
+    pedestal_mesh?: string | null;
     analysis: string | null;
   };
+  mesh_prepared_targets?: Partial<Record<MeshTarget, MeshTargetState>>;
+  mesh_reconstruction_targets?: Partial<Record<MeshTarget, MeshReconstructionTargetState>>;
+  combined_reconstruction?: {
+    available: boolean;
+    components?: Partial<Record<MeshTarget, CombinedReconstructionTargetState>>;
+  };
+  normals_display_ready_by_target?: Partial<Record<MeshTarget, boolean>>;
 };
 
 export type PointMarker = {
@@ -49,16 +90,23 @@ export type PointCloudView = {
   colors: [number, number, number][];
   normals?: [number, number, number][];
   indices: number[];
-  bounds: {
-    min: [number, number, number];
-    max: [number, number, number];
-  };
-  scene_bounds?: {
-    min: [number, number, number];
-    max: [number, number, number];
-  };
+  bounds: PointBounds;
+  scene_bounds?: PointBounds;
   markers: PointMarker[];
   normal_segments?: [[number, number, number], [number, number, number]][];
+  analysis_markers?: PointMarker[];
+  analysis_segments?: {
+    start: [number, number, number];
+    end: [number, number, number];
+    color: [number, number, number];
+    label: string;
+  }[];
+  analysis_summary?: {
+    title?: string;
+    metrics?: { label: string; value: string }[];
+    vectors?: { label: string; value: [number, number, number] | null }[];
+    csv_path?: string | null;
+  };
   normal_diagnostics?: {
     point_count: number;
     normal_shape: number[] | null;
@@ -74,6 +122,12 @@ export type PointCloudView = {
   };
   rock_point_count?: number;
   bottom_point_count?: number;
+  pedestal_point_count?: number;
+  object_point_count?: number;
+  interface_fill_point_count?: number;
+  mesh_target?: MeshTarget;
+  reset_preview?: boolean;
+  prepared_saved?: boolean;
   total_points: number;
   rendered_points: number;
 };
@@ -82,19 +136,60 @@ export type MeshView = {
   kind: "mesh";
   url: string;
   show_wireframe: boolean;
+  mesh_target?: MeshTarget;
+  mesh_method?: "poisson" | "local_plane_filled_holes" | string;
+  mesh_path?: string | null;
+  vertex_count?: number;
+  triangle_count?: number;
   vertices?: [number, number, number][];
   triangles?: [number, number, number][];
-  bounds?: {
-    min: [number, number, number];
-    max: [number, number, number];
-  };
-  scene_bounds?: {
-    min: [number, number, number];
-    max: [number, number, number];
-  };
+  analysis_markers?: PointCloudView["analysis_markers"];
+  analysis_segments?: PointCloudView["analysis_segments"];
+  analysis_summary?: PointCloudView["analysis_summary"];
+  bounds?: PointBounds;
+  scene_bounds?: PointBounds;
 };
 
-export type ViewerPayload = PointCloudView | MeshView;
+export type CombinedMeshComponent =
+  | {
+    kind: "mesh";
+    target: MeshTarget;
+    source: "mesh";
+    url: string;
+    mesh_path?: string | null;
+    vertex_count?: number;
+    triangle_count?: number;
+    vertices?: [number, number, number][];
+    triangles?: [number, number, number][];
+    color?: [number, number, number];
+    wire_color?: [number, number, number];
+    show_wireframe?: boolean;
+  }
+  | {
+    kind: "pointCloud";
+    target: MeshTarget;
+    source: "segmentation";
+    points: [number, number, number][];
+    colors: [number, number, number][];
+    normals?: [number, number, number][];
+    indices: number[];
+    point_count: number;
+  };
+
+export type CombinedMeshView = {
+  kind: "combinedMesh";
+  components: CombinedMeshComponent[];
+  total_points: number;
+  rendered_points: number;
+  bounds: PointBounds;
+  scene_bounds?: PointBounds;
+  analysis_markers?: PointCloudView["analysis_markers"];
+  analysis_segments?: PointCloudView["analysis_segments"];
+  analysis_summary?: PointCloudView["analysis_summary"];
+  combined_reconstruction?: SessionSummary["combined_reconstruction"];
+};
+
+export type ViewerPayload = PointCloudView | MeshView | CombinedMeshView;
 
 export type JobResponse = {
   job_id: string;
@@ -127,6 +222,7 @@ export type ProjectUiState = {
   project_filename?: string | null;
   active_view?: string;
   pick_mode?: string;
+  active_mesh_target?: MeshTarget;
   point_size?: number;
   segment_params?: SegmentParams;
   denoise_params?: DenoiseParams;
@@ -242,8 +338,16 @@ export async function uploadPointCloud(sessionId: string, file: File): Promise<S
   });
 }
 
-export async function getViewer(sessionId: string, viewName: string): Promise<ViewerPayload> {
-  return request<ViewerPayload>(`/api/sessions/${sessionId}/viewer/${viewName}?t=${Date.now()}`);
+export async function getViewer(
+  sessionId: string,
+  viewName: string,
+  options: { meshTarget?: MeshTarget } = {}
+): Promise<ViewerPayload> {
+  const params = new URLSearchParams({ t: String(Date.now()) });
+  if (options.meshTarget) {
+    params.set("mesh_target", options.meshTarget);
+  }
+  return request<ViewerPayload>(`/api/sessions/${sessionId}/viewer/${viewName}?${params.toString()}`);
 }
 
 export async function getJob(jobId: string): Promise<JobResponse> {
@@ -311,8 +415,12 @@ export async function commitInterfaceDraft(sessionId: string): Promise<JobRespon
   return runJob(`/api/sessions/${sessionId}/interface/draft/commit`);
 }
 
-export async function manualRemovePreparedPoints(sessionId: string, selectedIndices: number[]): Promise<JobResponse> {
-  return runJob(`/api/sessions/${sessionId}/mesh/noise/manual-remove`, { selected_indices: selectedIndices });
+export async function manualRemovePreparedPoints(
+  sessionId: string,
+  selectedIndices: number[],
+  target: MeshTarget = "rock"
+): Promise<JobResponse> {
+  return runJob(`/api/sessions/${sessionId}/mesh/noise/manual-remove`, { selected_indices: selectedIndices, target });
 }
 
 export function downloadUrl(sessionId: string, kind: string): string {

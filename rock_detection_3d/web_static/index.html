@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rock Detection 3D</title>
-    <link rel="stylesheet" href="/web-static/styles.css?v=20260615-panel-scroll" />
+    <link rel="stylesheet" href="/web-static/styles.css?v=20260616-combined-rock-pedestal" />
   </head>
   <body>
     <div class="shell">
@@ -48,6 +48,7 @@
             <button data-view="segmented" data-help-title="Segmented view" data-help-body="Show the latest rock/support labels after running region growing or ICRG.">Segmented</button>
             <button data-view="mesh_prepared" data-help-title="Mesh prep view" data-help-body="Show the prepared point set used for normal estimation and mesh reconstruction.">Mesh Prep</button>
             <button data-view="mesh" data-help-title="Mesh view" data-help-body="Show mesh status after reconstruction; download the PLY from the Downloads panel.">Mesh</button>
+            <button data-view="analysis" data-help-title="Analysis view" data-help-body="Show the sampled rock surface with center of mass, gravity direction, alpha rocking point, and analysis metrics.">Analysis</button>
           </div>
           <button id="toggleTips" class="tip-toggle" type="button" aria-pressed="true">Hover Tips On</button>
         </section>
@@ -89,6 +90,7 @@
         </div>
         <canvas id="viewer"></canvas>
         <div id="branchLegend" class="branch-legend hidden" aria-live="polite"></div>
+        <div id="analysisWindow" class="analysis-window hidden" aria-live="polite"></div>
         <canvas id="manualRemovalOverlay" class="manual-removal-overlay hidden"></canvas>
         <canvas id="interfaceEditorOverlay" class="manual-removal-overlay interface-editor-overlay hidden"></canvas>
         <div id="toast" class="toast hidden"></div>
@@ -187,7 +189,14 @@
 
         <section class="panel">
           <h2>4. Mesh Preparation</h2>
-          <button id="prepareMesh" class="wide" data-help-title="Prepare" data-help-body="Create the prepared rock point set used for normals, reconstruction, and analysis.">Prepare Mesh</button>
+          <div class="segmented-control mesh-target-control" aria-label="Mesh preparation target">
+            <button id="prepareRockMesh" class="active" type="button" data-mesh-target="rock" data-help-title="Prepare Rock Mesh" data-help-body="Use rock points plus the interpolated interface fill for rock mesh preparation.">Prepare Rock Mesh</button>
+            <button id="preparePedestalMesh" type="button" data-mesh-target="pedestal" data-help-title="Prepare Pedestal Mesh" data-help-body="Use only pedestal/support points for pedestal mesh preparation. Interface points are not included.">Prepare Pedestal Mesh</button>
+          </div>
+          <div class="button-row mesh-prep-actions">
+            <button id="prepareMesh" data-help-title="Run Preparation" data-help-body="Open the existing prepared target if available; otherwise prepare it from the current label-propagated segmentation.">Run Preparation</button>
+            <button id="resetMeshPreparation" data-help-title="Reset Preparation" data-help-body="Preview a fresh prepared target from label propagation. It is not saved until denoise or manual removal commits it.">Reset</button>
+          </div>
           <label>
             <span class="label-row">
               <span>Denoise method</span>
@@ -235,11 +244,17 @@
             <button id="removeNoise" data-help-title="Denoise" data-help-body="Run the selected denoise method: SOR, DBSCAN, or SOR followed by DBSCAN.">Denoise</button>
             <button id="undoNoise" data-help-title="Undo Denoise" data-help-body="Restore the prepared mesh point cloud to the state before the last denoise step.">Undo Denoise</button>
           </div>
-          <button id="manualRemoval" class="wide" data-help-title="Manual Removal" data-help-body="Draw a screen-space polygon in Mesh Prep view and remove selected prepared rock or interpolated bottom-face points.">Manual Removal</button>
+          <button id="hagVegetation" class="wide" data-help-title="Height Above Ground" data-help-body="For prepared pedestal points, estimate local ground and select vegetation points above the height threshold. Apply previews the selection; confirm removes it.">Height Above Ground</button>
+          <button id="roughnessRemoval" class="wide" data-help-title="Roughness" data-help-body="For prepared pedestal points, calculate local best-fit-plane roughness, show a heatmap, then select points above the threshold.">Roughness</button>
+          <button id="manualRemoval" class="wide" data-help-title="Manual Removal" data-help-body="Draw a screen-space polygon in Mesh Prep view and remove all prepared points projected inside it, including points hidden behind the front surface.">Manual Removal</button>
         </section>
 
         <section class="panel">
           <h2>5. Normals</h2>
+          <div class="segmented-control mesh-target-control" aria-label="Normals target">
+            <button id="normalRockTarget" class="active" type="button" data-mesh-target="rock" data-help-title="Rock Normals" data-help-body="Compute or display normals for the prepared rock target.">Rock Normals</button>
+            <button id="normalPedestalTarget" type="button" data-mesh-target="pedestal" data-help-title="Pedestal Normals" data-help-body="Compute or display normals for the prepared pedestal target.">Pedestal Normals</button>
+          </div>
           <label>
             <span class="label-row">
               <span>Normal method</span>
@@ -269,6 +284,10 @@
 
         <section class="panel">
           <h2>6. Reconstruction</h2>
+          <div class="segmented-control mesh-target-control" aria-label="Reconstruction target">
+            <button id="reconstructRockTarget" class="active" type="button" data-mesh-target="rock" data-help-title="Rock Reconstruction" data-help-body="Run the existing Poisson reconstruction on the prepared rock point set. Rock reconstruction is used by analysis and the standard Mesh PLY download.">Rock</button>
+            <button id="reconstructPedestalTarget" type="button" data-mesh-target="pedestal" data-help-title="Pedestal Reconstruction" data-help-body="Run the local-plane filled-hole surface reconstruction on the prepared pedestal point set.">Pedestal</button>
+          </div>
           <label>
             <span class="label-row">
               <span>Depth</span>
@@ -276,7 +295,8 @@
             </span>
             <input id="meshDepth" type="number" min="5" max="12" step="1" value="8" />
           </label>
-          <button id="reconstruct" class="wide" data-help-title="Reconstruct Mesh" data-help-body="Run Poisson reconstruction and create the downloadable mesh PLY.">Reconstruct Mesh</button>
+          <button id="reconstruct" class="wide" data-help-title="Reconstruct Mesh" data-help-body="Run Poisson for rock or local-plane filled-hole surface reconstruction for pedestal, based on the selected reconstruction target.">Reconstruct Mesh</button>
+          <button id="loadRockPedestal" class="wide" data-help-title="Load Rock + Pedestal" data-help-body="Load rock and pedestal together. Existing meshes are used first; missing meshes fall back to their segmented point clouds.">Load Rock + Pedestal</button>
         </section>
 
         <section class="panel">
@@ -369,20 +389,140 @@
         </div>
       </div>
 
+      <div id="vegetationWindow" class="floating-window vegetation-window hidden" role="dialog" aria-labelledby="vegetationWindowTitle" aria-hidden="true">
+        <div id="vegetationWindowHandle" class="floating-window-header">
+          <h2 id="vegetationWindowTitle">Height Above Ground</h2>
+          <button id="closeVegetationWindow" class="floating-window-close" type="button" aria-label="Close vegetation selection window">x</button>
+        </div>
+        <div class="floating-window-body">
+          <p class="tool-note">Apply previews likely vegetation in yellow. Adjust parameters and apply again until the selection looks right, then confirm removal.</p>
+          <div class="inline-fields">
+            <label>
+              <span class="label-row">
+                <span>Grid size</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="HAG grid size help" data-info-title="Grid size" data-info-body="XY cell size used to estimate local ground elevation. Increase for sparse scans; decrease for denser or uneven ground.">i</span>
+              </span>
+              <input id="hagGridSize" type="number" min="0.001" max="5" step="0.001" value="0.05" />
+            </label>
+            <label>
+              <span class="label-row">
+                <span>Height threshold</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="HAG height threshold help" data-info-title="Height threshold" data-info-body="Points this far above the local ground estimate are selected as vegetation candidates. Increase to select only taller vegetation.">i</span>
+              </span>
+              <input id="hagHeightThreshold" type="number" min="0" max="5" step="0.001" value="0.08" />
+            </label>
+            <label>
+              <span class="label-row">
+                <span>Ground percentile</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="HAG ground percentile help" data-info-title="Ground percentile" data-info-body="Low Z percentile in each grid cell used as the local ground estimate. Lower values follow the lowest points more aggressively.">i</span>
+              </span>
+              <input id="hagGroundPercentile" type="number" min="0" max="100" step="1" value="10" />
+            </label>
+            <label>
+              <span class="label-row">
+                <span>Min points</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="HAG minimum points help" data-info-title="Minimum points per cell" data-info-body="A cell needs at least this many points to estimate ground directly. Sparse cells borrow the nearest valid ground cell.">i</span>
+              </span>
+              <input id="hagMinPointsPerCell" type="number" min="1" max="1000" step="1" value="3" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="hagApply" data-help-title="Apply HAG" data-help-body="Run Height Above Ground selection and preview vegetation candidates in yellow.">Apply</button>
+            <button id="hagConfirm" data-help-title="Confirm Removal" data-help-body="Remove the currently selected vegetation candidates from the prepared pedestal point cloud.">Confirm Removal</button>
+          </div>
+          <div class="button-row">
+            <button id="hagClear" data-help-title="Clear HAG Selection" data-help-body="Clear the yellow preview selection without changing the prepared pedestal point cloud.">Clear</button>
+            <button id="hagClose" data-help-title="Close HAG" data-help-body="Close this tool and clear its preview selection.">Close</button>
+          </div>
+          <div class="readout">
+            <span id="hagCount">0 vegetation candidates selected</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="roughnessWindow" class="floating-window roughness-window hidden" role="dialog" aria-labelledby="roughnessWindowTitle" aria-hidden="true">
+        <div id="roughnessWindowHandle" class="floating-window-header">
+          <h2 id="roughnessWindowTitle">Roughness</h2>
+          <button id="closeRoughnessWindow" class="floating-window-close" type="button" aria-label="Close roughness selection window">x</button>
+        </div>
+        <div class="floating-window-body">
+          <p class="tool-note">Calculate builds a local plane roughness heatmap from the radius. Apply uses the threshold on the current heatmap without recalculating.</p>
+          <div class="inline-fields">
+            <div class="field-with-action">
+              <label>
+                <span class="label-row">
+                  <span>Radius</span>
+                  <span class="info-button" tabindex="0" role="button" aria-label="Roughness radius help" data-info-title="Roughness radius" data-info-body="Spherical neighborhood radius used to fit a local least-squares plane around each pedestal point. Larger radii smooth over broader ground trends; smaller radii react to local texture and noise.">i</span>
+                </span>
+                <input id="roughnessRadius" type="number" min="0.001" max="5" step="0.001" value="0.05" />
+              </label>
+              <button id="roughnessCalculate" data-help-title="Calculate Roughness" data-help-body="Calculate roughness for the current prepared pedestal points using this radius, then display the heatmap and color bar.">Calculate</button>
+            </div>
+            <label>
+              <span class="label-row">
+                <span>Threshold</span>
+                <span class="info-button" tabindex="0" role="button" aria-label="Roughness threshold help" data-info-title="Roughness threshold" data-info-body="Prepared pedestal points with point-to-local-plane roughness above this value are selected for removal. Increase to select only rougher points.">i</span>
+              </span>
+              <input id="roughnessThreshold" type="number" min="0" max="5" step="0.001" value="0.01" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="roughnessApply" data-help-title="Apply Roughness Threshold" data-help-body="Use the threshold to select points from the current roughness heatmap. This does not recalculate roughness.">Apply</button>
+            <button id="roughnessConfirm" data-help-title="Confirm Roughness Removal" data-help-body="Remove the currently selected rough pedestal points from the prepared pedestal point cloud.">Confirm Removal</button>
+          </div>
+          <div class="button-row">
+            <button id="roughnessClear" data-help-title="Clear Roughness Selection" data-help-body="Clear the magenta preview selection without changing the prepared pedestal point cloud.">Clear</button>
+            <button id="roughnessClose" data-help-title="Close Roughness" data-help-body="Close this tool and clear its preview selection.">Close</button>
+          </div>
+          <div class="readout">
+            <span id="roughnessCount">0 roughness candidates selected</span>
+          </div>
+          <div class="readout subtle">
+            <span id="roughnessStats">No roughness computed</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="pedestalBranchWindow" class="floating-window pedestal-branch-window hidden" role="dialog" aria-labelledby="pedestalBranchWindowTitle" aria-hidden="true">
+        <div id="pedestalBranchWindowHandle" class="floating-window-header">
+          <h2 id="pedestalBranchWindowTitle">Pedestal Reset Source</h2>
+          <button id="closePedestalBranchWindow" class="floating-window-close" type="button" aria-label="Close pedestal branch selection window">x</button>
+        </div>
+        <div class="floating-window-body pedestal-branch-body">
+          <p class="tool-note">Choose RG Result pedestal branches, or use the dense label-propagated pedestal option. The reset stays a preview until denoise or manual removal commits it.</p>
+          <label class="branch-source-option branch-source-all">
+            <input id="pedestalBranchIncludeAll" type="checkbox" />
+            <span>
+              <strong>All label-propagated pedestal points</strong>
+              <small>Use every dense point labeled as pedestal/support after label propagation.</small>
+            </span>
+          </label>
+          <div class="section-title-row">
+            <h3>Pedestal Seed Branches</h3>
+            <span id="pedestalBranchCount" class="inline-readout">0 selected</span>
+          </div>
+          <div id="pedestalBranchOptions" class="branch-source-list" aria-live="polite"></div>
+          <div class="button-row">
+            <button id="pedestalBranchApply" data-help-title="Apply Pedestal Source" data-help-body="Reset Pedestal Mesh Prep using the selected label-propagated pedestal points and/or selected pedestal seed branches.">Apply</button>
+            <button id="pedestalBranchCancel" data-help-title="Cancel" data-help-body="Close without changing the current prepared pedestal preview.">Cancel</button>
+          </div>
+        </div>
+      </div>
+
       <div id="manualRemovalWindow" class="floating-window manual-removal-window hidden" role="dialog" aria-labelledby="manualRemovalWindowTitle" aria-hidden="true">
         <div id="manualRemovalWindowHandle" class="floating-window-header">
           <h2 id="manualRemovalWindowTitle">Manual Removal</h2>
           <button id="closeManualRemovalWindow" class="floating-window-close" type="button" aria-label="Close manual removal window">x</button>
         </div>
         <div class="floating-window-body">
-          <p class="tool-note">Draw around visible noise in Mesh Prep. Front rendered rock and interpolated bottom-face points can be removed.</p>
+          <p class="tool-note">Draw around noise in Mesh Prep. All prepared points projected inside the polygon are removed, including points hidden behind the front surface.</p>
           <div class="button-row">
             <button id="manualRemovalDraw" data-help-title="Draw Polygon" data-help-body="Add polygon vertices with left clicks in the viewer. The preview updates after three vertices.">Draw Polygon</button>
             <button id="manualRemovalUndoVertex" data-help-title="Undo Vertex" data-help-body="Remove the most recent polygon vertex and update the preview.">Undo Vertex</button>
           </div>
           <div class="button-row">
             <button id="manualRemovalClear" data-help-title="Clear Manual Selection" data-help-body="Clear the polygon and selected preview points without changing the prepared mesh.">Clear</button>
-            <button id="manualRemovalApply" data-help-title="Remove Selected" data-help-body="Remove selected prepared rock or interpolated bottom-face points and add this edit to the denoise undo history.">Remove Selected</button>
+            <button id="manualRemovalApply" data-help-title="Remove Selected" data-help-body="Remove selected prepared object or interface-fill points and add this edit to the active target's denoise undo history.">Remove Selected</button>
           </div>
           <div class="readout">
             <span id="manualRemovalCount">0 selected</span>
@@ -393,6 +533,6 @@
 
     </div>
 
-    <script src="/web-static/app.js?v=20260615-panel-scroll"></script>
+    <script src="/web-static/app.js?v=20260616-combined-rock-pedestal"></script>
   </body>
 </html>

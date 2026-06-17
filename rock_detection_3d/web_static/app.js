@@ -1,4 +1,4 @@
-const REQUIRED_RUNTIME_BUILD = "20260615-panel-scroll";
+const REQUIRED_RUNTIME_BUILD = "20260616-combined-rock-pedestal";
 
 const MEASUREMENT_COLORS = [
   [1.0, 0.76, 0.12],
@@ -30,6 +30,7 @@ const state = {
   program: null,
   pickProgram: null,
   lineProgram: null,
+  meshProgram: null,
   positionBuffer: null,
   colorBuffer: null,
   pointNormalBuffer: null,
@@ -38,12 +39,15 @@ const state = {
   normalColorBuffer: null,
   measurementLinePositionBuffer: null,
   measurementLineColorBuffer: null,
+  analysisLinePositionBuffer: null,
+  analysisLineColorBuffer: null,
   markerPositionBuffer: null,
   markerColorBuffer: null,
   markerHaloPositionBuffer: null,
   markerHaloColorBuffer: null,
   meshPositionBuffer: null,
   meshColorBuffer: null,
+  meshNormalBuffer: null,
   meshLinePositionBuffer: null,
   meshLineColorBuffer: null,
   centeredPositions: null,
@@ -56,6 +60,7 @@ const state = {
   pointCount: 0,
   normalLineCount: 0,
   measurementLineCount: 0,
+  analysisLineCount: 0,
   markerCount: 0,
   markerHaloCount: 0,
   meshVertexCount: 0,
@@ -80,6 +85,19 @@ const state = {
   manualRemovalDrawMode: false,
   manualRemovalPolygon: [],
   manualRemovalSelected: [],
+  vegetationSelected: [],
+  vegetationWindowDragging: false,
+  vegetationWindowDragOffset: null,
+  vegetationWindowOpen: false,
+  roughnessSelected: [],
+  roughnessValues: [],
+  roughnessStats: null,
+  roughnessWindowDragging: false,
+  roughnessWindowDragOffset: null,
+  roughnessWindowOpen: false,
+  pedestalBranchWindowDragging: false,
+  pedestalBranchWindowDragOffset: null,
+  pedestalBranchWindowOpen: false,
   interfaceEditorOpen: false,
   interfaceEditorMode: "anchors",
   interfaceEditorStroke: [],
@@ -102,6 +120,7 @@ const state = {
   projectHasSaveTarget: false,
   projectSaveHandle: null,
   segmentedColorMode: "two_color",
+  activeMeshTarget: "rock",
   measurementActive: false,
   measurementPoints: [],
   measurementDistance: null
@@ -116,7 +135,7 @@ function $(id) {
 function initElements() {
   [
     "currentFile", "fileInput", "importProjectInput", "saveProject", "saveProjectAs",
-    "statusList", "activeViewLabel", "viewMeta", "viewer", "branchLegend", "toast",
+    "statusList", "activeViewLabel", "viewMeta", "viewer", "branchLegend", "analysisWindow", "toast",
     "infoTooltip",
     "toggleTips", "measurementToggle", "measurementClear", "measurementReadout", "measurementPointA", "measurementPointB",
     "rockCount", "pedestalCount", "interfaceCount", "partsCount", "pointSize", "pickRock", "pickPedestal",
@@ -130,12 +149,22 @@ function initElements() {
     "editorOrderRow", "editorShowOrder",
     "smoothness", "curvature", "proximity", "voxel",
     "neighbors", "distance", "labelPropagationDistance", "runSegment", "runICRG", "runLabelPropagation",
-    "prepareMesh", "removeNoise", "undoNoise",
+    "prepareRockMesh", "preparePedestalMesh", "prepareMesh", "resetMeshPreparation", "removeNoise", "undoNoise",
+    "hagVegetation", "vegetationWindow", "vegetationWindowHandle", "closeVegetationWindow",
+    "hagGridSize", "hagHeightThreshold", "hagGroundPercentile", "hagMinPointsPerCell",
+    "hagApply", "hagConfirm", "hagClear", "hagClose", "hagCount",
+    "roughnessRemoval", "roughnessWindow", "roughnessWindowHandle", "closeRoughnessWindow",
+    "roughnessRadius", "roughnessCalculate", "roughnessThreshold",
+    "roughnessApply", "roughnessConfirm", "roughnessClear", "roughnessClose", "roughnessCount", "roughnessStats",
+    "pedestalBranchWindow", "pedestalBranchWindowHandle", "closePedestalBranchWindow",
+    "pedestalBranchIncludeAll", "pedestalBranchOptions", "pedestalBranchCount",
+    "pedestalBranchApply", "pedestalBranchCancel",
     "manualRemoval", "manualRemovalOverlay", "manualRemovalWindow", "manualRemovalWindowHandle",
     "closeManualRemovalWindow", "manualRemovalDraw", "manualRemovalUndoVertex", "manualRemovalClear",
     "manualRemovalApply", "manualRemovalClose", "manualRemovalCount",
     "denoiseMethod", "sorNeighbors", "sorStdRatio", "dbscanEps", "dbscanMinPoints",
-    "normalMethod", "normalK", "normalScale", "normalScaleValue", "computeNormals", "meshDepth", "reconstruct", "analyze",
+    "normalRockTarget", "normalPedestalTarget", "normalMethod", "normalK", "normalScale", "normalScaleValue", "computeNormals",
+    "reconstructRockTarget", "reconstructPedestalTarget", "meshDepth", "reconstruct", "loadRockPedestal", "analyze",
     "downloadSegmented", "downloadMesh", "downloadAnalysis"
   ].forEach((id) => {
     el[id] = $(id);
@@ -295,13 +324,126 @@ function viewIsAvailable(summary, viewName) {
     return Boolean(summary.status?.voxel_segmentation_ready);
   }
   if (viewName === "mesh_prepared") {
-    return Boolean(summary.status?.mesh_prepared);
+    return meshTargetPrepared(state.activeMeshTarget, summary);
+  }
+  if (viewName === "analysis") {
+    return Boolean(summary.status?.analysis_completed);
+  }
+  if (viewName === "mesh") {
+    return meshReconstructionCompleted(state.activeMeshTarget, summary);
+  }
+  if (viewName === "combined_mesh") {
+    return combinedReconstructionAvailable(summary);
   }
   return Boolean(summary.status?.mesh_completed);
 }
 
+function meshTargetState(target = state.activeMeshTarget, summary = state.session) {
+  const targets = summary?.mesh_prepared_targets || {};
+  return targets[target] || null;
+}
+
+function meshTargetAvailable(target = state.activeMeshTarget, summary = state.session) {
+  const targetState = meshTargetState(target, summary);
+  if (targetState) {
+    return Boolean(targetState.available ?? targetState.prepared ?? targetState.preview);
+  }
+  return target === "rock" && Boolean(summary?.status?.mesh_prepared);
+}
+
+function meshTargetSaved(target = state.activeMeshTarget, summary = state.session) {
+  const targetState = meshTargetState(target, summary);
+  if (targetState) {
+    return Boolean(targetState.prepared);
+  }
+  return target === "rock" && Boolean(summary?.status?.mesh_prepared);
+}
+
+function meshTargetPrepared(target = state.activeMeshTarget, summary = state.session) {
+  return meshTargetAvailable(target, summary);
+}
+
+function meshReconstructionState(target = state.activeMeshTarget, summary = state.session) {
+  const targets = summary?.mesh_reconstruction_targets || {};
+  return targets[target] || null;
+}
+
+function meshReconstructionCompleted(target = state.activeMeshTarget, summary = state.session) {
+  const stateForTarget = meshReconstructionState(target, summary);
+  if (stateForTarget) {
+    return Boolean(stateForTarget.completed);
+  }
+  return target === "rock" && Boolean(summary?.status?.mesh_completed);
+}
+
+function combinedReconstructionAvailable(summary = state.session) {
+  return Boolean(summary?.combined_reconstruction?.available);
+}
+
+function setActiveMeshTarget(target, options = {}) {
+  if (!["rock", "pedestal"].includes(target)) {
+    return;
+  }
+  state.activeMeshTarget = target;
+  if (target !== "pedestal") {
+    hideVegetationWindow({ clearSelection: true });
+    hideRoughnessWindow({ clearSelection: true });
+    hidePedestalBranchWindow();
+  }
+  updateMeshTargetControls();
+  clearManualRemovalSelection({ redraw: false });
+  if (options.reloadView && state.activeView === "mesh_prepared") {
+    loadView(meshTargetPrepared(target) ? "mesh_prepared" : bestAvailableView(state.session));
+  } else if (options.reloadView && state.activeView === "mesh") {
+    loadView(meshReconstructionCompleted(target) ? "mesh" : bestAvailableView(state.session));
+  } else {
+    updateStatus();
+  }
+}
+
+function updateMeshTargetControls() {
+  const target = state.activeMeshTarget;
+  [
+    el.prepareRockMesh,
+    el.preparePedestalMesh,
+    el.normalRockTarget,
+    el.normalPedestalTarget,
+    el.reconstructRockTarget,
+    el.reconstructPedestalTarget
+  ].forEach((button) => {
+    if (!button) {
+      return;
+    }
+    const active = button.dataset.meshTarget === target;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  if (el.reconstruct) {
+    const disabled = !meshTargetSaved(target);
+    el.reconstruct.disabled = disabled;
+    el.reconstruct.textContent = target === "pedestal" ? "Reconstruct Surface" : "Reconstruct Mesh";
+    el.reconstruct.title = disabled ? `Prepare the ${target} mesh point set first.` : "";
+  }
+  if (el.meshDepth) {
+    el.meshDepth.disabled = target === "pedestal";
+    el.meshDepth.title = target === "pedestal" ? "Poisson depth is only used for rock reconstruction." : "";
+  }
+  if (el.analyze) {
+    const disabled = !state.session?.status?.mesh_completed || target !== "rock";
+    el.analyze.disabled = disabled;
+    el.analyze.title = target === "pedestal" ? "Analysis is rock-only in this version." : "";
+  }
+  if (el.loadRockPedestal) {
+    const disabled = !combinedReconstructionAvailable();
+    el.loadRockPedestal.disabled = disabled;
+    el.loadRockPedestal.title = disabled
+      ? "Requires rock and pedestal sources. Each side needs either a reconstructed mesh or segmented point-cloud points."
+      : "";
+  }
+}
+
 function bestAvailableView(summary, preferred) {
-  const views = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"];
+  const views = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh", "analysis"];
   if (preferred && views.includes(preferred) && viewIsAvailable(summary, preferred)) {
     return preferred;
   }
@@ -471,16 +613,16 @@ function updateStatus() {
   }
   const status = state.session.status;
   const rows = [
-    ["point_cloud_loaded", "Point cloud"],
-    ["seeds_ready", "Seeds"],
-    ["interface_ready", "Interface"],
-    ["segmentation_ready", "Segmentation"],
-    ["mesh_prepared", "Mesh prep"],
-    ["mesh_completed", "Mesh"],
-    ["analysis_completed", "Analysis"]
+    [Boolean(status.point_cloud_loaded), "Point cloud"],
+    [Boolean(status.seeds_ready), "Seeds"],
+    [Boolean(status.interface_ready), "Interface"],
+    [Boolean(status.segmentation_ready), "Segmentation"],
+    [Boolean(status.mesh_prepared), "Mesh prep"],
+    [meshReconstructionCompleted("rock") || meshReconstructionCompleted("pedestal"), "Mesh"],
+    [Boolean(status.analysis_completed), "Analysis"]
   ];
   el.statusList.innerHTML = rows
-    .map(([key, label]) => `<div class="status-row ${status[key] ? "done" : ""}">${label}</div>`)
+    .map(([done, label]) => `<div class="status-row ${done ? "done" : ""}">${label}</div>`)
     .join("");
 
   el.currentFile.textContent = state.session.current_file || "No point cloud loaded";
@@ -490,8 +632,12 @@ function updateStatus() {
   el.interfaceCount.textContent = `Interface ${state.interfacePoints.length}`;
   el.partsCount.textContent = `Parts ${state.interfaceParts.length}`;
 
+  const meshDownloadKind = state.activeMeshTarget === "pedestal" ? "pedestal_mesh" : "mesh";
+  const meshDownloadPath = state.activeMeshTarget === "pedestal"
+    ? state.session.outputs.pedestal_mesh
+    : state.session.outputs.mesh;
   setDownload(el.downloadSegmented, "segmented", state.session.outputs.segmented);
-  setDownload(el.downloadMesh, "mesh", state.session.outputs.mesh);
+  setDownload(el.downloadMesh, meshDownloadKind, meshDownloadPath);
   setDownload(el.downloadAnalysis, "analysis", state.session.outputs.analysis);
   if (el.runSegment) {
     el.runSegment.disabled = !status.seeds_ready;
@@ -502,8 +648,31 @@ function updateStatus() {
   if (el.runLabelPropagation) {
     el.runLabelPropagation.disabled = !status.voxel_segmentation_ready;
   }
+  if (el.prepareMesh) {
+    el.prepareMesh.disabled = !status.segmentation_ready;
+  }
+  if (el.resetMeshPreparation) {
+    el.resetMeshPreparation.disabled = !status.segmentation_ready;
+  }
+  const activeTargetPrepared = meshTargetPrepared();
+  const vegetationAvailable = activeTargetPrepared && state.activeMeshTarget === "pedestal";
+  if (el.hagVegetation) {
+    el.hagVegetation.disabled = !vegetationAvailable;
+  }
+  if (el.roughnessRemoval) {
+    el.roughnessRemoval.disabled = !vegetationAvailable;
+  }
   if (el.manualRemoval) {
-    el.manualRemoval.disabled = !status.mesh_prepared;
+    el.manualRemoval.disabled = !activeTargetPrepared;
+  }
+  if (el.removeNoise) {
+    el.removeNoise.disabled = !activeTargetPrepared;
+  }
+  if (el.undoNoise) {
+    el.undoNoise.disabled = !meshTargetSaved();
+  }
+  if (el.computeNormals) {
+    el.computeNormals.disabled = !activeTargetPrepared;
   }
   if (el.saveProject) {
     el.saveProject.disabled = !status.point_cloud_loaded;
@@ -511,10 +680,16 @@ function updateStatus() {
   if (el.saveProjectAs) {
     el.saveProjectAs.disabled = !status.point_cloud_loaded;
   }
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    button.disabled = !viewIsAvailable(state.session, button.dataset.view);
+  });
   updateManualRemovalUI({ redraw: false });
   updateInterfaceEditorUI({ redraw: false });
   updateMeasurementUI({ redraw: false });
   updateSegmentedColorModeUI();
+  updateMeshTargetControls();
+  updateVegetationUI({ redraw: false });
+  updateRoughnessUI({ redraw: false });
   applyMeasurementControlLock();
 }
 
@@ -732,6 +907,24 @@ function jobCompletionMessage(label, result) {
       : "";
     return `Brush add ${mode}: ${sampled.toLocaleString()} sampled anchors, ${inserted.toLocaleString()} inserted${removed}.`;
   }
+  if (result.loaded_existing) {
+    const target = result.target || "mesh";
+    const objectCount = Number.isFinite(result.object_point_count)
+      ? `: ${Number(result.object_point_count).toLocaleString()} object points`
+      : "";
+    return `Loaded existing ${target} preparation${objectCount}.`;
+  }
+  if (result.reset_preview) {
+    const target = result.target || "mesh";
+    const objectCount = Number.isFinite(result.object_point_count)
+      ? `: ${Number(result.object_point_count).toLocaleString()} object points`
+      : "";
+    return `Reset preview loaded for ${target} preparation${objectCount}.`;
+  }
+  if (lowerLabel.includes("preparing") && Number.isFinite(result.object_point_count)) {
+    const target = result.target || "mesh";
+    return `Prepared ${target}: ${Number(result.object_point_count).toLocaleString()} object points.`;
+  }
   if (!lowerLabel.includes("normal")) {
     return "";
   }
@@ -779,6 +972,7 @@ function buildProjectUiState(filename = state.projectFilename) {
     active_view: state.activeView,
     pick_mode: state.pickMode,
     segmented_color_mode: state.segmentedColorMode,
+    active_mesh_target: state.activeMeshTarget,
     point_size: Number(el.pointSize.value || 3.5),
     segment_params: segmentParams(),
     denoise_params: denoiseParams(),
@@ -836,6 +1030,18 @@ function restoreProjectUiState(uiState = {}, summary) {
   }
   if (["two_color", "multi_seed"].includes(uiState.segmented_color_mode)) {
     state.segmentedColorMode = uiState.segmented_color_mode;
+  }
+  if (["rock", "pedestal"].includes(uiState.active_mesh_target)) {
+    state.activeMeshTarget = uiState.active_mesh_target;
+  } else {
+    state.activeMeshTarget = "rock";
+  }
+  if (!meshTargetPrepared(state.activeMeshTarget, summary)) {
+    if (meshTargetPrepared("rock", summary)) {
+      state.activeMeshTarget = "rock";
+    } else if (meshTargetPrepared("pedestal", summary)) {
+      state.activeMeshTarget = "pedestal";
+    }
   }
   state.interfacePoints = Array.isArray(uiState.interface_points) ? uiState.interface_points : [];
   state.interfaceParts = Array.isArray(uiState.interface_parts) ? uiState.interface_parts : [];
@@ -944,6 +1150,8 @@ async function importProject(file, options = {}) {
     state.projectSaveHandle = options.saveHandle || null;
     state.projectHasSaveTarget = Boolean(state.projectSaveHandle);
     state.measurementActive = false;
+    hideVegetationWindow({ clearSelection: true });
+    hideRoughnessWindow({ clearSelection: true });
     clearMeasurementPoints({ redraw: false });
     releaseMeasurementControlLock();
     state.zoom = 1;
@@ -980,7 +1188,10 @@ async function uploadFile(file) {
     state.projectFilename = projectFilenameFromName(file.name);
     state.projectHasSaveTarget = false;
     state.projectSaveHandle = null;
+    state.activeMeshTarget = "rock";
     state.measurementActive = false;
+    hideVegetationWindow({ clearSelection: true });
+    hideRoughnessWindow({ clearSelection: true });
     clearMeasurementPoints({ redraw: false });
     releaseMeasurementControlLock();
     clearManualRemovalSelection({ redraw: false });
@@ -1008,9 +1219,14 @@ async function loadView(viewName) {
     if (viewName === "segmented") {
       params.set("color_mode", state.segmentedColorMode);
     }
+    if (viewName === "mesh_prepared" || viewName === "mesh") {
+      params.set("mesh_target", state.activeMeshTarget);
+    }
     const payload = await api(`/api/sessions/${state.session.session_id}/viewer/${viewName}?${params.toString()}`);
     if (payload.kind === "mesh") {
       await hydrateMeshView(payload);
+    } else if (payload.kind === "combinedMesh") {
+      await hydrateCombinedMeshView(payload);
     }
     state.view = payload;
     state.activeView = viewName;
@@ -1018,10 +1234,17 @@ async function loadView(viewName) {
     el.activeViewLabel.textContent = viewName.replace("_", " ");
     updateViewMeta();
     updateBranchLegend();
+    updateAnalysisWindow();
     if (viewName !== "mesh_prepared" && state.manualRemovalWindowOpen) {
       state.manualRemovalDrawMode = false;
       state.manualRemovalSelected = [];
       state.manualRemovalPolygon = [];
+    }
+    if (viewName !== "mesh_prepared" && state.vegetationWindowOpen) {
+      hideVegetationWindow({ clearSelection: true });
+    }
+    if (viewName !== "mesh_prepared" && state.roughnessWindowOpen) {
+      hideRoughnessWindow({ clearSelection: true });
     }
     if (viewName !== "interface" && state.interfaceEditorOpen) {
       state.interfaceEditorStroke = [];
@@ -1032,6 +1255,7 @@ async function loadView(viewName) {
       state.interfaceEditorBrushEndSegment = null;
     }
     updateManualRemovalUI({ redraw: false });
+    updateRoughnessUI({ redraw: false });
     updateInterfaceEditorUI({ redraw: false });
     document.querySelectorAll("[data-view]").forEach((button) => {
       button.classList.toggle("active", button.dataset.view === viewName);
@@ -1059,6 +1283,41 @@ function updateViewMeta() {
   }
   if (Array.isArray(state.view?.seed_branches) && state.view.seed_branches.length) {
     parts.push(`${state.view.seed_branches.length.toLocaleString()} seed branches`);
+  }
+  if (state.activeView === "mesh_prepared" && state.view?.kind === "pointCloud") {
+    const target = state.view.mesh_target || state.activeMeshTarget;
+    if (Number.isFinite(state.view.object_point_count)) {
+      parts.push(`${target} ${state.view.object_point_count.toLocaleString()}`);
+    }
+    if (Number.isFinite(state.view.interface_fill_point_count) && state.view.interface_fill_point_count > 0) {
+      parts.push(`interface fill ${state.view.interface_fill_point_count.toLocaleString()}`);
+    }
+  }
+  if (state.activeView === "mesh" && state.view?.kind === "mesh") {
+    const target = state.view.mesh_target || state.activeMeshTarget;
+    const method = state.view.mesh_method || (target === "pedestal" ? "local_plane_filled_holes" : "poisson");
+    parts.push(`${target} ${method.toUpperCase()}`);
+    if (Number.isFinite(state.view.triangle_count)) {
+      parts.push(`${state.view.triangle_count.toLocaleString()} triangles`);
+    }
+  }
+  if (state.view?.analysis_summary) {
+    const segmentCount = (state.view.analysis_segments || []).length;
+    const markerCount = (state.view.analysis_markers || []).length;
+    parts.push("analysis overlays");
+    if (segmentCount) {
+      parts.push(`${segmentCount.toLocaleString()} axes/lines`);
+    }
+    if (markerCount) {
+      parts.push(`${markerCount.toLocaleString()} markers`);
+    }
+  }
+  if (state.view?.kind === "combinedMesh") {
+    for (const component of state.view.components || []) {
+      const target = String(component.target || "target");
+      const source = String(component.source || component.kind || "source");
+      parts.push(`${target} ${source}`);
+    }
   }
   if (state.view?.kind === "pointCloud" && state.view.normal_segments) {
     const diagnostics = state.view.normal_diagnostics || {};
@@ -1160,6 +1419,260 @@ function updateBranchLegend() {
   }
 }
 
+function pedestalBranchOptions() {
+  const summaryOptions = Array.isArray(state.session?.pedestal_branch_options)
+    ? state.session.pedestal_branch_options
+    : [];
+  if (summaryOptions.length) {
+    return summaryOptions;
+  }
+  const viewBranches = Array.isArray(state.view?.seed_branches) ? state.view.seed_branches : [];
+  return viewBranches.filter((branch) => {
+    const classLabel = String(branch.class_label || "").toLowerCase();
+    const label = String(branch.label || "").toLowerCase();
+    return classLabel === "pedestal" || Number(branch.region_index) === 0 || label.startsWith("pedestal");
+  });
+}
+
+function selectedPedestalBranchIds() {
+  if (!el.pedestalBranchOptions) {
+    return [];
+  }
+  return Array.from(el.pedestalBranchOptions.querySelectorAll("input[data-branch-id]:checked"))
+    .map((input) => Number(input.dataset.branchId))
+    .filter(Number.isFinite);
+}
+
+function updatePedestalBranchSelectionUI() {
+  const selectedCount = selectedPedestalBranchIds().length;
+  if (el.pedestalBranchCount) {
+    const allText = el.pedestalBranchIncludeAll?.checked ? "all + " : "";
+    el.pedestalBranchCount.textContent = `${allText}${selectedCount} branch${selectedCount === 1 ? "" : "es"} selected`;
+  }
+  if (el.pedestalBranchApply) {
+    el.pedestalBranchApply.disabled = !el.pedestalBranchIncludeAll?.checked && selectedCount === 0;
+  }
+}
+
+function renderPedestalBranchOptions() {
+  if (!el.pedestalBranchOptions) {
+    return;
+  }
+  const options = pedestalBranchOptions();
+  el.pedestalBranchOptions.textContent = "";
+  if (!options.length) {
+    const empty = document.createElement("div");
+    empty.className = "readout subtle";
+    empty.textContent = "No pedestal seed branches are available. Run region growing and label propagation first.";
+    el.pedestalBranchOptions.appendChild(empty);
+    updatePedestalBranchSelectionUI();
+    return;
+  }
+  for (const branch of options) {
+    const branchId = Number(branch.branch_id);
+    if (!Number.isFinite(branchId)) {
+      continue;
+    }
+    const row = document.createElement("label");
+    row.className = "branch-source-option";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.branchId = String(branchId);
+    checkbox.addEventListener("change", updatePedestalBranchSelectionUI);
+
+    const content = document.createElement("span");
+    const main = document.createElement("span");
+    main.className = "branch-source-main";
+
+    const swatch = document.createElement("span");
+    swatch.className = "branch-source-swatch";
+    swatch.style.background = branchColorCss(branch.color);
+
+    const title = document.createElement("strong");
+    title.textContent = branch.label || `Pedestal seed ${branchId + 1}`;
+
+    main.append(swatch, title);
+    const details = document.createElement("small");
+    const rgCount = Number(branch.rg_node_count || 0);
+    const denseCount = Number(branch.dense_node_count || branch.node_count || 0);
+    const parts = [];
+    if (rgCount > 0) {
+      parts.push(`${rgCount.toLocaleString()} RG nodes`);
+    }
+    if (denseCount > 0) {
+      parts.push(`${denseCount.toLocaleString()} dense points`);
+    }
+    details.textContent = parts.join(" - ") || "No propagated points currently assigned";
+    content.append(main, details);
+    row.append(checkbox, content);
+    el.pedestalBranchOptions.appendChild(row);
+  }
+  updatePedestalBranchSelectionUI();
+}
+
+function showPedestalBranchWindow() {
+  if (!el.pedestalBranchWindow) {
+    return;
+  }
+  state.pedestalBranchWindowOpen = true;
+  el.pedestalBranchWindow.classList.remove("hidden");
+  el.pedestalBranchWindow.setAttribute("aria-hidden", "false");
+  if (el.pedestalBranchIncludeAll) {
+    el.pedestalBranchIncludeAll.checked = false;
+  }
+  renderPedestalBranchOptions();
+}
+
+function hidePedestalBranchWindow() {
+  state.pedestalBranchWindowOpen = false;
+  if (el.pedestalBranchWindow) {
+    el.pedestalBranchWindow.classList.add("hidden");
+    el.pedestalBranchWindow.setAttribute("aria-hidden", "true");
+  }
+}
+
+function movePedestalBranchWindow(clientX, clientY) {
+  if (!state.pedestalBranchWindowDragOffset || !el.pedestalBranchWindow) {
+    return;
+  }
+  const rect = el.pedestalBranchWindow.getBoundingClientRect();
+  const margin = 8;
+  const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+  const left = clamp(clientX - state.pedestalBranchWindowDragOffset[0], margin, maxLeft);
+  const top = clamp(clientY - state.pedestalBranchWindowDragOffset[1], margin, maxTop);
+  el.pedestalBranchWindow.style.left = `${left}px`;
+  el.pedestalBranchWindow.style.top = `${top}px`;
+  el.pedestalBranchWindow.style.right = "auto";
+}
+
+function startPedestalBranchWindowDrag(event) {
+  if (!el.pedestalBranchWindow || event.button !== 0) {
+    return;
+  }
+  if (event.target?.closest?.("button")) {
+    return;
+  }
+  const rect = el.pedestalBranchWindow.getBoundingClientRect();
+  state.pedestalBranchWindowDragging = true;
+  state.pedestalBranchWindowDragOffset = [event.clientX - rect.left, event.clientY - rect.top];
+  el.pedestalBranchWindowHandle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function dragPedestalBranchWindow(event) {
+  if (!state.pedestalBranchWindowDragging) {
+    return;
+  }
+  movePedestalBranchWindow(event.clientX, event.clientY);
+}
+
+function stopPedestalBranchWindowDrag(event) {
+  if (!state.pedestalBranchWindowDragging) {
+    return;
+  }
+  state.pedestalBranchWindowDragging = false;
+  state.pedestalBranchWindowDragOffset = null;
+  if (el.pedestalBranchWindowHandle?.hasPointerCapture?.(event.pointerId)) {
+    el.pedestalBranchWindowHandle.releasePointerCapture(event.pointerId);
+  }
+}
+
+async function openPedestalBranchWindow() {
+  if (!state.session?.status?.segmentation_ready) {
+    showToast("Run label propagation before resetting pedestal mesh preparation.", true);
+    return;
+  }
+  hideVegetationWindow({ clearSelection: true });
+  hideRoughnessWindow({ clearSelection: true });
+  hideManualRemovalWindow();
+  showPedestalBranchWindow();
+}
+
+async function applyPedestalBranchReset() {
+  const includeAll = Boolean(el.pedestalBranchIncludeAll?.checked);
+  const branchIds = selectedPedestalBranchIds();
+  if (!includeAll && !branchIds.length) {
+    showToast("Select at least one pedestal source for reset.", true);
+    return;
+  }
+  const job = await runAction(
+    "Resetting pedestal preparation",
+    `/api/sessions/${state.session.session_id}/mesh/prepare`,
+    {
+      target: "pedestal",
+      reset: true,
+      include_label_propagation_pedestal: includeAll,
+      pedestal_branch_ids: branchIds
+    },
+    "mesh_prepared"
+  );
+  if (job) {
+    hidePedestalBranchWindow();
+    clearPreparedSelectionPreviews();
+  }
+}
+
+function formatAnalysisValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => Number(item).toFixed(4)).join(", ");
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value.toFixed(3);
+  }
+  return value === null || value === undefined || value === "" ? "--" : String(value);
+}
+
+function updateAnalysisWindow() {
+  if (!el.analysisWindow) {
+    return;
+  }
+  const summary = state.view?.analysis_summary;
+  if (state.activeView !== "analysis" || !summary) {
+    el.analysisWindow.classList.add("hidden");
+    el.analysisWindow.textContent = "";
+    return;
+  }
+  el.analysisWindow.classList.remove("hidden");
+  el.analysisWindow.textContent = "";
+
+  const title = document.createElement("div");
+  title.className = "analysis-window-title";
+  title.textContent = summary.title || "Analysis";
+  el.analysisWindow.appendChild(title);
+
+  const metricList = document.createElement("div");
+  metricList.className = "analysis-window-list";
+  for (const item of summary.metrics || []) {
+    const row = document.createElement("div");
+    row.className = "analysis-window-row";
+    const label = document.createElement("span");
+    label.textContent = item.label || "";
+    const value = document.createElement("strong");
+    value.textContent = formatAnalysisValue(item.value);
+    row.appendChild(label);
+    row.appendChild(value);
+    metricList.appendChild(row);
+  }
+  el.analysisWindow.appendChild(metricList);
+
+  const vectorList = document.createElement("div");
+  vectorList.className = "analysis-window-list analysis-window-vectors";
+  for (const item of summary.vectors || []) {
+    const row = document.createElement("div");
+    row.className = "analysis-window-row";
+    const label = document.createElement("span");
+    label.textContent = item.label || "";
+    const value = document.createElement("strong");
+    value.textContent = formatAnalysisValue(item.value);
+    row.appendChild(label);
+    row.appendChild(value);
+    vectorList.appendChild(row);
+  }
+  el.analysisWindow.appendChild(vectorList);
+}
+
 async function hydrateMeshView(payload) {
   if (payload.vertices?.length && payload.triangles?.length) {
     return;
@@ -1173,6 +1686,37 @@ async function hydrateMeshView(payload) {
     throw new Error(`Could not load mesh PLY: ${response.statusText}`);
   }
   Object.assign(payload, parsePlyMesh(await response.arrayBuffer()));
+}
+
+async function hydrateCombinedMeshView(payload) {
+  const components = Array.isArray(payload.components) ? payload.components : [];
+  const boundsPoints = [];
+  for (const component of components) {
+    if (component.kind !== "mesh") {
+      for (const point of component.points || []) {
+        boundsPoints.push(point);
+      }
+      continue;
+    }
+    if (!component.vertices?.length || !component.triangles?.length) {
+      if (!component.url) {
+        throw new Error(`Missing ${component.target || ""} mesh URL.`);
+      }
+      const url = `${component.url}${component.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Could not load ${component.target || "component"} mesh PLY: ${response.statusText}`);
+      }
+      Object.assign(component, parsePlyMesh(await response.arrayBuffer()));
+    }
+    for (const point of component.vertices || []) {
+      boundsPoints.push(point);
+    }
+  }
+  if (boundsPoints.length) {
+    payload.bounds = viewBounds(boundsPoints);
+    payload.scene_bounds = payload.scene_bounds || payload.bounds;
+  }
 }
 
 function findPlyHeaderEnd(bytes) {
@@ -1570,11 +2114,308 @@ function hideManualRemovalWindow() {
   updateManualRemovalUI();
 }
 
-async function openManualRemovalWindow() {
-  if (!state.session?.status?.mesh_prepared) {
-    showToast("Prepare the mesh before manual removal.", true);
+function showVegetationWindow() {
+  if (!el.vegetationWindow) {
     return;
   }
+  state.vegetationWindowOpen = true;
+  el.vegetationWindow.classList.remove("hidden");
+  el.vegetationWindow.setAttribute("aria-hidden", "false");
+  updateVegetationUI();
+}
+
+function hideVegetationWindow(options = {}) {
+  if (options.clearSelection) {
+    state.vegetationSelected = [];
+  }
+  state.vegetationWindowOpen = false;
+  if (el.vegetationWindow) {
+    el.vegetationWindow.classList.add("hidden");
+    el.vegetationWindow.setAttribute("aria-hidden", "true");
+  }
+  updateVegetationUI();
+  updateManualRemovalUI();
+}
+
+function clearVegetationSelection(options = {}) {
+  state.vegetationSelected = [];
+  updateVegetationUI({ redraw: options.redraw !== false });
+}
+
+function clearPreparedSelectionPreviews(options = {}) {
+  const redraw = options.redraw !== false;
+  clearManualRemovalSelection({ redraw: false });
+  clearVegetationSelection({ redraw: false });
+  clearRoughnessState({ redraw });
+}
+
+function closeVegetationWindow() {
+  hideVegetationWindow({ clearSelection: true });
+}
+
+async function openVegetationWindow() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Height Above Ground vegetation removal is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  if (!meshTargetPrepared("pedestal")) {
+    showToast("Prepare the pedestal mesh before running Height Above Ground selection.", true);
+    return;
+  }
+  hideRoughnessWindow({ clearSelection: true });
+  hidePedestalBranchWindow();
+  hideManualRemovalWindow();
+  state.manualRemovalPolygon = [];
+  state.manualRemovalSelected = [];
+  state.manualRemovalDrawMode = false;
+  showVegetationWindow();
+  if (state.activeView !== "mesh_prepared") {
+    await loadView("mesh_prepared");
+  }
+}
+
+function moveVegetationWindow(clientX, clientY) {
+  if (!state.vegetationWindowDragOffset || !el.vegetationWindow) {
+    return;
+  }
+  const rect = el.vegetationWindow.getBoundingClientRect();
+  const margin = 8;
+  const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+  const left = clamp(clientX - state.vegetationWindowDragOffset[0], margin, maxLeft);
+  const top = clamp(clientY - state.vegetationWindowDragOffset[1], margin, maxTop);
+  el.vegetationWindow.style.left = `${left}px`;
+  el.vegetationWindow.style.top = `${top}px`;
+  el.vegetationWindow.style.right = "auto";
+}
+
+function startVegetationWindowDrag(event) {
+  if (!el.vegetationWindow || event.button !== 0) {
+    return;
+  }
+  if (event.target?.closest?.("button")) {
+    return;
+  }
+  const rect = el.vegetationWindow.getBoundingClientRect();
+  state.vegetationWindowDragging = true;
+  state.vegetationWindowDragOffset = [event.clientX - rect.left, event.clientY - rect.top];
+  el.vegetationWindowHandle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function dragVegetationWindow(event) {
+  if (!state.vegetationWindowDragging) {
+    return;
+  }
+  moveVegetationWindow(event.clientX, event.clientY);
+}
+
+function stopVegetationWindowDrag(event) {
+  if (!state.vegetationWindowDragging) {
+    return;
+  }
+  state.vegetationWindowDragging = false;
+  state.vegetationWindowDragOffset = null;
+  if (el.vegetationWindowHandle?.hasPointerCapture?.(event.pointerId)) {
+    el.vegetationWindowHandle.releasePointerCapture(event.pointerId);
+  }
+}
+
+function showRoughnessWindow() {
+  if (!el.roughnessWindow) {
+    return;
+  }
+  state.roughnessWindowOpen = true;
+  el.roughnessWindow.classList.remove("hidden");
+  el.roughnessWindow.setAttribute("aria-hidden", "false");
+  updateRoughnessUI();
+}
+
+function hideRoughnessWindow(options = {}) {
+  if (options.clearSelection) {
+    state.roughnessSelected = [];
+    state.roughnessValues = [];
+    state.roughnessStats = null;
+  }
+  state.roughnessWindowOpen = false;
+  if (el.roughnessWindow) {
+    el.roughnessWindow.classList.add("hidden");
+    el.roughnessWindow.setAttribute("aria-hidden", "true");
+  }
+  destroyRoughnessColorbar();
+  updateRoughnessUI();
+  updateManualRemovalUI();
+}
+
+function clearRoughnessSelection(options = {}) {
+  state.roughnessSelected = [];
+  updateRoughnessUI({ redraw: options.redraw !== false });
+}
+
+function clearRoughnessState(options = {}) {
+  state.roughnessSelected = [];
+  state.roughnessValues = [];
+  state.roughnessStats = null;
+  destroyRoughnessColorbar();
+  updateRoughnessUI({ redraw: options.redraw !== false });
+}
+
+function closeRoughnessWindow() {
+  hideRoughnessWindow({ clearSelection: true });
+}
+
+function formatRoughnessValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "--";
+  }
+  return `${numeric.toFixed(4)} m`;
+}
+
+function roughnessHeatmapColor(value) {
+  const numeric = Number(value);
+  const stats = state.roughnessStats || {};
+  const minValue = Number(stats.min_roughness ?? 0);
+  const maxValue = Number(stats.max_roughness ?? 0);
+  if (!Number.isFinite(numeric) || !Number.isFinite(minValue) || !Number.isFinite(maxValue) || maxValue <= minValue) {
+    return [0.58, 0.62, 0.58];
+  }
+  const stops = [
+    [0.0, [0.17, 0.29, 0.85]],
+    [0.25, [0.12, 0.61, 0.83]],
+    [0.5, [0.19, 0.72, 0.44]],
+    [0.75, [1.0, 0.83, 0.23]],
+    [1.0, [0.84, 0.21, 0.16]]
+  ];
+  const t = clamp((numeric - minValue) / (maxValue - minValue), 0, 1);
+  for (let i = 1; i < stops.length; i += 1) {
+    if (t <= stops[i][0]) {
+      const [leftT, leftColor] = stops[i - 1];
+      const [rightT, rightColor] = stops[i];
+      const localT = (t - leftT) / Math.max(rightT - leftT, 1e-9);
+      return [
+        leftColor[0] + (rightColor[0] - leftColor[0]) * localT,
+        leftColor[1] + (rightColor[1] - leftColor[1]) * localT,
+        leftColor[2] + (rightColor[2] - leftColor[2]) * localT
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+function ensureRoughnessColorbar() {
+  let colorbar = document.getElementById("roughnessColorbar");
+  if (!colorbar) {
+    colorbar = document.createElement("div");
+    colorbar.id = "roughnessColorbar";
+    colorbar.className = "roughness-colorbar";
+    document.querySelector(".workspace")?.appendChild(colorbar);
+  }
+  return colorbar;
+}
+
+function updateRoughnessColorbar() {
+  if (!state.roughnessWindowOpen || !state.roughnessValues.length || !state.roughnessStats) {
+    destroyRoughnessColorbar();
+    return;
+  }
+  const colorbar = ensureRoughnessColorbar();
+  colorbar.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "roughness-colorbar-title";
+  title.textContent = "Roughness";
+  const gradient = document.createElement("div");
+  gradient.className = "roughness-colorbar-gradient";
+  const labels = document.createElement("div");
+  labels.className = "roughness-colorbar-labels";
+  const minLabel = document.createElement("span");
+  minLabel.textContent = formatRoughnessValue(state.roughnessStats.min_roughness);
+  const maxLabel = document.createElement("span");
+  maxLabel.textContent = formatRoughnessValue(state.roughnessStats.max_roughness);
+  labels.append(minLabel, maxLabel);
+  colorbar.append(title, gradient, labels);
+}
+
+function destroyRoughnessColorbar() {
+  document.getElementById("roughnessColorbar")?.remove();
+}
+
+async function openRoughnessWindow() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Roughness removal is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  if (!meshTargetPrepared("pedestal")) {
+    showToast("Prepare the pedestal mesh before running roughness selection.", true);
+    return;
+  }
+  hideVegetationWindow({ clearSelection: true });
+  hidePedestalBranchWindow();
+  hideManualRemovalWindow();
+  state.manualRemovalPolygon = [];
+  state.manualRemovalSelected = [];
+  state.manualRemovalDrawMode = false;
+  showRoughnessWindow();
+  if (state.activeView !== "mesh_prepared") {
+    await loadView("mesh_prepared");
+  }
+}
+
+function moveRoughnessWindow(clientX, clientY) {
+  if (!state.roughnessWindowDragOffset || !el.roughnessWindow) {
+    return;
+  }
+  const rect = el.roughnessWindow.getBoundingClientRect();
+  const margin = 8;
+  const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+  const left = clamp(clientX - state.roughnessWindowDragOffset[0], margin, maxLeft);
+  const top = clamp(clientY - state.roughnessWindowDragOffset[1], margin, maxTop);
+  el.roughnessWindow.style.left = `${left}px`;
+  el.roughnessWindow.style.top = `${top}px`;
+  el.roughnessWindow.style.right = "auto";
+}
+
+function startRoughnessWindowDrag(event) {
+  if (!el.roughnessWindow || event.button !== 0) {
+    return;
+  }
+  if (event.target?.closest?.("button")) {
+    return;
+  }
+  const rect = el.roughnessWindow.getBoundingClientRect();
+  state.roughnessWindowDragging = true;
+  state.roughnessWindowDragOffset = [event.clientX - rect.left, event.clientY - rect.top];
+  el.roughnessWindowHandle.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function dragRoughnessWindow(event) {
+  if (!state.roughnessWindowDragging) {
+    return;
+  }
+  moveRoughnessWindow(event.clientX, event.clientY);
+}
+
+function stopRoughnessWindowDrag(event) {
+  if (!state.roughnessWindowDragging) {
+    return;
+  }
+  state.roughnessWindowDragging = false;
+  state.roughnessWindowDragOffset = null;
+  if (el.roughnessWindowHandle?.hasPointerCapture?.(event.pointerId)) {
+    el.roughnessWindowHandle.releasePointerCapture(event.pointerId);
+  }
+}
+
+async function openManualRemovalWindow() {
+  if (!meshTargetPrepared()) {
+    showToast(`Prepare the ${state.activeMeshTarget} mesh before manual removal.`, true);
+    return;
+  }
+  hideVegetationWindow({ clearSelection: true });
+  hideRoughnessWindow({ clearSelection: true });
+  hidePedestalBranchWindow();
   showManualRemovalWindow();
   if (state.activeView !== "mesh_prepared") {
     await loadView("mesh_prepared");
@@ -1718,11 +2559,12 @@ function drawManualRemovalOverlay() {
   }
 }
 
-function collectVisibleSelectionForPolygon(polygon, filterSourceIndex = null) {
+function collectProjectedSelectionForPolygon(polygon, filterSourceIndex = null) {
   if (
     !state.view ||
     state.view.kind !== "pointCloud" ||
-    polygon.length < 3
+    polygon.length < 3 ||
+    !state.centeredPositions
   ) {
     return [];
   }
@@ -1730,44 +2572,41 @@ function collectVisibleSelectionForPolygon(polygon, filterSourceIndex = null) {
     uploadPointCloudToGPU();
   }
   const rect = el.viewer.getBoundingClientRect();
-  const size = canvasSize();
-  if (!renderPickBuffer(size)) {
-    return [];
-  }
-
-  const gl = state.gl;
-  const pixels = new Uint8Array(size.width * size.height * 4);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, state.pickFramebuffer);
-  gl.readPixels(0, 0, size.width, size.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-  const dprX = size.width / Math.max(rect.width, 1);
-  const dprY = size.height / Math.max(rect.height, 1);
   const selected = new Set();
   const totalPointCount = Number.isFinite(state.view.total_points)
     ? Number(state.view.total_points)
     : Infinity;
-  for (let row = 0; row < size.height; row += 1) {
-    for (let col = 0; col < size.width; col += 1) {
-      const offset = (row * size.width + col) * 4;
-      const encoded = (pixels[offset] << 16) | (pixels[offset + 1] << 8) | pixels[offset + 2];
-      if (encoded === 0) {
-        continue;
-      }
-      const cssX = (col + 0.5) / dprX;
-      const cssY = rect.height - (row + 0.5) / dprY;
-      if (!pointInPolygon(cssX, cssY, polygon)) {
-        continue;
-      }
-      const sourceIndex = state.sourceIndices[encoded - 1];
-      if (
-        sourceIndex !== undefined &&
-        sourceIndex >= 0 &&
-        sourceIndex < totalPointCount &&
-        (!filterSourceIndex || filterSourceIndex(sourceIndex))
-      ) {
-        selected.add(sourceIndex);
-      }
+  state.mvpMatrix = computeMatrices(canvasSize());
+  for (let renderIndex = 0; renderIndex < state.sourceIndices.length; renderIndex += 1) {
+    const sourceIndex = state.sourceIndices[renderIndex];
+    if (
+      sourceIndex === undefined ||
+      sourceIndex < 0 ||
+      sourceIndex >= totalPointCount ||
+      (filterSourceIndex && !filterSourceIndex(sourceIndex))
+    ) {
+      continue;
+    }
+    const offset = renderIndex * 3;
+    const clip = transformPoint(
+      state.mvpMatrix,
+      state.centeredPositions[offset],
+      state.centeredPositions[offset + 1],
+      state.centeredPositions[offset + 2]
+    );
+    if (!Number.isFinite(clip[3]) || clip[3] <= 0) {
+      continue;
+    }
+    const ndcX = clip[0] / clip[3];
+    const ndcY = clip[1] / clip[3];
+    const ndcZ = clip[2] / clip[3];
+    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) {
+      continue;
+    }
+    const cssX = (ndcX * 0.5 + 0.5) * rect.width;
+    const cssY = (-ndcY * 0.5 + 0.5) * rect.height;
+    if (pointInPolygon(cssX, cssY, polygon)) {
+      selected.add(sourceIndex);
     }
   }
   return Array.from(selected).sort((a, b) => a - b);
@@ -2007,7 +2846,7 @@ function collectManualRemovalSelection() {
     updateManualRemovalUI();
     return;
   }
-  state.manualRemovalSelected = collectVisibleSelectionForPolygon(state.manualRemovalPolygon);
+  state.manualRemovalSelected = collectProjectedSelectionForPolygon(state.manualRemovalPolygon);
   updateManualRemovalUI();
 }
 
@@ -2018,9 +2857,75 @@ function clearManualRemovalSelection(options = {}) {
   updateManualRemovalUI({ redraw: options.redraw !== false });
 }
 
+function updateVegetationUI(options = {}) {
+  const redraw = options.redraw !== false;
+  const available = meshTargetPrepared("pedestal") && state.activeMeshTarget === "pedestal";
+  if (el.hagVegetation) {
+    el.hagVegetation.disabled = !available;
+  }
+  if (el.hagApply) {
+    el.hagApply.disabled = !available;
+  }
+  if (el.hagConfirm) {
+    el.hagConfirm.disabled = !available || !state.vegetationSelected.length;
+  }
+  if (el.hagClear) {
+    el.hagClear.disabled = !state.vegetationSelected.length;
+  }
+  if (el.hagCount) {
+    const selectedText = state.vegetationSelected.length.toLocaleString();
+    el.hagCount.textContent = `${selectedText} vegetation candidate${state.vegetationSelected.length === 1 ? "" : "s"} selected`;
+  }
+  if (redraw && state.view?.kind === "pointCloud") {
+    uploadPointCloudToGPU();
+    draw();
+  }
+}
+
+function updateRoughnessUI(options = {}) {
+  const redraw = options.redraw !== false;
+  const available = meshTargetPrepared("pedestal") && state.activeMeshTarget === "pedestal";
+  if (el.roughnessRemoval) {
+    el.roughnessRemoval.disabled = !available;
+  }
+  if (el.roughnessCalculate) {
+    el.roughnessCalculate.disabled = !available;
+  }
+  if (el.roughnessApply) {
+    el.roughnessApply.disabled = !available || !state.roughnessValues.length;
+  }
+  if (el.roughnessConfirm) {
+    el.roughnessConfirm.disabled = !available || !state.roughnessSelected.length;
+  }
+  if (el.roughnessClear) {
+    el.roughnessClear.disabled = !state.roughnessSelected.length;
+  }
+  if (el.roughnessCount) {
+    const selectedText = state.roughnessSelected.length.toLocaleString();
+    el.roughnessCount.textContent = `${selectedText} roughness candidate${state.roughnessSelected.length === 1 ? "" : "s"} selected`;
+  }
+  if (el.roughnessStats) {
+    if (state.roughnessStats) {
+      const maxText = Number(state.roughnessStats.max_roughness || 0).toFixed(4);
+      const meanText = Number(state.roughnessStats.mean_roughness || 0).toFixed(4);
+      const validText = Number(state.roughnessStats.valid_roughness_count || 0).toLocaleString();
+      const voxelText = Number(state.roughnessStats.voxel_point_count || 0).toLocaleString();
+      const voxelSizeText = Number(state.roughnessStats.voxel_size || 0).toFixed(4);
+      el.roughnessStats.textContent = `Heatmap ready: ${voxelText} voxel points at ${voxelSizeText} m, max ${maxText} m, mean ${meanText} m, ${validText} valid`;
+    } else {
+      el.roughnessStats.textContent = "Click Calculate to build the roughness heatmap";
+    }
+  }
+  updateRoughnessColorbar();
+  if (redraw && state.view?.kind === "pointCloud") {
+    uploadPointCloudToGPU();
+    draw();
+  }
+}
+
 function updateManualRemovalUI(options = {}) {
   const redraw = options.redraw !== false;
-  const available = Boolean(state.session?.status?.mesh_prepared);
+  const available = meshTargetPrepared();
   if (el.manualRemoval) {
     el.manualRemoval.disabled = !available;
   }
@@ -2048,6 +2953,8 @@ function updateManualRemovalUI(options = {}) {
     uploadMarkersToGPU();
     draw();
   }
+  updateVegetationUI({ redraw: false });
+  updateRoughnessUI({ redraw: false });
 }
 
 function toggleManualRemovalDraw() {
@@ -2071,13 +2978,13 @@ function undoManualRemovalVertex() {
 
 async function applyManualRemoval() {
   if (!state.manualRemovalSelected.length) {
-    showToast("Draw a polygon that selects at least one visible rock point.", true);
+    showToast("Draw a polygon that selects at least one visible prepared point.", true);
     return;
   }
   const job = await runAction(
     "Manual removal",
     `/api/sessions/${state.session.session_id}/mesh/noise/manual-remove`,
-    { selected_indices: state.manualRemovalSelected },
+    { selected_indices: state.manualRemovalSelected, target: state.activeMeshTarget },
     "mesh_prepared"
   );
   if (!job) {
@@ -2088,6 +2995,137 @@ async function applyManualRemoval() {
   state.manualRemovalDrawMode = false;
   showManualRemovalWindow();
   updateManualRemovalUI();
+}
+
+async function applyHagVegetationSelection() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Height Above Ground vegetation selection is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  const job = await runAction(
+    "Selecting vegetation",
+    `/api/sessions/${state.session.session_id}/mesh/vegetation/hag/select`,
+    hagVegetationParams(),
+    "mesh_prepared"
+  );
+  if (!job) {
+    return;
+  }
+  const selected = Array.isArray(job.result?.selected_indices)
+    ? job.result.selected_indices.map((idx) => Number(idx)).filter((idx) => Number.isFinite(idx))
+    : [];
+  state.vegetationSelected = selected;
+  state.manualRemovalPolygon = [];
+  state.manualRemovalDrawMode = false;
+  showVegetationWindow();
+  updateVegetationUI();
+  showToast(`Selected ${selected.length.toLocaleString()} vegetation candidate${selected.length === 1 ? "" : "s"}.`);
+}
+
+async function confirmHagVegetationRemoval() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Height Above Ground vegetation removal is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  if (!state.vegetationSelected.length) {
+    showToast("Apply Height Above Ground first to select vegetation candidates.", true);
+    return;
+  }
+  const job = await runAction(
+    "Removing vegetation",
+    `/api/sessions/${state.session.session_id}/mesh/noise/manual-remove`,
+    { selected_indices: state.vegetationSelected, target: "pedestal" },
+    "mesh_prepared"
+  );
+  if (!job) {
+    return;
+  }
+  state.vegetationSelected = [];
+  state.manualRemovalPolygon = [];
+  state.manualRemovalDrawMode = false;
+  showVegetationWindow();
+  updateVegetationUI();
+}
+
+async function calculateRoughnessHeatmap() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Roughness calculation is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  const job = await runAction(
+    "Calculating roughness",
+    `/api/sessions/${state.session.session_id}/mesh/roughness/calculate`,
+    roughnessCalculationParams(),
+    "mesh_prepared"
+  );
+  if (!job) {
+    return;
+  }
+  const values = Array.isArray(job.result?.roughness_values)
+    ? job.result.roughness_values.map((value) => {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : null;
+    })
+    : [];
+  state.roughnessValues = values;
+  state.roughnessSelected = [];
+  state.roughnessStats = {
+    min_roughness: job.result?.min_roughness,
+    max_roughness: job.result?.max_roughness,
+    mean_roughness: job.result?.mean_roughness,
+    valid_roughness_count: job.result?.valid_roughness_count,
+    voxel_size: job.result?.voxel_size,
+    voxel_point_count: job.result?.voxel_point_count
+  };
+  state.manualRemovalPolygon = [];
+  state.manualRemovalDrawMode = false;
+  showRoughnessWindow();
+  updateRoughnessUI();
+  showToast(`Calculated roughness for ${Number(job.result?.valid_roughness_count || 0).toLocaleString()} point${Number(job.result?.valid_roughness_count || 0) === 1 ? "" : "s"}.`);
+}
+
+function applyRoughnessThreshold() {
+  if (!state.roughnessValues.length) {
+    showToast("Click Calculate before applying a roughness threshold.", true);
+    return;
+  }
+  const threshold = Math.max(0, Number(el.roughnessThreshold.value || 0));
+  const selected = [];
+  for (let index = 0; index < state.roughnessValues.length; index += 1) {
+    const value = Number(state.roughnessValues[index]);
+    if (Number.isFinite(value) && value > threshold) {
+      selected.push(index);
+    }
+  }
+  state.roughnessSelected = selected;
+  updateRoughnessUI();
+  showToast(`Selected ${selected.length.toLocaleString()} roughness candidate${selected.length === 1 ? "" : "s"}.`);
+}
+
+async function confirmRoughnessRemoval() {
+  if (state.activeMeshTarget !== "pedestal") {
+    showToast("Roughness removal is only available for prepared pedestal mesh.", true);
+    return;
+  }
+  if (!state.roughnessSelected.length) {
+    showToast("Apply Roughness first to select points above the threshold.", true);
+    return;
+  }
+  const job = await runAction(
+    "Removing rough points",
+    `/api/sessions/${state.session.session_id}/mesh/noise/manual-remove`,
+    { selected_indices: state.roughnessSelected, target: "pedestal" },
+    "mesh_prepared"
+  );
+  if (!job) {
+    return;
+  }
+  state.roughnessSelected = [];
+  state.roughnessStats = null;
+  state.manualRemovalPolygon = [];
+  state.manualRemovalDrawMode = false;
+  showRoughnessWindow();
+  updateRoughnessUI();
 }
 
 function resizeInterfaceEditorOverlay() {
@@ -3508,6 +4546,23 @@ function denoiseParams() {
   };
 }
 
+function hagVegetationParams() {
+  return {
+    target: "pedestal",
+    grid_size: Number(el.hagGridSize.value || 0.05),
+    height_threshold: Number(el.hagHeightThreshold.value || 0.08),
+    ground_percentile: Number(el.hagGroundPercentile.value || 10),
+    min_points_per_cell: Number(el.hagMinPointsPerCell.value || 3)
+  };
+}
+
+function roughnessCalculationParams() {
+  return {
+    target: "pedestal",
+    radius: Number(el.roughnessRadius.value || 0.05)
+  };
+}
+
 function mat4Identity() {
   return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 }
@@ -3752,6 +4807,49 @@ function createLineProgram(gl) {
   return program;
 }
 
+function createMeshProgram(gl) {
+  const vertex = compileShader(gl, gl.VERTEX_SHADER, `
+    attribute vec3 a_position;
+    attribute vec3 a_color;
+    attribute vec3 a_normal;
+    uniform mat4 u_matrix;
+    uniform mat3 u_normalMatrix;
+    varying vec3 v_color;
+    varying vec3 v_normal;
+    void main() {
+      gl_Position = u_matrix * vec4(a_position, 1.0);
+      v_color = a_color;
+      v_normal = normalize(u_normalMatrix * a_normal);
+    }
+  `);
+  const fragment = compileShader(gl, gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    uniform vec3 u_lightDirection;
+    varying vec3 v_color;
+    varying vec3 v_normal;
+    void main() {
+      vec3 normal = normalize(v_normal);
+      vec3 light = normalize(u_lightDirection);
+      float diffuse = abs(dot(normal, light));
+      float specular = pow(diffuse, 30.0) * 0.12;
+      vec3 color = v_color * (0.42 + diffuse * 0.58) + vec3(0.08 + specular);
+      gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+    }
+  `);
+  const program = gl.createProgram();
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  gl.deleteShader(vertex);
+  gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const message = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error(message || "Mesh shader link failed");
+  }
+  return program;
+}
+
 function ensureGL() {
   if (state.gl) {
     return state.gl;
@@ -3764,6 +4862,7 @@ function ensureGL() {
   state.program = createProgram(gl);
   state.pickProgram = createPickProgram(gl);
   state.lineProgram = createLineProgram(gl);
+  state.meshProgram = createMeshProgram(gl);
   state.positionBuffer = gl.createBuffer();
   state.colorBuffer = gl.createBuffer();
   state.pointNormalBuffer = gl.createBuffer();
@@ -3772,12 +4871,15 @@ function ensureGL() {
   state.normalColorBuffer = gl.createBuffer();
   state.measurementLinePositionBuffer = gl.createBuffer();
   state.measurementLineColorBuffer = gl.createBuffer();
+  state.analysisLinePositionBuffer = gl.createBuffer();
+  state.analysisLineColorBuffer = gl.createBuffer();
   state.markerPositionBuffer = gl.createBuffer();
   state.markerColorBuffer = gl.createBuffer();
   state.markerHaloPositionBuffer = gl.createBuffer();
   state.markerHaloColorBuffer = gl.createBuffer();
   state.meshPositionBuffer = gl.createBuffer();
   state.meshColorBuffer = gl.createBuffer();
+  state.meshNormalBuffer = gl.createBuffer();
   state.meshLinePositionBuffer = gl.createBuffer();
   state.meshLineColorBuffer = gl.createBuffer();
   gl.enable(gl.DEPTH_TEST);
@@ -3785,6 +4887,7 @@ function ensureGL() {
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.clearColor(0.965, 0.975, 0.957, 1);
+  gl.useProgram(state.program);
   return gl;
 }
 
@@ -4087,11 +5190,32 @@ function uploadPointCloudToGPU() {
     drawText("WebGL is not available in this browser.");
     return;
   }
+  resetPointCloudGLState(gl);
   const points = state.view.points || [];
   const colors = state.view.colors || [];
   const normals = state.view.normals || [];
   const hasNormals = normals.length === points.length;
   const indices = state.view.indices || [];
+  const vegetationSelection = (
+    state.activeView === "mesh_prepared" &&
+    state.activeMeshTarget === "pedestal" &&
+    state.vegetationSelected.length
+  )
+    ? new Set(state.vegetationSelected.map((idx) => Number(idx)))
+    : null;
+  const roughnessSelection = (
+    state.activeView === "mesh_prepared" &&
+    state.activeMeshTarget === "pedestal" &&
+    state.roughnessSelected.length
+  )
+    ? new Set(state.roughnessSelected.map((idx) => Number(idx)))
+    : null;
+  const roughnessHeatmap = (
+    state.activeView === "mesh_prepared" &&
+    state.activeMeshTarget === "pedestal" &&
+    state.roughnessWindowOpen &&
+    state.roughnessValues.length
+  );
   const fallbackBounds = state.view.bounds || viewBounds(points);
   setViewFrame(state.view.scene_bounds || fallbackBounds, fallbackBounds);
   state.pointCount = points.length;
@@ -4105,7 +5229,16 @@ function uploadPointCloudToGPU() {
   const pickColors = new Float32Array(points.length * 3);
   for (let i = 0; i < points.length; i += 1) {
     const point = points[i];
-    const color = colors[i] || [0.5, 0.5, 0.5];
+    const sourceIndex = indices[i];
+    const roughnessValue = roughnessHeatmap ? state.roughnessValues[sourceIndex] : undefined;
+    const hasRoughnessValue = roughnessHeatmap && Number.isFinite(Number(roughnessValue));
+    const color = roughnessSelection?.has(sourceIndex)
+      ? [0.95, 0.18, 0.85]
+      : hasRoughnessValue
+        ? roughnessHeatmapColor(roughnessValue)
+      : vegetationSelection?.has(sourceIndex)
+        ? [1.0, 0.84, 0.0]
+        : (colors[i] || [0.5, 0.5, 0.5]);
     const normal = hasNormals ? normalize(normals[i] || [0, 0, 1]) : [0, 0, 1];
     const encoded = i + 1;
     const framedPoint = framePoint(point);
@@ -4133,14 +5266,21 @@ function uploadPointCloudToGPU() {
   state.renderKey = state.view;
   uploadNormalSegmentsToGPU();
   uploadMeasurementLineToGPU();
+  uploadAnalysisOverlayToGPU();
   uploadMarkersToGPU();
 }
 
 function markerSourcePoints() {
-  if (!state.view || state.view.kind !== "pointCloud") {
+  if (!state.view) {
     return [];
   }
   const points = [];
+  for (const marker of state.view.analysis_markers || []) {
+    points.push({ point: marker.point, color: marker.color || [1, 0.86, 0.05], haloColor: [0.02, 0.02, 0.02] });
+  }
+  if (state.view.kind === "mesh") {
+    return points;
+  }
   const indexToPoint = new Map();
   for (let i = 0; i < state.view.indices.length; i += 1) {
     indexToPoint.set(state.view.indices[i], state.view.points[i]);
@@ -4155,13 +5295,15 @@ function markerSourcePoints() {
     }
   }
 
-  const sourceIndicesMatchCurrentView = state.activeView !== "voxel_segmented";
+  const sourceIndicesMatchCurrentView = !["voxel_segmented", "mesh_prepared", "analysis"].includes(state.activeView);
   if (sourceIndicesMatchCurrentView) {
     pushSelection(state.rockSeeds, [1, 0.05, 0.02]);
     pushSelection(state.pedestalSeeds, [0.0, 0.24, 1.0]);
-    pushSelection(state.interfacePoints, [0.0, 1.0, 0.0]);
-    for (const part of state.interfaceParts) {
-      pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+    if (state.activeView !== "seeds") {
+      pushSelection(state.interfacePoints, [0.0, 1.0, 0.0]);
+      for (const part of state.interfaceParts) {
+        pushSelection(part.selected_indices || [], [0.0, 1.0, 0.0]);
+      }
     }
   }
   if (state.activeView === "interface" && state.interfaceEditorOpen && state.interfaceDraft) {
@@ -4227,9 +5369,40 @@ function uploadMeasurementLineToGPU() {
   gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
 }
 
+function uploadAnalysisOverlayToGPU() {
+  const gl = state.gl;
+  if (!gl || !state.analysisLinePositionBuffer || !state.analysisLineColorBuffer || !state.view) {
+    state.analysisLineCount = 0;
+    return;
+  }
+  const segments = state.view.analysis_segments || [];
+  state.analysisLineCount = segments.length * 2;
+  if (!segments.length) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, state.analysisLinePositionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(), gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, state.analysisLineColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(), gl.DYNAMIC_DRAW);
+    return;
+  }
+  const positions = new Float32Array(segments.length * 6);
+  const colors = new Float32Array(segments.length * 6);
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i];
+    const start = framePoint(segment.start);
+    const end = framePoint(segment.end);
+    const color = segment.color || [1.0, 0.82, 0.0];
+    positions.set([start[0], start[1], start[2], end[0], end[1], end[2]], i * 6);
+    colors.set([color[0], color[1], color[2], color[0], color[1], color[2]], i * 6);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.analysisLinePositionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.analysisLineColorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.DYNAMIC_DRAW);
+}
+
 function uploadMarkersToGPU() {
   const gl = state.gl;
-  if (!gl || !state.view || state.view.kind !== "pointCloud") {
+  if (!gl || !state.view) {
     return;
   }
   const markers = markerSourcePoints();
@@ -4331,6 +5504,7 @@ function drawPointBatch(gl, program, positionBuffer, colorBuffer, colorAttribute
   if (!count) {
     return;
   }
+  gl.useProgram(program);
   bindAttribute(gl, program, positionBuffer, "a_position", 3);
   bindAttribute(gl, program, colorBuffer, colorAttributeName, 3);
   bindOptionalNormalAttribute(gl, program, shaded ? normalBuffer : null);
@@ -4353,6 +5527,24 @@ function drawPointBatch(gl, program, positionBuffer, colorBuffer, colorAttribute
   gl.drawArrays(gl.POINTS, 0, count);
 }
 
+function shouldShadeActivePointCloud() {
+  return state.view?.kind === "pointCloud";
+}
+
+function resetPointCloudGLState(gl) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0.965, 0.975, 0.957, 1);
+  if (state.program) {
+    gl.useProgram(state.program);
+  }
+}
+
 function drawSolidBatch(gl, positionBuffer, colorBuffer, count, mode) {
   if (!count || !state.lineProgram) {
     return;
@@ -4362,6 +5554,20 @@ function drawSolidBatch(gl, positionBuffer, colorBuffer, count, mode) {
   bindAttribute(gl, state.lineProgram, positionBuffer, "a_position", 3);
   bindAttribute(gl, state.lineProgram, colorBuffer, "a_color", 3);
   gl.drawArrays(mode, 0, count);
+}
+
+function drawMeshBatch(gl) {
+  if (!state.meshVertexCount || !state.meshProgram) {
+    return;
+  }
+  gl.useProgram(state.meshProgram);
+  gl.uniformMatrix4fv(gl.getUniformLocation(state.meshProgram, "u_matrix"), false, state.mvpMatrix);
+  gl.uniformMatrix3fv(gl.getUniformLocation(state.meshProgram, "u_normalMatrix"), false, computeNormalMatrix());
+  gl.uniform3f(gl.getUniformLocation(state.meshProgram, "u_lightDirection"), 0.28, -0.38, 0.88);
+  bindAttribute(gl, state.meshProgram, state.meshPositionBuffer, "a_position", 3);
+  bindAttribute(gl, state.meshProgram, state.meshColorBuffer, "a_color", 3);
+  bindAttribute(gl, state.meshProgram, state.meshNormalBuffer, "a_normal", 3);
+  gl.drawArrays(gl.TRIANGLES, 0, state.meshVertexCount);
 }
 
 function cross(a, b) {
@@ -4504,6 +5710,7 @@ function uploadMeshToGPU() {
   state.pointNormalCount = 0;
   state.normalLineCount = 0;
   state.measurementLineCount = 0;
+  state.analysisLineCount = 0;
   state.markerCount = 0;
   state.markerHaloCount = 0;
   state.centeredPositions = null;
@@ -4511,10 +5718,10 @@ function uploadMeshToGPU() {
 
   const trianglePositions = new Float32Array(triangles.length * 9);
   const triangleColors = new Float32Array(triangles.length * 9);
+  const triangleNormals = new Float32Array(triangles.length * 9);
   const wirePositions = new Float32Array(triangles.length * 18);
   const wireColors = new Float32Array(triangles.length * 18);
-  const light = normalize([0.25, -0.45, 0.86]);
-  const base = [0.74, 0.36, 0.3];
+  const base = [0.5, 0.5, 0.5];
   const wire = [0.13, 0.17, 0.17];
 
   for (let triIndex = 0; triIndex < triangles.length; triIndex += 1) {
@@ -4525,12 +5732,10 @@ function uploadMeshToGPU() {
     if (!a || !b || !c) {
       continue;
     }
+    const points = [a, b, c];
     const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     const ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
     const normal = normalize(cross(ab, ac));
-    const shade = 0.42 + 0.58 * Math.max(0, normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]);
-    const color = base.map((value) => Math.min(1, value * shade + 0.08));
-    const points = [a, b, c];
     for (let corner = 0; corner < 3; corner += 1) {
       const point = points[corner];
       const offset = triIndex * 9 + corner * 3;
@@ -4538,9 +5743,12 @@ function uploadMeshToGPU() {
       trianglePositions[offset] = framedPoint[0];
       trianglePositions[offset + 1] = framedPoint[1];
       trianglePositions[offset + 2] = framedPoint[2];
-      triangleColors[offset] = color[0];
-      triangleColors[offset + 1] = color[1];
-      triangleColors[offset + 2] = color[2];
+      triangleColors[offset] = base[0];
+      triangleColors[offset + 1] = base[1];
+      triangleColors[offset + 2] = base[2];
+      triangleNormals[offset] = normal[0];
+      triangleNormals[offset + 1] = normal[1];
+      triangleNormals[offset + 2] = normal[2];
     }
     const edges = [a, b, b, c, c, a];
     for (let edgeIndex = 0; edgeIndex < edges.length; edgeIndex += 1) {
@@ -4562,10 +5770,136 @@ function uploadMeshToGPU() {
   gl.bufferData(gl.ARRAY_BUFFER, trianglePositions, gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, state.meshColorBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, triangleColors, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshNormalBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, triangleNormals, gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, state.meshLinePositionBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, wirePositions, gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, state.meshLineColorBuffer);
   gl.bufferData(gl.ARRAY_BUFFER, wireColors, gl.STATIC_DRAW);
+  uploadAnalysisOverlayToGPU();
+  uploadMarkersToGPU();
+  state.renderKey = state.view;
+}
+
+function uploadCombinedMeshToGPU() {
+  if (!state.view || state.view.kind !== "combinedMesh") {
+    return;
+  }
+  const gl = ensureGL();
+  if (!gl) {
+    drawText("WebGL is not available in this browser.");
+    return;
+  }
+  const components = Array.isArray(state.view.components) ? state.view.components : [];
+  const framePoints = [];
+  for (const component of components) {
+    const points = component.kind === "mesh" ? (component.vertices || []) : (component.points || []);
+    for (const point of points) {
+      framePoints.push(point);
+    }
+  }
+  if (!framePoints.length) {
+    drawText("No rock or pedestal geometry is available.");
+    return;
+  }
+  const fallbackBounds = state.view.bounds || viewBounds(framePoints);
+  setViewFrame(state.view.scene_bounds || fallbackBounds, fallbackBounds);
+  state.normalLineCount = 0;
+  state.measurementLineCount = 0;
+  state.analysisLineCount = 0;
+  state.markerCount = 0;
+  state.markerHaloCount = 0;
+
+  const trianglePositions = [];
+  const triangleColors = [];
+  const triangleNormals = [];
+  const wirePositions = [];
+  const wireColors = [];
+  const pointPositions = [];
+  const pointColors = [];
+  const pointNormals = [];
+  const pickColors = [];
+  const sourceIndices = [];
+  let encoded = 1;
+  let pointNormalCount = 0;
+
+  for (const component of components) {
+    if (component.kind === "mesh") {
+      const vertices = component.vertices || [];
+      const triangles = component.triangles || [];
+      const base = component.color || [0.5, 0.5, 0.5];
+      const wire = component.wire_color || [0.13, 0.17, 0.17];
+      for (const tri of triangles) {
+        const a = vertices[tri[0]];
+        const b = vertices[tri[1]];
+        const c = vertices[tri[2]];
+        if (!a || !b || !c) {
+          continue;
+        }
+        const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        const ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        const normal = normalize(cross(ab, ac));
+        for (const point of [a, b, c]) {
+          const framedPoint = framePoint(point);
+          trianglePositions.push(framedPoint[0], framedPoint[1], framedPoint[2]);
+          triangleColors.push(base[0], base[1], base[2]);
+          triangleNormals.push(normal[0], normal[1], normal[2]);
+        }
+        for (const point of [a, b, b, c, c, a]) {
+          const framedPoint = framePoint(point);
+          wirePositions.push(framedPoint[0], framedPoint[1], framedPoint[2]);
+          wireColors.push(wire[0], wire[1], wire[2]);
+        }
+      }
+      continue;
+    }
+
+    const points = component.points || [];
+    const colors = component.colors || [];
+    const normals = component.normals || [];
+    const indices = component.indices || [];
+    const hasNormals = normals.length === points.length;
+    for (let i = 0; i < points.length; i += 1) {
+      const point = points[i];
+      const color = colors[i] || component.color || [0.5, 0.5, 0.5];
+      const normal = hasNormals ? normalize(normals[i] || [0, 0, 1]) : [0, 0, 1];
+      const framedPoint = framePoint(point);
+      pointPositions.push(framedPoint[0], framedPoint[1], framedPoint[2]);
+      pointColors.push(color[0], color[1], color[2]);
+      pointNormals.push(normal[0], normal[1], normal[2]);
+      pickColors.push(((encoded >> 16) & 255) / 255, ((encoded >> 8) & 255) / 255, (encoded & 255) / 255);
+      sourceIndices.push(Number.isFinite(indices[i]) ? Number(indices[i]) : i);
+      encoded += 1;
+    }
+    if (hasNormals) {
+      pointNormalCount += points.length;
+    }
+  }
+
+  state.meshVertexCount = trianglePositions.length / 3;
+  state.meshLineVertexCount = wirePositions.length / 3;
+  state.pointCount = pointPositions.length / 3;
+  state.pointNormalCount = pointNormalCount;
+  state.sourceIndices = sourceIndices;
+  state.centeredPositions = new Float32Array(pointPositions);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshPositionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(trianglePositions), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshColorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(triangleColors), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshNormalBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(triangleNormals), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshLinePositionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wirePositions), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.meshLineColorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wireColors), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.positionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, state.centeredPositions, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.colorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pointColors), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.pointNormalBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pointNormals), gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.pickColorBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pickColors), gl.STATIC_DRAW);
   state.renderKey = state.view;
 }
 
@@ -4586,11 +5920,72 @@ function draw() {
     }
     const size = canvasSize();
     gl.viewport(0, 0, size.width, size.height);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.depthFunc(gl.LEQUAL);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     state.mvpMatrix = computeMatrices(size);
-    drawSolidBatch(gl, state.meshPositionBuffer, state.meshColorBuffer, state.meshVertexCount, gl.TRIANGLES);
+    drawMeshBatch(gl);
     if (state.view.show_wireframe) {
       drawSolidBatch(gl, state.meshLinePositionBuffer, state.meshLineColorBuffer, state.meshLineVertexCount, gl.LINES);
+    }
+    if (state.analysisLineCount || state.markerCount) {
+      gl.disable(gl.DEPTH_TEST);
+      gl.lineWidth(3);
+      drawSolidBatch(gl, state.analysisLinePositionBuffer, state.analysisLineColorBuffer, state.analysisLineCount, gl.LINES);
+      gl.enable(gl.DEPTH_TEST);
+      gl.useProgram(state.program);
+      gl.uniformMatrix4fv(gl.getUniformLocation(state.program, "u_matrix"), false, state.mvpMatrix);
+      drawPointBatch(gl, state.program, state.markerHaloPositionBuffer, state.markerHaloColorBuffer, "a_color", state.markerHaloCount, 18, null, false);
+      drawPointBatch(gl, state.program, state.markerPositionBuffer, state.markerColorBuffer, "a_color", state.markerCount, 11, null, false);
+    }
+    drawManualRemovalOverlay();
+    drawInterfaceEditorOverlay();
+    return;
+  }
+  if (state.view.kind === "combinedMesh") {
+    if (state.renderKey !== state.view) {
+      uploadCombinedMeshToGPU();
+    }
+    const gl = state.gl;
+    if (!gl || (!state.meshVertexCount && !state.pointCount)) {
+      return;
+    }
+    const size = canvasSize();
+    gl.viewport(0, 0, size.width, size.height);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.depthFunc(gl.LEQUAL);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    state.mvpMatrix = computeMatrices(size);
+    if (state.meshVertexCount) {
+      drawMeshBatch(gl);
+    }
+    if (state.view.show_wireframe && state.meshLineVertexCount) {
+      drawSolidBatch(gl, state.meshLinePositionBuffer, state.meshLineColorBuffer, state.meshLineVertexCount, gl.LINES);
+    }
+    if (state.pointCount) {
+      gl.useProgram(state.program);
+      gl.uniformMatrix4fv(gl.getUniformLocation(state.program, "u_matrix"), false, state.mvpMatrix);
+      const pointSize = Number(el.pointSize.value || 2.5);
+      const shadePointCloud = state.pointNormalCount === state.pointCount;
+      drawPointBatch(
+        gl,
+        state.program,
+        state.positionBuffer,
+        state.colorBuffer,
+        "a_color",
+        state.pointCount,
+        pointSize,
+        shadePointCloud ? state.pointNormalBuffer : null,
+        shadePointCloud
+      );
     }
     drawManualRemovalOverlay();
     drawInterfaceEditorOverlay();
@@ -4612,6 +6007,7 @@ function draw() {
   if (!gl) {
     return;
   }
+  resetPointCloudGLState(gl);
   const size = canvasSize();
   gl.viewport(0, 0, size.width, size.height);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -4620,6 +6016,7 @@ function draw() {
   gl.uniformMatrix4fv(gl.getUniformLocation(state.program, "u_matrix"), false, state.mvpMatrix);
 
   const pointSize = Number(el.pointSize.value || 2.5);
+  const shadePointCloud = shouldShadeActivePointCloud() && state.pointNormalCount === state.pointCount;
   drawPointBatch(
     gl,
     state.program,
@@ -4628,8 +6025,8 @@ function draw() {
     "a_color",
     state.pointCount,
     pointSize,
-    state.pointNormalCount === state.pointCount ? state.pointNormalBuffer : null,
-    state.pointNormalCount === state.pointCount
+    shadePointCloud ? state.pointNormalBuffer : null,
+    shadePointCloud
   );
   gl.disable(gl.DEPTH_TEST);
   gl.lineWidth(2);
@@ -4637,6 +6034,7 @@ function draw() {
   uploadMeasurementLineToGPU();
   gl.lineWidth(3);
   drawSolidBatch(gl, state.measurementLinePositionBuffer, state.measurementLineColorBuffer, state.measurementLineCount, gl.LINES);
+  drawSolidBatch(gl, state.analysisLinePositionBuffer, state.analysisLineColorBuffer, state.analysisLineCount, gl.LINES);
   gl.enable(gl.DEPTH_TEST);
   gl.useProgram(state.program);
   gl.uniformMatrix4fv(gl.getUniformLocation(state.program, "u_matrix"), false, state.mvpMatrix);
@@ -4663,9 +6061,7 @@ function renderPickBuffer(size) {
   gl.uniformMatrix4fv(gl.getUniformLocation(state.pickProgram, "u_matrix"), false, state.mvpMatrix);
   const pointSize = Number(el.pointSize.value || 3.5);
   drawPointBatch(gl, state.pickProgram, state.positionBuffer, state.pickColorBuffer, "a_pickColor", state.pointCount, pointSize);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.clearColor(0.965, 0.975, 0.957, 1);
-  gl.enable(gl.BLEND);
+  resetPointCloudGLState(gl);
   return true;
 }
 
@@ -5019,6 +6415,39 @@ function bindEvents() {
   el.interfaceWindowHandle.addEventListener("pointermove", dragInterfaceWindow);
   el.interfaceWindowHandle.addEventListener("pointerup", stopInterfaceWindowDrag);
   el.interfaceWindowHandle.addEventListener("pointercancel", stopInterfaceWindowDrag);
+  el.hagVegetation.addEventListener("click", openVegetationWindow);
+  el.vegetationWindowHandle.addEventListener("pointerdown", startVegetationWindowDrag);
+  el.vegetationWindowHandle.addEventListener("pointermove", dragVegetationWindow);
+  el.vegetationWindowHandle.addEventListener("pointerup", stopVegetationWindowDrag);
+  el.vegetationWindowHandle.addEventListener("pointercancel", stopVegetationWindowDrag);
+  el.closeVegetationWindow.addEventListener("click", closeVegetationWindow);
+  el.hagApply.addEventListener("click", applyHagVegetationSelection);
+  el.hagConfirm.addEventListener("click", confirmHagVegetationRemoval);
+  el.hagClear.addEventListener("click", () => {
+    clearVegetationSelection();
+  });
+  el.hagClose.addEventListener("click", closeVegetationWindow);
+  el.roughnessRemoval.addEventListener("click", openRoughnessWindow);
+  el.roughnessWindowHandle.addEventListener("pointerdown", startRoughnessWindowDrag);
+  el.roughnessWindowHandle.addEventListener("pointermove", dragRoughnessWindow);
+  el.roughnessWindowHandle.addEventListener("pointerup", stopRoughnessWindowDrag);
+  el.roughnessWindowHandle.addEventListener("pointercancel", stopRoughnessWindowDrag);
+  el.closeRoughnessWindow.addEventListener("click", closeRoughnessWindow);
+  el.roughnessCalculate.addEventListener("click", calculateRoughnessHeatmap);
+  el.roughnessApply.addEventListener("click", applyRoughnessThreshold);
+  el.roughnessConfirm.addEventListener("click", confirmRoughnessRemoval);
+  el.roughnessClear.addEventListener("click", () => {
+    clearRoughnessSelection();
+  });
+  el.roughnessClose.addEventListener("click", closeRoughnessWindow);
+  el.pedestalBranchWindowHandle.addEventListener("pointerdown", startPedestalBranchWindowDrag);
+  el.pedestalBranchWindowHandle.addEventListener("pointermove", dragPedestalBranchWindow);
+  el.pedestalBranchWindowHandle.addEventListener("pointerup", stopPedestalBranchWindowDrag);
+  el.pedestalBranchWindowHandle.addEventListener("pointercancel", stopPedestalBranchWindowDrag);
+  el.closePedestalBranchWindow.addEventListener("click", hidePedestalBranchWindow);
+  el.pedestalBranchIncludeAll.addEventListener("change", updatePedestalBranchSelectionUI);
+  el.pedestalBranchApply.addEventListener("click", applyPedestalBranchReset);
+  el.pedestalBranchCancel.addEventListener("click", hidePedestalBranchWindow);
   el.manualRemoval.addEventListener("click", openManualRemovalWindow);
   el.closeManualRemovalWindow.addEventListener("click", hideManualRemovalWindow);
   el.manualRemovalWindowHandle.addEventListener("pointerdown", startManualRemovalWindowDrag);
@@ -5078,32 +6507,97 @@ function bindEvents() {
       "segmented"
     );
   });
+  [
+    el.prepareRockMesh,
+    el.preparePedestalMesh,
+    el.normalRockTarget,
+    el.normalPedestalTarget,
+    el.reconstructRockTarget,
+    el.reconstructPedestalTarget
+  ].forEach((button) => {
+    button?.addEventListener("click", () => {
+      const target = button.dataset.meshTarget || "rock";
+      setActiveMeshTarget(target, { reloadView: true });
+    });
+  });
   el.prepareMesh.addEventListener("click", async () => {
-    const job = await runAction("Preparing mesh", `/api/sessions/${state.session.session_id}/mesh/prepare`, undefined, "mesh_prepared");
+    const job = await runAction(
+      `Preparing ${state.activeMeshTarget} mesh`,
+      `/api/sessions/${state.session.session_id}/mesh/prepare`,
+      { target: state.activeMeshTarget },
+      "mesh_prepared"
+    );
     if (job) {
-      clearManualRemovalSelection();
+      clearPreparedSelectionPreviews();
+    }
+  });
+  el.resetMeshPreparation.addEventListener("click", async () => {
+    if (state.activeMeshTarget === "pedestal") {
+      await openPedestalBranchWindow();
+      return;
+    }
+    const job = await runAction(
+      `Resetting ${state.activeMeshTarget} preparation`,
+      `/api/sessions/${state.session.session_id}/mesh/prepare`,
+      { target: state.activeMeshTarget, reset: true },
+      "mesh_prepared"
+    );
+    if (job) {
+      clearPreparedSelectionPreviews();
     }
   });
   el.removeNoise.addEventListener("click", async () => {
-    const job = await runAction("Denoising", `/api/sessions/${state.session.session_id}/mesh/noise/remove`, denoiseParams(), "mesh_prepared");
+    const job = await runAction(
+      `Denoising ${state.activeMeshTarget}`,
+      `/api/sessions/${state.session.session_id}/mesh/noise/remove`,
+      { ...denoiseParams(), target: state.activeMeshTarget },
+      "mesh_prepared"
+    );
     if (job) {
-      clearManualRemovalSelection();
+      clearPreparedSelectionPreviews();
     }
   });
   el.undoNoise.addEventListener("click", async () => {
-    const job = await runAction("Undoing noise", `/api/sessions/${state.session.session_id}/mesh/noise/undo`, undefined, "mesh_prepared");
+    const job = await runAction(
+      `Undoing ${state.activeMeshTarget} noise`,
+      `/api/sessions/${state.session.session_id}/mesh/noise/undo`,
+      { target: state.activeMeshTarget },
+      "mesh_prepared"
+    );
     if (job) {
-      clearManualRemovalSelection();
+      clearPreparedSelectionPreviews();
     }
   });
   el.computeNormals.addEventListener("click", () => runAction("Computing normals", `/api/sessions/${state.session.session_id}/mesh/normals`, {
     method: el.normalMethod.value,
-    k: Number(el.normalK.value)
+    k: Number(el.normalK.value),
+    target: state.activeMeshTarget
   }, "mesh_prepared"));
-  el.reconstruct.addEventListener("click", () => runAction("Reconstructing mesh", `/api/sessions/${state.session.session_id}/mesh/reconstruct`, {
-    depth: Number(el.meshDepth.value)
-  }, "mesh"));
-  el.analyze.addEventListener("click", () => runAction("Computing analysis", `/api/sessions/${state.session.session_id}/analysis`));
+  el.reconstruct.addEventListener("click", () => {
+    runAction(
+      state.activeMeshTarget === "pedestal" ? "Reconstructing pedestal surface" : "Reconstructing mesh",
+      `/api/sessions/${state.session.session_id}/mesh/reconstruct`,
+      {
+        depth: Number(el.meshDepth.value),
+        target: state.activeMeshTarget
+      },
+      "mesh"
+    );
+  });
+  el.loadRockPedestal.addEventListener("click", () => {
+    if (!combinedReconstructionAvailable()) {
+      showToast("Rock and pedestal sources are both required.", true);
+      return;
+    }
+    loadView("combined_mesh");
+  });
+  el.analyze.addEventListener("click", () => {
+    if (state.activeMeshTarget !== "rock") {
+      showToast("Analysis is rock-only in this version.", true);
+      return;
+    }
+    runAction("Computing analysis", `/api/sessions/${state.session.session_id}/analysis`, undefined, "analysis");
+  });
 
   el.viewer.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -5162,6 +6656,8 @@ function bindEvents() {
       state.dragMode = "interface_anchor_insert";
     } else if (editorAnchors && event.shiftKey && event.button === 2) {
       state.dragMode = "interface_anchor_remove";
+    } else if (state.activeView === "analysis") {
+      state.dragMode = event.button === 1 || event.button === 2 ? "pan" : "rotate";
     } else if (event.shiftKey && event.button === 0) {
       state.dragMode = "select";
     } else if (event.shiftKey && event.button === 2) {

@@ -117,6 +117,13 @@ class ProjectIOTests(unittest.TestCase):
         }
         session.status.mesh_prepared = True
 
+    def make_pcd(self, points, color) -> o3d.geometry.PointCloud:
+        point_array = np.asarray(points, dtype=float).reshape((-1, 3))
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(point_array)
+        pcd.colors = o3d.utility.Vector3dVector(np.tile(np.asarray(color, dtype=float), (len(point_array), 1)))
+        return pcd
+
     def interface_marker_indices(self, payload):
         return [
             int(marker["index"])
@@ -156,6 +163,317 @@ class ProjectIOTests(unittest.TestCase):
         self.assertEqual(dest.basal_points.tolist(), [2, 3])
         self.assertEqual(self.interface_marker_indices(dest.viewer_payload("raw")), [2, 3])
         np.testing.assert_allclose(np.asarray(dest.pcd.points), np.asarray(source.pcd.points))
+
+    def test_project_round_trip_restores_rock_and_pedestal_prepared_targets(self):
+        source = self.make_session("targetprep")
+        source._set_prepared_mesh_state(
+            "rock",
+            source._build_prepared_mesh_state(
+                "rock",
+                self.make_pcd([[1.0, 0.0, 0.0], [1.0, 0.0, 1.0]], [1.0, 0.0, 0.0]),
+                self.make_pcd([[0.8, 0.0, 0.0]], [0.0, 1.0, 0.0]),
+            ),
+        )
+        source._set_prepared_mesh_state(
+            "pedestal",
+            source._build_prepared_mesh_state(
+                "pedestal",
+                self.make_pcd([[0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.2, 1.0, 0.5]], [0.1, 0.36, 0.95]),
+                self.make_pcd([[0.2, 0.8, 0.0], [0.2, 0.8, 1.0]], [0.0, 1.0, 0.0]),
+            ),
+        )
+        source._set_normals_display_ready("pedestal", True)
+
+        archive_path = source.export_project(
+            ui_state={"active_mesh_target": "pedestal"},
+            filename="targetprep.rd3dproj",
+            app_build="test-build",
+        )
+        dest = WebWorkflowSession(session_id="targetdest", run_dir=self.root / "targetdest_run")
+        imported = dest.import_project(archive_path)
+
+        self.assertTrue(imported["summary"]["mesh_prepared_targets"]["rock"]["prepared"])
+        self.assertTrue(imported["summary"]["mesh_prepared_targets"]["pedestal"]["prepared"])
+        self.assertEqual(imported["ui_state"]["active_mesh_target"], "pedestal")
+        rock_payload = dest.viewer_payload("mesh_prepared", mesh_target="rock")
+        pedestal_payload = dest.viewer_payload("mesh_prepared", mesh_target="pedestal")
+        self.assertEqual(rock_payload["object_point_count"], 2)
+        self.assertEqual(rock_payload["interface_fill_point_count"], 1)
+        self.assertEqual(pedestal_payload["object_point_count"], 3)
+        self.assertEqual(pedestal_payload["interface_fill_point_count"], 2)
+        self.assertEqual(pedestal_payload["mesh_target"], "pedestal")
+
+    def test_reset_preview_is_visible_but_not_exported_until_committed(self):
+        source = self.make_session("resetpreview")
+        saved_state = source._build_prepared_mesh_state(
+            "rock",
+            self.make_pcd([[1.0, 0.0, 0.0]], [1.0, 0.0, 0.0]),
+            self.make_pcd([[0.0, 0.0, 0.0]], [0.0, 1.0, 0.0]),
+        )
+        preview_state = source._build_prepared_mesh_state(
+            "rock",
+            self.make_pcd([[1.0, 0.0, 0.0], [1.0, 0.0, 1.0]], [1.0, 0.0, 0.0]),
+            self.make_pcd([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], [0.0, 1.0, 0.0]),
+        )
+        source._set_prepared_mesh_state("rock", saved_state)
+        source._set_prepared_mesh_reset_preview("rock", preview_state)
+
+        preview_payload = source.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertTrue(preview_payload["reset_preview"])
+        self.assertTrue(preview_payload["prepared_saved"])
+        self.assertEqual(preview_payload["object_point_count"], 2)
+
+        source.compute_normals(method="open3d", k=3, target="rock")
+        self.assertEqual(len(source.prepared_mesh_states["rock"]["object_pcd"].points), 1)
+        self.assertEqual(len(source.prepared_mesh_reset_previews["rock"]["object_pcd"].points), 2)
+
+        archive_path = source.export_project(
+            ui_state={"active_mesh_target": "rock"},
+            filename="resetpreview.rd3dproj",
+            app_build="test-build",
+        )
+        dest = WebWorkflowSession(session_id="resetdest", run_dir=self.root / "resetdest_run")
+        dest.import_project(archive_path)
+
+        imported_payload = dest.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertFalse(imported_payload["reset_preview"])
+        self.assertTrue(imported_payload["prepared_saved"])
+        self.assertEqual(imported_payload["object_point_count"], 1)
+
+    def test_prepare_pedestal_mesh_uses_only_pedestal_points(self):
+        session = self.make_session("pedestalprep")
+        self.add_seeds_and_interface(session)
+        labels = np.asarray([0, 0, 1, 1, 0, 1], dtype=int)
+        session.segmented_pcd = session.pcd
+        session.segmented_labels = labels
+        session.status.segmentation_ready = True
+
+        result = session.prepare_mesh(target="pedestal")
+
+        self.assertEqual(result["object_point_count"], 3)
+        self.assertEqual(result["interface_fill_point_count"], 0)
+        np.testing.assert_array_equal(session.basal_points, np.asarray([2, 3], dtype=int))
+        payload = session.viewer_payload("mesh_prepared", mesh_target="pedestal")
+        self.assertEqual(payload["mesh_target"], "pedestal")
+        self.assertEqual(payload["object_point_count"], 3)
+        self.assertEqual(payload["interface_fill_point_count"], 0)
+        self.assertEqual(payload["total_points"], 3)
+        self.assertEqual(self.interface_marker_indices(payload), [])
+
+    def test_project_import_restores_pedestal_prepared_mesh_with_empty_interface(self):
+        source = self.make_session("pedestalprepimport")
+        self.add_seeds_and_interface(source)
+        source.segmented_pcd = source.pcd
+        source.segmented_labels = np.asarray([0, 0, 1, 1, 0, 1], dtype=int)
+        source.status.segmentation_ready = True
+        source.prepare_mesh(target="pedestal")
+
+        archive_path = source.export_project(ui_state={}, filename="pedestalprepimport.rd3dproj", app_build="test-build")
+        dest = WebWorkflowSession(session_id="pedestalprepimport_dest", run_dir=self.root / "pedestalprepimport_dest_run")
+        dest.import_project(archive_path)
+
+        target_summary = dest.summary()["mesh_prepared_targets"]["pedestal"]
+        self.assertTrue(target_summary["prepared"])
+        self.assertEqual(target_summary["object_point_count"], 3)
+        self.assertEqual(target_summary["interface_fill_point_count"], 0)
+        payload = dest.viewer_payload("mesh_prepared", mesh_target="pedestal")
+        self.assertEqual(payload["object_point_count"], 3)
+        self.assertEqual(payload["interface_fill_point_count"], 0)
+
+    def test_pedestal_branch_reset_uses_rg_branch_points_not_dense_propagated_branch(self):
+        session = self.make_session("pedestalbranchreset")
+        self.add_seeds_and_interface(session)
+        session.segmented_pcd = session.pcd
+        session.segmented_labels = np.asarray([0, 0, 0, 0, 0, 1], dtype=int)
+        session.segmented_branch_ids = np.asarray([4, 4, 4, 4, 4, 0], dtype=int)
+        session.segmented_branches = [
+            {"branch_id": 0, "seed_index": 5, "region_index": 1, "class_label": "rock", "label": "Rock seed 1", "color": [0.93, 0.18, 0.14]},
+            {"branch_id": 4, "seed_index": 3, "region_index": 0, "class_label": "pedestal", "label": "Pedestal seed 4", "color": [0.10, 0.36, 0.95]},
+        ]
+        rg_branch_points = np.asarray([
+            [0.10, 0.10, 0.00],
+            [0.20, 0.20, 0.00],
+        ], dtype=float)
+        session.voxel_segmented_points = np.vstack([
+            rg_branch_points,
+            np.asarray([[0.30, 0.30, 0.00], [1.00, 1.00, 1.00]], dtype=float),
+        ])
+        session.voxel_segmented_labels = np.asarray([0, 0, 0, 1], dtype=int)
+        session.voxel_segmented_branch_ids = np.asarray([4, 4, 3, 0], dtype=int)
+        session.voxel_segmented_branches = [
+            {"branch_id": 0, "seed_index": 3, "region_index": 1, "class_label": "rock", "label": "Rock seed 1", "color": [0.93, 0.18, 0.14]},
+            {"branch_id": 3, "seed_index": 2, "region_index": 0, "class_label": "pedestal", "label": "Pedestal seed 3", "color": [0.96, 0.62, 0.05]},
+            {"branch_id": 4, "seed_index": 1, "region_index": 0, "class_label": "pedestal", "label": "Pedestal seed 4", "color": [0.10, 0.36, 0.95]},
+        ]
+        session.status.segmentation_ready = True
+        session.status.voxel_segmentation_ready = True
+
+        options = session.summary()["pedestal_branch_options"]
+        seed4 = next(option for option in options if option["branch_id"] == 4)
+        self.assertEqual(seed4["label"], "Pedestal seed 4")
+        self.assertEqual(seed4["rg_node_count"], 2)
+        self.assertEqual(seed4["dense_node_count"], 5)
+
+        result = session.prepare_mesh(
+            target="pedestal",
+            reset=True,
+            include_label_propagation_pedestal=False,
+            pedestal_branch_ids=[4],
+        )
+
+        self.assertEqual(result["object_point_count"], 2)
+        self.assertEqual(result["selected_rg_point_count"], 2)
+        self.assertEqual(result["selected_dense_point_count"], 0)
+        payload = session.viewer_payload("mesh_prepared", mesh_target="pedestal")
+        np.testing.assert_allclose(np.asarray(payload["points"], dtype=float), rg_branch_points)
+
+    def test_pedestal_reconstruction_uses_local_plane_filled_holes_target(self):
+        session = self.make_session("pedestallocalplane")
+        pedestal_points = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.1],
+            [0.0, 1.0, 0.2],
+            [1.0, 1.0, 0.0],
+        ]
+        session._set_prepared_mesh_state(
+            "pedestal",
+            session._build_prepared_mesh_state(
+                "pedestal",
+                self.make_pcd(pedestal_points, [0.1, 0.36, 0.95]),
+                self.make_pcd([], [0.0, 1.0, 0.0]),
+            ),
+        )
+
+        result = session.reconstruct_mesh(target="pedestal")
+
+        self.assertEqual(result["target"], "pedestal")
+        self.assertEqual(result["method"], "local_plane_filled_holes")
+        self.assertGreaterEqual(result["triangle_count"], 2)
+        self.assertTrue(Path(result["mesh_path"]).exists())
+        self.assertFalse(session.status.mesh_completed)
+        self.assertIsNone(session.mesh_path)
+        self.assertTrue(session.summary()["outputs"]["pedestal_mesh"])
+        payload = session.viewer_payload("mesh", mesh_target="pedestal", mesh_url="/pedestal_mesh.ply")
+        self.assertEqual(payload["mesh_target"], "pedestal")
+        self.assertEqual(payload["mesh_method"], "local_plane_filled_holes")
+        self.assertFalse(payload["show_wireframe"])
+        self.assertEqual(session.download_path("pedestal_mesh"), Path(result["mesh_path"]))
+
+    def test_combined_reconstruction_uses_segmentation_when_meshes_are_missing(self):
+        session = self.make_session("combinedfallback")
+        session.segmented_pcd = session.pcd
+        session.segmented_labels = np.asarray([0, 1, 1, 1, 0, 1], dtype=int)
+        session.status.segmentation_ready = True
+
+        summary = session.summary()["combined_reconstruction"]
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["components"]["rock"]["source"], "segmentation")
+        self.assertEqual(summary["components"]["pedestal"]["source"], "segmentation")
+
+        payload = session.viewer_payload("combined_mesh")
+        components = {component["target"]: component for component in payload["components"]}
+        self.assertEqual(components["rock"]["kind"], "pointCloud")
+        self.assertEqual(components["rock"]["point_count"], 4)
+        self.assertEqual(components["pedestal"]["kind"], "pointCloud")
+        self.assertEqual(components["pedestal"]["point_count"], 2)
+
+    def test_combined_reconstruction_is_unavailable_when_a_target_has_no_source(self):
+        session = self.make_session("combinedmissing")
+        session.segmented_pcd = session.pcd
+        session.segmented_labels = np.asarray([1, 1, 1, 1, 1, 1], dtype=int)
+        session.status.segmentation_ready = True
+
+        self.assertFalse(session.summary()["combined_reconstruction"]["available"])
+        with self.assertRaisesRegex(ValueError, "pedestal"):
+            session.viewer_payload("combined_mesh")
+
+    def test_combined_reconstruction_prefers_mesh_for_available_target(self):
+        session = self.make_session("combinedmesh")
+        session.segmented_pcd = session.pcd
+        session.segmented_labels = np.asarray([0, 1, 1, 1, 0, 1], dtype=int)
+        session.status.segmentation_ready = True
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(np.asarray([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ], dtype=float))
+        mesh.triangles = o3d.utility.Vector3iVector(np.asarray([[0, 1, 2]], dtype=int))
+        mesh_path = session.output_dir / "combinedmesh_rock_mesh.ply"
+        o3d.io.write_triangle_mesh(str(mesh_path), mesh)
+        session._set_reconstructed_mesh_state("rock", mesh, mesh_path)
+
+        payload = session.viewer_payload("combined_mesh")
+        components = {component["target"]: component for component in payload["components"]}
+        self.assertEqual(components["rock"]["kind"], "mesh")
+        self.assertEqual(components["rock"]["source"], "mesh")
+        self.assertEqual(components["rock"]["triangle_count"], 1)
+        self.assertEqual(components["pedestal"]["kind"], "pointCloud")
+        self.assertEqual(components["pedestal"]["source"], "segmentation")
+        self.assertEqual(components["pedestal"]["point_count"], 2)
+
+    def test_height_above_ground_selects_pedestal_vegetation_candidates(self):
+        session = self.make_session("hag")
+        pedestal_points = [
+            [0.00, 0.00, 0.00],
+            [0.02, 0.00, 0.01],
+            [0.00, 0.02, 0.00],
+            [0.01, 0.01, 0.20],
+            [0.20, 0.20, 0.01],
+            [0.22, 0.20, 0.02],
+            [0.20, 0.22, 0.18],
+        ]
+        state = session._build_prepared_mesh_state(
+            "pedestal",
+            self.make_pcd(pedestal_points, [0.1, 0.36, 0.95]),
+            self.make_pcd([], [0.0, 1.0, 0.0]),
+        )
+        session._set_prepared_mesh_state("pedestal", state)
+
+        result = session.select_height_above_ground_vegetation({
+            "target": "pedestal",
+            "grid_size": 0.1,
+            "height_threshold": 0.1,
+            "ground_percentile": 0,
+            "min_points_per_cell": 1,
+        })
+
+        self.assertEqual(result["selected_indices"], [3, 6])
+        self.assertEqual(result["selected_count"], 2)
+        self.assertEqual(len(session.prepared_mesh_states["pedestal"]["object_pcd"].points), 7)
+
+    def test_roughness_calculates_pedestal_point_to_local_plane_distance(self):
+        session = self.make_session("roughness")
+        pedestal_points = [
+            [-0.10, -0.10, 0.00],
+            [-0.10, 0.00, 0.00],
+            [-0.10, 0.10, 0.00],
+            [0.00, -0.10, 0.00],
+            [0.00, 0.00, 0.20],
+            [0.00, 0.10, 0.00],
+            [0.10, -0.10, 0.00],
+            [0.10, 0.00, 0.00],
+            [0.10, 0.10, 0.00],
+        ]
+        state = session._build_prepared_mesh_state(
+            "pedestal",
+            self.make_pcd(pedestal_points, [0.1, 0.36, 0.95]),
+            self.make_pcd([], [0.0, 1.0, 0.0]),
+        )
+        session._set_prepared_mesh_state("pedestal", state)
+
+        result = session.calculate_roughness({
+            "target": "pedestal",
+            "radius": 0.3,
+        })
+
+        values = np.asarray(result["roughness_values"], dtype=float)
+        self.assertEqual(int(np.nanargmax(values)), 4)
+        self.assertGreater(values[4], 0.1)
+        self.assertEqual(result["valid_roughness_count"], 9)
+        self.assertAlmostEqual(result["voxel_size"], 0.1)
+        self.assertEqual(result["voxel_point_count"], 9)
+        self.assertEqual(len(session.prepared_mesh_states["pedestal"]["object_pcd"].points), 9)
 
     def test_raw_only_project_imports_cleanly(self):
         source = self.make_session("rawonly")
@@ -352,7 +670,7 @@ class ProjectIOTests(unittest.TestCase):
         interface_markers = [marker for marker in payload["markers"] if marker["label"].startswith("Interface")]
         self.assertEqual([marker["index"] for marker in interface_markers], [2, 3])
 
-    def test_manual_interface_overlays_all_point_cloud_views(self):
+    def test_manual_interface_overlays_expected_point_cloud_views(self):
         session = self.make_session("manualallviews")
         self.add_seeds_and_interface(session)
         session.display_interface_source = "manual"
@@ -369,14 +687,107 @@ class ProjectIOTests(unittest.TestCase):
         session.status.voxel_segmentation_ready = True
         self.add_prepared_mesh_view(session)
 
-        for view_name in ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared"]:
+        for view_name in ["raw", "interface", "voxel_segmented", "segmented"]:
             with self.subTest(view=view_name):
                 payload = session.viewer_payload(view_name)
                 self.assertEqual(self.interface_marker_indices(payload), [2, 3])
 
+        self.assertEqual(self.interface_marker_indices(session.viewer_payload("seeds")), [])
+        mesh_prep_payload = session.viewer_payload("mesh_prepared")
+        self.assertEqual(self.interface_marker_indices(mesh_prep_payload), [])
+        self.assertEqual(mesh_prep_payload["interface_path_source_indices"], [2, 3])
+
         raw_payload = session.viewer_payload("raw")
         self.assertEqual(raw_payload["colors"][2], [0.0, 1.0, 0.0])
         self.assertEqual(raw_payload["colors"][3], [0.0, 1.0, 0.0])
+
+    def test_manual_removal_can_remove_interface_fill_points(self):
+        session = self.make_session("removefill")
+        self.add_seeds_and_interface(session)
+        object_pcd = self.make_pcd([[0, 0, 0], [0, 0, 1]], [1, 0, 0])
+        interface_pcd = self.make_pcd([[1, 0, 0], [1, 0, 1]], [0, 1, 0])
+        session._set_prepared_mesh_state(
+            "rock",
+            session._build_prepared_mesh_state("rock", object_pcd, interface_pcd),
+        )
+
+        result = session.manual_remove_prepared_points([2], target="rock")
+
+        self.assertEqual(result["removed_object_point_count"], 0)
+        self.assertEqual(result["removed_interface_fill_point_count"], 1)
+        self.assertEqual(result["removed_interface_path_point_count"], 0)
+        self.assertEqual(result["interface_fill_point_count"], 1)
+        self.assertEqual(len(session.prepared_mesh_states["rock"]["interface_pcd"].points), 1)
+
+    def test_manual_removal_can_remove_visible_interface_path_points(self):
+        session = self.make_session("removepath")
+        self.add_seeds_and_interface(session)
+        object_pcd = self.make_pcd([[0, 0, 0], [0, 0, 1]], [1, 0, 0])
+        interface_pcd = self.make_pcd([[0.5, 0, 0]], [0, 1, 0])
+        session._set_prepared_mesh_state(
+            "rock",
+            session._build_prepared_mesh_state("rock", object_pcd, interface_pcd),
+        )
+        payload = session.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertEqual(payload["interface_path_source_indices"], [2, 3])
+        path_payload_index = len(session.prepared_mesh_states["rock"]["combined_points"])
+
+        result = session.manual_remove_prepared_points([path_payload_index], target="rock")
+
+        self.assertEqual(result["removed_object_point_count"], 0)
+        self.assertEqual(result["removed_interface_fill_point_count"], 0)
+        self.assertEqual(result["removed_interface_path_point_count"], 1)
+        self.assertEqual(result["interface_path_point_count"], 1)
+        refreshed = session.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertEqual(refreshed["interface_path_source_indices"], [3])
+        self.assertEqual(self.interface_marker_indices(refreshed), [])
+        self.assertEqual(session.manual_basal_parts_metadata["parts"][0]["point_indices"], [3])
+
+        session.undo_noise(target="rock")
+        restored = session.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertEqual(restored["interface_path_source_indices"], [2, 3])
+
+    def test_manual_removal_can_remove_mixed_prepared_and_interface_path_points(self):
+        session = self.make_session("removemixed")
+        self.add_seeds_and_interface(session)
+        object_pcd = self.make_pcd([[0, 0, 0], [0, 0, 1]], [1, 0, 0])
+        interface_pcd = self.make_pcd([[0.5, 0, 0], [0.5, 0, 1]], [0, 1, 0])
+        session._set_prepared_mesh_state(
+            "rock",
+            session._build_prepared_mesh_state("rock", object_pcd, interface_pcd),
+        )
+        combined_count = len(session.prepared_mesh_states["rock"]["combined_points"])
+
+        result = session.manual_remove_prepared_points([0, 2, combined_count + 1], target="rock")
+
+        self.assertEqual(result["removed_object_point_count"], 1)
+        self.assertEqual(result["removed_interface_fill_point_count"], 1)
+        self.assertEqual(result["removed_interface_path_point_count"], 1)
+        self.assertEqual(result["object_point_count"], 1)
+        self.assertEqual(result["interface_fill_point_count"], 1)
+        refreshed = session.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertEqual(refreshed["interface_path_source_indices"], [2])
+
+    def test_removed_interface_path_point_does_not_return_in_new_mesh_prep_state(self):
+        session = self.make_session("pathregen")
+        self.add_seeds_and_interface(session)
+        object_pcd = self.make_pcd([[0, 0, 0], [0, 0, 1]], [1, 0, 0])
+        interface_pcd = self.make_pcd([[0.5, 0, 0]], [0, 1, 0])
+        session._set_prepared_mesh_state(
+            "rock",
+            session._build_prepared_mesh_state("rock", object_pcd, interface_pcd),
+        )
+        combined_count = len(session.prepared_mesh_states["rock"]["combined_points"])
+        session.manual_remove_prepared_points([combined_count], target="rock")
+
+        regenerated_interface_pcd = self.make_pcd([[0.25, 0, 0]], [0, 1, 0])
+        session._set_prepared_mesh_state(
+            "rock",
+            session._build_prepared_mesh_state("rock", object_pcd, regenerated_interface_pcd),
+        )
+
+        payload = session.viewer_payload("mesh_prepared", mesh_target="rock")
+        self.assertEqual(payload["interface_path_source_indices"], [3])
 
     def test_regular_region_growing_sets_auto_interface_overlay(self):
         session = self.make_session("autorg")

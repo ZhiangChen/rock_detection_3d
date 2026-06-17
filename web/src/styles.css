@@ -98,7 +98,13 @@ a {
   gap: 10px;
   align-items: center;
   margin-bottom: 14px;
-  color: #24454b;
+}
+
+.brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #2e766f, #bc5a4b);
 }
 
 .brand-row h1 {
@@ -206,8 +212,21 @@ a {
   font-size: 13px;
 }
 
+.status-row::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border: 1px solid #a7aea7;
+  border-radius: 50%;
+}
+
 .status-row.done {
   color: #2e766f;
+}
+
+.status-row.done::before {
+  background: #2e766f;
+  border-color: #2e766f;
 }
 
 .view-grid {
@@ -226,6 +245,11 @@ a {
   background: #dcece6;
   border-color: #2e766f;
   color: #214d48;
+}
+
+.segmented.mesh-target-control {
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 7px;
 }
 
 .tip-toggle {
@@ -502,6 +526,52 @@ a {
   gap: 7px;
 }
 
+.field-with-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.field-with-action .button-help-wrap {
+  align-self: end;
+}
+
+.roughness-colorbar {
+  position: absolute;
+  right: 16px;
+  bottom: 18px;
+  z-index: 12;
+  width: 210px;
+  padding: 10px;
+  border: 1px solid #cbd4ce;
+  border-radius: 6px;
+  background: rgba(250, 252, 248, 0.94);
+  box-shadow: 0 10px 28px rgba(28, 45, 39, 0.16);
+  color: #394640;
+  font-size: 12px;
+}
+
+.roughness-colorbar-title {
+  margin-bottom: 6px;
+  font-weight: 700;
+}
+
+.roughness-colorbar-gradient {
+  height: 12px;
+  border: 1px solid rgba(58, 70, 64, 0.25);
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2c4ad9, #1f9bd4, #31b86f, #ffd43b, #d7352a);
+}
+
+.roughness-colorbar-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 5px;
+  color: #59645e;
+}
+
 .selection-readout {
   min-height: 28px;
   margin-top: 8px;
@@ -615,7 +685,11 @@ a {
   justify-content: center;
   background: #eef6f0;
   color: #2e766f;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
   cursor: help;
+  user-select: none;
 }
 
 .info-anchor:hover,
@@ -694,6 +768,56 @@ button.active {
   background: #dcece6;
   border-color: #2e766f;
   color: #214d48;
+}
+
+.analysis-window {
+  position: absolute;
+  top: 72px;
+  right: 14px;
+  z-index: 12;
+  width: min(320px, calc(100% - 28px));
+  max-height: min(520px, calc(100% - 96px));
+  overflow-y: auto;
+  padding: 11px;
+  border: 1px solid #cbd4ce;
+  border-radius: 6px;
+  background: rgba(250, 252, 248, 0.96);
+  box-shadow: 0 10px 24px rgba(32, 36, 39, 0.14);
+}
+
+.analysis-window-title {
+  margin-bottom: 8px;
+  color: #3e4741;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.analysis-window-list {
+  display: grid;
+  gap: 5px;
+}
+
+.analysis-window-vectors {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #dce0d8;
+}
+
+.analysis-window-row {
+  display: grid;
+  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  color: #59635d;
+  font-size: 12px;
+}
+
+.analysis-window-row strong {
+  min-width: 0;
+  color: #26302b;
+  font-weight: 650;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 1100px) {

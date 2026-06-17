@@ -29,7 +29,7 @@ RUNS_DIR = REPO_ROOT / "web_runs"
 WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
 WEB_STATIC_DIR = MODULE_DIR / "web_static"
 ALLOWED_POINT_CLOUD_SUFFIXES = {".las", ".laz"}
-APP_BUILD = "20260615-panel-scroll"
+APP_BUILD = "20260616-combined-rock-pedestal"
 
 
 class ManualSeedsRequest(BaseModel):
@@ -85,6 +85,14 @@ class SegmentRequest(BaseModel):
 class NormalsRequest(BaseModel):
     method: Literal["pymeshlab", "open3d"] = "pymeshlab"
     k: int = 200
+    target: Literal["rock", "pedestal"] = "rock"
+
+
+class MeshTargetRequest(BaseModel):
+    target: Literal["rock", "pedestal"] = "rock"
+    reset: bool = False
+    include_label_propagation_pedestal: bool | None = None
+    pedestal_branch_ids: list[int] = Field(default_factory=list)
 
 
 class DenoiseRequest(BaseModel):
@@ -93,14 +101,30 @@ class DenoiseRequest(BaseModel):
     sor_std_ratio: float = 2.0
     dbscan_eps: float = 0.02
     dbscan_min_points: int = 20
+    target: Literal["rock", "pedestal"] = "rock"
 
 
 class ManualRemoveRequest(BaseModel):
     selected_indices: list[int] = Field(default_factory=list)
+    target: Literal["rock", "pedestal"] = "rock"
+
+
+class HeightAboveGroundRequest(BaseModel):
+    target: Literal["pedestal"] = "pedestal"
+    grid_size: float = 0.05
+    height_threshold: float = 0.08
+    ground_percentile: float = 10.0
+    min_points_per_cell: int = 3
+
+
+class RoughnessRequest(BaseModel):
+    target: Literal["pedestal"] = "pedestal"
+    radius: float = 0.05
 
 
 class ReconstructRequest(BaseModel):
     depth: int = 8
+    target: Literal["rock", "pedestal"] = "rock"
 
 
 class ProjectExportRequest(BaseModel):
@@ -255,22 +279,36 @@ def upload_point_cloud(session_id: str, file: UploadFile = File(...)) -> dict[st
 
 
 @app.get("/api/sessions/{session_id}/viewer/{view_name}")
-def get_viewer(session_id: str, view_name: str, color_mode: str | None = None) -> dict[str, Any]:
+def get_viewer(
+    session_id: str,
+    view_name: str,
+    color_mode: str | None = None,
+    mesh_target: Literal["rock", "pedestal"] = "rock",
+) -> dict[str, Any]:
     record = _get_session(session_id)
-    mesh_url = f"/api/sessions/{session_id}/downloads/mesh" if view_name == "mesh" else None
+    mesh_url = None
+    if view_name == "mesh":
+        mesh_url = f"/api/sessions/{session_id}/downloads/{'pedestal_mesh' if mesh_target == 'pedestal' else 'mesh'}"
+    elif view_name == "analysis":
+        mesh_url = f"/api/sessions/{session_id}/downloads/mesh"
     try:
         with record.lock:
-            return record.workflow.viewer_payload(view_name, mesh_url=mesh_url, color_mode=color_mode)
+            return record.workflow.viewer_payload(
+                view_name,
+                mesh_url=mesh_url,
+                color_mode=color_mode,
+                mesh_target=mesh_target,
+            )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/sessions/{session_id}/diagnostics/normals")
-def get_normal_diagnostics(session_id: str) -> dict[str, Any]:
+def get_normal_diagnostics(session_id: str, target: Literal["rock", "pedestal"] = "rock") -> dict[str, Any]:
     record = _get_session(session_id)
     try:
         with record.lock:
-            return record.workflow.prepared_normal_diagnostics()
+            return record.workflow.prepared_normal_diagnostics(target=target)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -454,8 +492,17 @@ def label_propagation(session_id: str, request: SegmentRequest) -> dict[str, str
 
 
 @app.post("/api/sessions/{session_id}/mesh/prepare")
-def prepare_mesh(session_id: str) -> dict[str, str]:
-    return _submit_job(session_id, "prepare_mesh", lambda workflow: workflow.prepare_mesh())
+def prepare_mesh(session_id: str, request: MeshTargetRequest = MeshTargetRequest()) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "prepare_mesh",
+        lambda workflow: workflow.prepare_mesh(
+            target=request.target,
+            reset=request.reset,
+            include_label_propagation_pedestal=request.include_label_propagation_pedestal,
+            pedestal_branch_ids=request.pedestal_branch_ids,
+        ),
+    )
 
 
 @app.post("/api/sessions/{session_id}/mesh/normals")
@@ -463,7 +510,7 @@ def compute_normals(session_id: str, request: NormalsRequest) -> dict[str, str]:
     return _submit_job(
         session_id,
         "compute_normals",
-        lambda workflow: workflow.compute_normals(method=request.method, k=request.k),
+        lambda workflow: workflow.compute_normals(method=request.method, k=request.k, target=request.target),
     )
 
 
@@ -481,18 +528,40 @@ def manual_remove_noise(session_id: str, request: ManualRemoveRequest) -> dict[s
     return _submit_job(
         session_id,
         "manual_remove_noise",
-        lambda workflow: workflow.manual_remove_prepared_points(request.selected_indices),
+        lambda workflow: workflow.manual_remove_prepared_points(request.selected_indices, target=request.target),
+    )
+
+
+@app.post("/api/sessions/{session_id}/mesh/vegetation/hag/select")
+def select_hag_vegetation(session_id: str, request: HeightAboveGroundRequest = HeightAboveGroundRequest()) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "select_hag_vegetation",
+        lambda workflow: workflow.select_height_above_ground_vegetation(request.model_dump()),
+    )
+
+
+@app.post("/api/sessions/{session_id}/mesh/roughness/calculate")
+def calculate_roughness(session_id: str, request: RoughnessRequest = RoughnessRequest()) -> dict[str, str]:
+    return _submit_job(
+        session_id,
+        "calculate_roughness",
+        lambda workflow: workflow.calculate_roughness(request.model_dump()),
     )
 
 
 @app.post("/api/sessions/{session_id}/mesh/noise/undo")
-def undo_noise(session_id: str) -> dict[str, str]:
-    return _submit_job(session_id, "undo_noise", lambda workflow: workflow.undo_noise())
+def undo_noise(session_id: str, request: MeshTargetRequest = MeshTargetRequest()) -> dict[str, str]:
+    return _submit_job(session_id, "undo_noise", lambda workflow: workflow.undo_noise(target=request.target))
 
 
 @app.post("/api/sessions/{session_id}/mesh/reconstruct")
 def reconstruct_mesh(session_id: str, request: ReconstructRequest) -> dict[str, str]:
-    return _submit_job(session_id, "reconstruct_mesh", lambda workflow: workflow.reconstruct_mesh(depth=request.depth))
+    return _submit_job(
+        session_id,
+        "reconstruct_mesh",
+        lambda workflow: workflow.reconstruct_mesh(depth=request.depth, target=request.target),
+    )
 
 
 @app.post("/api/sessions/{session_id}/analysis")
@@ -552,12 +621,12 @@ if WEB_STATIC_DIR.exists():
 
 @app.get("/", response_model=None)
 def root() -> FileResponse | JSONResponse:
-    index = WEB_DIST_DIR / "index.html"
-    if index.exists():
-        return FileResponse(index)
     static_index = WEB_STATIC_DIR / "index.html"
     if static_index.exists():
         return FileResponse(static_index)
+    index = WEB_DIST_DIR / "index.html"
+    if index.exists():
+        return FileResponse(index)
     return JSONResponse({
         "message": "Rock Detection 3D API is running. Build the React app in web/ to serve the browser UI.",
         "docs": "/docs",
@@ -568,7 +637,4 @@ def root() -> FileResponse | JSONResponse:
 def spa_fallback(full_path: str) -> FileResponse | JSONResponse:
     if full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="Not found")
-    index = WEB_DIST_DIR / "index.html"
-    if index.exists():
-        return FileResponse(index)
     return root()

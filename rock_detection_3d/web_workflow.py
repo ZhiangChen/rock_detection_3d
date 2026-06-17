@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import ast
+import csv
 import json
 import re
 import shutil
@@ -24,7 +26,9 @@ from typing import Any, Literal
 import laspy
 import numpy as np
 import open3d as o3d
-from scipy.spatial import cKDTree
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+from scipy.ndimage import binary_dilation, binary_fill_holes, distance_transform_edt, gaussian_filter, label
+from scipy.spatial import Delaunay, QhullError, cKDTree
 
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
@@ -63,6 +67,8 @@ BRUSH_ADD_MIN_ANCHORS = 3
 BRUSH_ADD_MAX_ANCHORS = 18
 BRUSH_REMOVE_MAX_ANCHORS = 12
 BRUSH_JUMP_MEDIAN_MULTIPLIER = 12.0
+PEDESTAL_MESH_METHOD = "local_plane_filled_holes"
+PEDESTAL_MESH_METHOD_LABEL = "Local Plane + Filled Holes"
 
 DEFAULT_CONFIG = {
     "thresholds": {
@@ -98,6 +104,18 @@ DEFAULT_CONFIG = {
 PROJECT_FORMAT = "rock_detection_3d.project"
 PROJECT_SCHEMA_VERSION = 1
 PROJECT_ARCHIVE_SUFFIX = ".rd3dproj"
+PROJECT_DEBUG_LOG_PATH = MODULE_DIR.parent / "web_runs" / "project_import_debug.log"
+MESH_TARGETS = {"rock", "pedestal"}
+MESH_TARGET_COLORS = {
+    "rock": {
+        "object": np.array([1.0, 0.0, 0.0], dtype=float),
+        "interface": np.array([0.0, 1.0, 0.0], dtype=float),
+    },
+    "pedestal": {
+        "object": np.array([0.10, 0.36, 0.95], dtype=float),
+        "interface": np.array([0.0, 1.0, 0.0], dtype=float),
+    },
+}
 
 
 def _deep_update(base: dict[str, Any], upd: dict[str, Any] | None) -> dict[str, Any]:
@@ -195,6 +213,71 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(item) for item in value]
     return value
+
+
+def _debug_array_summary(array: Any, *, label_values: bool = False, sample_rows: int = 3) -> dict[str, Any]:
+    if array is None:
+        return {"present": False}
+    try:
+        arr = np.asarray(array)
+    except Exception as exc:  # noqa: BLE001
+        return {"present": True, "error": str(exc)}
+    summary: dict[str, Any] = {
+        "present": True,
+        "shape": list(arr.shape),
+        "dtype": str(arr.dtype),
+        "size": int(arr.size),
+    }
+    if arr.size == 0:
+        return summary
+    if np.issubdtype(arr.dtype, np.number):
+        finite = arr[np.isfinite(arr)] if np.issubdtype(arr.dtype, np.floating) else arr.reshape(-1)
+        if finite.size:
+            summary["min"] = float(np.min(finite))
+            summary["max"] = float(np.max(finite))
+        if arr.ndim == 2 and arr.shape[1] == 3:
+            rows = arr.reshape((-1, 3))
+            summary["sample"] = np.round(rows[:sample_rows].astype(float), 4).tolist()
+            rounded = np.round(rows.astype(float), 4)
+            summary["unique_row_count"] = int(len(np.unique(rounded, axis=0)))
+            summary["all_rows_equal"] = bool(len(rounded) > 0 and np.allclose(rounded, rounded[0]))
+            summary["all_gray_0_5"] = bool(len(rows) > 0 and np.allclose(rows, 0.5))
+        elif label_values and arr.ndim == 1:
+            values, counts = np.unique(arr.astype(int), return_counts=True)
+            summary["value_counts"] = {
+                str(int(value)): int(count)
+                for value, count in zip(values, counts, strict=False)
+            }
+    else:
+        flat = arr.reshape(-1)
+        summary["sample"] = [str(item)[:500] for item in flat[:sample_rows]]
+    return summary
+
+
+def _debug_pcd_summary(pcd: o3d.geometry.PointCloud | None) -> dict[str, Any]:
+    if pcd is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "points": _debug_array_summary(np.asarray(pcd.points)),
+        "colors": _debug_array_summary(np.asarray(pcd.colors) if pcd.has_colors() else None),
+        "has_colors": bool(pcd.has_colors()),
+        "has_normals": bool(pcd.has_normals()),
+    }
+
+
+def _project_debug_log(event: str, **fields: Any) -> None:
+    try:
+        PROJECT_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **_to_jsonable(fields),
+        }
+        with PROJECT_DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not write project debug log: %s", exc)
 
 
 def _safe_filename(name: str | None, default: str, suffix: str | None = None) -> str:
@@ -439,12 +522,37 @@ class WebWorkflowSession:
         self.voxel_segmented_labels: np.ndarray | None = None
         self.voxel_segmented_branch_ids: np.ndarray | None = None
         self.voxel_segmented_branches: list[dict[str, Any]] = []
+        self.prepared_mesh_states: dict[str, dict[str, Any] | None] = {
+            "rock": None,
+            "pedestal": None,
+        }
+        self.prepared_mesh_reset_previews: dict[str, dict[str, Any] | None] = {
+            "rock": None,
+            "pedestal": None,
+        }
+        self.normals_display_ready_by_target: dict[str, bool] = {
+            "rock": False,
+            "pedestal": False,
+        }
+        self.noise_removal_history_by_target: dict[str, list[dict[str, Any]]] = {
+            "rock": [],
+            "pedestal": [],
+        }
         self.prepared_mesh_data: dict[str, Any] | None = None
         self.normals_display_ready = False
-        self.noise_removal_history: list[dict[str, Any]] = []
+        self.noise_removal_history: list[dict[str, Any]] = self.noise_removal_history_by_target["rock"]
         self.segmented_pcd_file_path: str | None = None
+        self.reconstructed_meshes: dict[str, o3d.geometry.TriangleMesh | None] = {
+            "rock": None,
+            "pedestal": None,
+        }
+        self.mesh_paths: dict[str, str | None] = {
+            "rock": None,
+            "pedestal": None,
+        }
         self.mesh_path: str | None = None
         self.analysis_csv_path: str | None = None
+        self.analysis_results: dict[str, Any] | None = None
         self.status = WorkflowStatus()
 
     def summary(self) -> dict[str, Any]:
@@ -467,9 +575,343 @@ class WebWorkflowSession:
             "interface_draft": self._interface_draft_summary(),
             "outputs": {
                 "segmented": self.segmented_pcd_file_path,
-                "mesh": self.mesh_path,
+                "mesh": self._mesh_output_path("rock"),
+                "pedestal_mesh": self._mesh_output_path("pedestal"),
                 "analysis": self.analysis_csv_path,
             },
+            "mesh_prepared_targets": self._prepared_mesh_target_summary(),
+            "mesh_reconstruction_targets": self._mesh_reconstruction_target_summary(),
+            "combined_reconstruction": self._combined_reconstruction_summary(),
+            "normals_display_ready_by_target": dict(self.normals_display_ready_by_target),
+            "pedestal_branch_options": self._pedestal_branch_options(),
+            "analysis_results": self.analysis_results,
+        }
+
+    def _mesh_target(self, target: str | None = None) -> Literal["rock", "pedestal"]:
+        normalized = str(target or "rock").strip().lower()
+        if normalized not in MESH_TARGETS:
+            raise ValueError("Mesh preparation target must be 'rock' or 'pedestal'.")
+        return normalized  # type: ignore[return-value]
+
+    def _prepared_mesh_target_summary(self) -> dict[str, dict[str, Any]]:
+        summary: dict[str, dict[str, Any]] = {}
+        for target in sorted(MESH_TARGETS):
+            data = self.prepared_mesh_states.get(target)
+            preview = self.prepared_mesh_reset_previews.get(target)
+            visible_data = preview or data
+            object_count = int(len(visible_data["object_pcd"].points)) if visible_data else 0
+            interface_count = int(len(visible_data["interface_pcd"].points)) if visible_data else 0
+            summary[target] = {
+                "prepared": bool(data),
+                "preview": bool(preview),
+                "available": bool(visible_data),
+                "normal_display_ready": bool(self.normals_display_ready_by_target.get(target, False)),
+                "object_point_count": object_count,
+                "interface_fill_point_count": interface_count,
+            }
+        return summary
+
+    def _mesh_output_path(self, target: str | None = "rock") -> str | None:
+        mesh_target = self._mesh_target(target)
+        value = self.mesh_paths.get(mesh_target)
+        if mesh_target == "rock" and not value:
+            value = self.mesh_path
+        return value
+
+    def _mesh_reconstruction_target_summary(self) -> dict[str, dict[str, Any]]:
+        summary: dict[str, dict[str, Any]] = {}
+        for target in sorted(MESH_TARGETS):
+            path = self._mesh_output_path(target)
+            mesh = self.reconstructed_meshes.get(target)
+            if target == "rock" and mesh is None:
+                mesh = self.mesh_processor.reconstructed_mesh
+            vertex_count = int(len(mesh.vertices)) if mesh is not None else 0
+            triangle_count = int(len(mesh.triangles)) if mesh is not None else 0
+            summary[target] = {
+                "completed": bool(path),
+                "path": path,
+                "method": "poisson" if target == "rock" else PEDESTAL_MESH_METHOD,
+                "vertex_count": vertex_count,
+                "triangle_count": triangle_count,
+            }
+        return summary
+
+    def _segmented_points_for_target(self, target: str) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+        if self.segmented_pcd is None or self.segmented_labels is None:
+            return (
+                np.empty((0, 3), dtype=float),
+                np.empty((0, 3), dtype=float),
+                None,
+                np.empty((0,), dtype=int),
+            )
+        points = np.asarray(self.segmented_pcd.points, dtype=float)
+        labels = np.asarray(self.segmented_labels, dtype=int).reshape(-1)
+        if points.ndim != 2 or points.shape[1] != 3 or len(labels) != len(points):
+            return (
+                np.empty((0, 3), dtype=float),
+                np.empty((0, 3), dtype=float),
+                None,
+                np.empty((0,), dtype=int),
+            )
+        label = 1 if target == "rock" else 0
+        indices = np.flatnonzero(labels == label).astype(int)
+        if len(indices) == 0:
+            return (
+                np.empty((0, 3), dtype=float),
+                np.empty((0, 3), dtype=float),
+                None,
+                np.empty((0,), dtype=int),
+            )
+        target_points = points[indices]
+        color = np.asarray([0.5, 0.5, 0.5] if target == "rock" else [0.10, 0.36, 0.95], dtype=float)
+        colors = np.tile(color, (len(target_points), 1))
+        normals = None
+        if self.segmented_pcd.has_normals():
+            segmented_normals = np.asarray(self.segmented_pcd.normals, dtype=float)
+            if segmented_normals.shape == points.shape:
+                normals = segmented_normals[indices]
+        return target_points, colors, normals, indices
+
+    def _combined_component_source(self, target: str) -> dict[str, Any]:
+        path = self._mesh_output_path(target)
+        mesh = self.reconstructed_meshes.get(target)
+        if target == "rock" and mesh is None:
+            mesh = self.mesh_processor.reconstructed_mesh
+        if mesh is None and path and Path(path).exists():
+            loaded = o3d.io.read_triangle_mesh(str(path))
+            if loaded is not None and len(loaded.triangles) > 0:
+                mesh = loaded
+                self.reconstructed_meshes[target] = loaded
+                if target == "rock":
+                    self.mesh_processor.reconstructed_mesh = loaded
+        if mesh is not None and path and Path(path).exists() and len(mesh.triangles) > 0:
+            vertices = np.asarray(mesh.vertices, dtype=float)
+            return {
+                "available": True,
+                "source": "mesh",
+                "vertex_count": int(len(vertices)),
+                "triangle_count": int(len(mesh.triangles)),
+                "bounds": _point_bounds(vertices) if len(vertices) else None,
+            }
+
+        points, _, _, _ = self._segmented_points_for_target(target)
+        if len(points):
+            return {
+                "available": True,
+                "source": "segmentation",
+                "point_count": int(len(points)),
+                "bounds": _point_bounds(points),
+            }
+        return {
+            "available": False,
+            "source": "none",
+            "point_count": 0,
+            "vertex_count": 0,
+            "triangle_count": 0,
+            "bounds": None,
+        }
+
+    def _combined_reconstruction_summary(self) -> dict[str, Any]:
+        components = {
+            target: self._combined_component_source(target)
+            for target in ["rock", "pedestal"]
+        }
+        return {
+            "available": all(component["available"] for component in components.values()),
+            "components": components,
+        }
+
+    def _set_reconstructed_mesh_state(
+        self,
+        target: str | None,
+        mesh: o3d.geometry.TriangleMesh | None,
+        path: str | Path | None,
+    ) -> None:
+        mesh_target = self._mesh_target(target)
+        path_str = str(path) if path is not None else None
+        self.reconstructed_meshes[mesh_target] = mesh
+        self.mesh_paths[mesh_target] = path_str
+        if mesh_target == "rock":
+            self.mesh_path = path_str
+            self.mesh_processor.reconstructed_mesh = mesh
+            self.status.mesh_completed = bool(path_str)
+
+    def _get_reconstructed_mesh_state(self, target: str | None = "rock") -> tuple[o3d.geometry.TriangleMesh, str]:
+        mesh_target = self._mesh_target(target)
+        mesh = self.reconstructed_meshes.get(mesh_target)
+        if mesh_target == "rock" and mesh is None:
+            mesh = self.mesh_processor.reconstructed_mesh
+        path = self._mesh_output_path(mesh_target)
+        if mesh is None and path:
+            loaded = o3d.io.read_triangle_mesh(str(path))
+            if loaded is not None and len(loaded.triangles) > 0:
+                mesh = loaded
+                self.reconstructed_meshes[mesh_target] = loaded
+                if mesh_target == "rock":
+                    self.mesh_processor.reconstructed_mesh = loaded
+        if mesh is None or not path:
+            raise ValueError(f"No reconstructed {mesh_target} mesh is available.")
+        return mesh, path
+
+    def _reset_mesh_outputs(self) -> None:
+        self.reconstructed_meshes = {"rock": None, "pedestal": None}
+        self.mesh_paths = {"rock": None, "pedestal": None}
+        self.mesh_processor.reconstructed_mesh = None
+        self.mesh_processor.temp_mesh_path = None
+        self.mesh_path = None
+        self.analysis_csv_path = None
+        self.analysis_results = None
+        self.status.mesh_completed = False
+        self.status.analysis_completed = False
+
+    def _sync_prepared_mesh_aliases(self) -> None:
+        self.prepared_mesh_data = self.prepared_mesh_states.get("rock")
+        self.normals_display_ready = bool(self.normals_display_ready_by_target.get("rock", False))
+        self.noise_removal_history = self.noise_removal_history_by_target.setdefault("rock", [])
+        self.status.mesh_prepared = any(bool(data) for data in self.prepared_mesh_states.values())
+
+    def _reset_prepared_mesh_states(self) -> None:
+        self.prepared_mesh_states = {"rock": None, "pedestal": None}
+        self.prepared_mesh_reset_previews = {"rock": None, "pedestal": None}
+        self.normals_display_ready_by_target = {"rock": False, "pedestal": False}
+        self.noise_removal_history_by_target = {"rock": [], "pedestal": []}
+        self._sync_prepared_mesh_aliases()
+
+    def _set_prepared_mesh_state(self, target: str | None, data: dict[str, Any] | None) -> None:
+        mesh_target = self._mesh_target(target)
+        self.prepared_mesh_states[mesh_target] = data
+        self.prepared_mesh_reset_previews[mesh_target] = None
+        if data is None:
+            self.normals_display_ready_by_target[mesh_target] = False
+            self.noise_removal_history_by_target[mesh_target] = []
+        self._sync_prepared_mesh_aliases()
+
+    def _set_prepared_mesh_reset_preview(self, target: str | None, data: dict[str, Any] | None) -> None:
+        mesh_target = self._mesh_target(target)
+        self.prepared_mesh_reset_previews[mesh_target] = data
+        self.normals_display_ready_by_target[mesh_target] = False
+        self._sync_prepared_mesh_aliases()
+
+    def _set_normals_display_ready(self, target: str | None, ready: bool) -> None:
+        mesh_target = self._mesh_target(target)
+        self.normals_display_ready_by_target[mesh_target] = bool(ready)
+        self._sync_prepared_mesh_aliases()
+
+    def _prepared_mesh_state(self, target: str | None = None) -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        data = self.prepared_mesh_states.get(mesh_target)
+        if not data and mesh_target == "rock" and self.prepared_mesh_data:
+            legacy_object_pcd = self.prepared_mesh_data.get("object_pcd") or self.prepared_mesh_data.get("rock_pcd")
+            legacy_interface_pcd = self.prepared_mesh_data.get("interface_pcd") or self.prepared_mesh_data.get("bottom_pcd")
+            if legacy_object_pcd is not None and legacy_interface_pcd is not None:
+                data = self._build_prepared_mesh_state(
+                    "rock",
+                    legacy_object_pcd,
+                    legacy_interface_pcd,
+                    self.prepared_mesh_data.get("preparation_result"),
+                )
+                if self.prepared_mesh_data.get("combined_points") is not None:
+                    data["combined_points"] = np.asarray(self.prepared_mesh_data["combined_points"], dtype=np.float64)
+                if self.prepared_mesh_data.get("combined_colors") is not None:
+                    data["combined_colors"] = np.asarray(self.prepared_mesh_data["combined_colors"], dtype=np.float64)
+                if self.prepared_mesh_data.get("combined_normals") is not None:
+                    data["combined_normals"] = np.asarray(self.prepared_mesh_data["combined_normals"], dtype=np.float64)
+                self.prepared_mesh_states["rock"] = data
+                self._sync_prepared_mesh_aliases()
+        if not data:
+            raise ValueError(f"Prepare the {mesh_target} mesh before using this operation.")
+        return data
+
+    def _visible_prepared_mesh_state(self, target: str | None = None) -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        data = self.prepared_mesh_reset_previews.get(mesh_target) or self.prepared_mesh_states.get(mesh_target)
+        if data:
+            return data
+        return self._prepared_mesh_state(mesh_target)
+
+    def _commit_prepared_mesh_reset_preview(self, target: str | None = None) -> bool:
+        mesh_target = self._mesh_target(target)
+        preview = self.prepared_mesh_reset_previews.get(mesh_target)
+        if not preview:
+            return False
+        self.prepared_mesh_states[mesh_target] = self._clone_prepared_mesh_state(preview)
+        self.prepared_mesh_reset_previews[mesh_target] = None
+        self.noise_removal_history_by_target[mesh_target] = []
+        self.normals_display_ready_by_target[mesh_target] = False
+        self._sync_prepared_mesh_aliases()
+        return True
+
+    def _prepared_mesh_history(self, target: str | None = None) -> list[dict[str, Any]]:
+        mesh_target = self._mesh_target(target)
+        return self.noise_removal_history_by_target.setdefault(mesh_target, [])
+
+    def _copy_point_cloud(self, pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+        points = np.asarray(pcd.points, dtype=np.float64).copy()
+        colors = np.asarray(pcd.colors, dtype=np.float64).copy() if pcd.has_colors() else np.full(points.shape, 0.5)
+        normals = np.asarray(pcd.normals, dtype=np.float64).copy() if pcd.has_normals() else None
+        return _make_point_cloud_with_normals(points, colors, normals)
+
+    def _clone_prepared_mesh_state(self, data: dict[str, Any]) -> dict[str, Any]:
+        object_pcd = self._copy_point_cloud(data["object_pcd"])
+        interface_pcd = self._copy_point_cloud(data["interface_pcd"])
+        combined_normals = data.get("combined_normals")
+        return {
+            **data,
+            "object_pcd": object_pcd,
+            "interface_pcd": interface_pcd,
+            "rock_pcd": object_pcd,
+            "bottom_pcd": interface_pcd,
+            "combined_points": np.asarray(data["combined_points"], dtype=np.float64).copy(),
+            "combined_colors": np.asarray(data["combined_colors"], dtype=np.float64).copy(),
+            "combined_normals": (
+                np.asarray(combined_normals, dtype=np.float64).copy()
+                if combined_normals is not None
+                else np.zeros_like(data["combined_points"])
+            ),
+        }
+
+    def _colorize_prepared_pcd(self, pcd: o3d.geometry.PointCloud, color: np.ndarray) -> o3d.geometry.PointCloud:
+        points = np.asarray(pcd.points)
+        pcd.colors = o3d.utility.Vector3dVector(np.tile(np.asarray(color, dtype=float), (len(points), 1)))
+        return pcd
+
+    def _build_prepared_mesh_state(
+        self,
+        target: str,
+        object_pcd: o3d.geometry.PointCloud,
+        interface_pcd: o3d.geometry.PointCloud,
+        preparation_result: Any = None,
+    ) -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        target_colors = MESH_TARGET_COLORS[mesh_target]
+        object_pcd = self._colorize_prepared_pcd(object_pcd, target_colors["object"])
+        interface_pcd = self._colorize_prepared_pcd(interface_pcd, target_colors["interface"])
+        object_points = np.asarray(object_pcd.points)
+        interface_points = np.asarray(interface_pcd.points)
+        combined_points = np.vstack((object_points, interface_points))
+        combined_colors = np.vstack((
+            np.asarray(object_pcd.colors),
+            np.asarray(interface_pcd.colors),
+        ))
+        object_normals = np.asarray(object_pcd.normals) if object_pcd.has_normals() else np.zeros_like(object_points)
+        interface_normals = (
+            np.asarray(interface_pcd.normals)
+            if interface_pcd.has_normals()
+            else np.zeros_like(interface_points)
+        )
+        combined_normals = np.vstack((object_normals, interface_normals))
+        return {
+            "target": mesh_target,
+            "object_label": mesh_target,
+            "interface_label": "interface_fill",
+            "object_pcd": object_pcd,
+            "interface_pcd": interface_pcd,
+            "rock_pcd": object_pcd,
+            "bottom_pcd": interface_pcd,
+            "combined_points": combined_points,
+            "combined_colors": combined_colors,
+            "combined_normals": combined_normals,
+            "preparation_result": preparation_result,
         }
 
     def _project_status_from_dict(self, status_data: dict[str, Any] | None) -> None:
@@ -554,13 +996,64 @@ class WebWorkflowSession:
             else np.empty((0,), dtype=np.int32)
         )
         arrays["voxel_branches_json"] = np.asarray([json.dumps(self.voxel_segmented_branches or [])])
+        _project_debug_log(
+            "segmented_state_write",
+            session_id=self.session_id,
+            current_file=self.current_pbr_file,
+            path=str(path),
+            keys=sorted(arrays.keys()),
+            segmented_points=_debug_array_summary(arrays.get("segmented_points")),
+            segmented_colors=_debug_array_summary(arrays.get("segmented_colors")),
+            segmented_labels=_debug_array_summary(arrays.get("labels"), label_values=True),
+            segmented_branch_ids=_debug_array_summary(arrays.get("segmented_branch_ids"), label_values=True),
+            segmented_branch_count=len(self.segmented_branches or []),
+            voxel_points=_debug_array_summary(arrays.get("voxel_segmented_points")),
+            voxel_colors=_debug_array_summary(arrays.get("voxel_segmented_colors")),
+            voxel_labels=_debug_array_summary(arrays.get("voxel_labels"), label_values=True),
+            voxel_branch_ids=_debug_array_summary(arrays.get("voxel_branch_ids"), label_values=True),
+            voxel_branch_count=len(self.voxel_segmented_branches or []),
+        )
         np.savez_compressed(path, **arrays)
 
     def _write_prepared_mesh_npz(self, path: Path) -> None:
         arrays: dict[str, np.ndarray] = {}
-        if self.prepared_mesh_data:
-            rock_pcd = self.prepared_mesh_data["rock_pcd"]
-            bottom_pcd = self.prepared_mesh_data["bottom_pcd"]
+        for target in ["rock", "pedestal"]:
+            data = self.prepared_mesh_states.get(target)
+            if not data:
+                continue
+            object_pcd = data["object_pcd"]
+            interface_pcd = data["interface_pcd"]
+            self._add_point_state(
+                arrays,
+                f"{target}_object",
+                np.asarray(object_pcd.points),
+                np.asarray(object_pcd.colors),
+                np.asarray(object_pcd.normals) if object_pcd.has_normals() else None,
+            )
+            self._add_point_state(
+                arrays,
+                f"{target}_interface",
+                np.asarray(interface_pcd.points),
+                np.asarray(interface_pcd.colors),
+                np.asarray(interface_pcd.normals) if interface_pcd.has_normals() else None,
+            )
+            self._add_point_state(
+                arrays,
+                f"{target}_combined",
+                data.get("combined_points"),
+                data.get("combined_colors"),
+                data.get("combined_normals"),
+            )
+            arrays[f"{target}_normal_display_ready"] = np.asarray(
+                [bool(self.normals_display_ready_by_target.get(target, False))],
+                dtype=bool,
+            )
+
+        # Legacy keys keep rock prepared state importable by older project archives/tools.
+        rock_data = self.prepared_mesh_states.get("rock")
+        if rock_data:
+            rock_pcd = rock_data["object_pcd"]
+            bottom_pcd = rock_data["interface_pcd"]
             self._add_point_state(
                 arrays,
                 "rock",
@@ -578,15 +1071,21 @@ class WebWorkflowSession:
             self._add_point_state(
                 arrays,
                 "combined",
-                self.prepared_mesh_data.get("combined_points"),
-                self.prepared_mesh_data.get("combined_colors"),
-                self.prepared_mesh_data.get("combined_normals"),
+                rock_data.get("combined_points"),
+                rock_data.get("combined_colors"),
+                rock_data.get("combined_normals"),
             )
         np.savez_compressed(path, **arrays)
 
-    def _restore_point_state(self, data: np.lib.npyio.NpzFile, prefix: str) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    def _restore_point_state(
+        self,
+        data: np.lib.npyio.NpzFile,
+        prefix: str,
+        *,
+        allow_empty: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         points = _npz_array(data, f"{prefix}_points")
-        if points is None or points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+        if points is None or points.ndim != 2 or points.shape[1] != 3 or (len(points) == 0 and not allow_empty):
             return None, None, None
         colors = _npz_array(data, f"{prefix}_colors")
         normals = _npz_array(data, f"{prefix}_normals")
@@ -616,6 +1115,21 @@ class WebWorkflowSession:
 
     def _restore_segmented_state_npz(self, path: Path) -> None:
         with np.load(path, allow_pickle=False) as data:
+            _project_debug_log(
+                "segmented_state_restore_read",
+                session_id=self.session_id,
+                current_file=self.current_pbr_file,
+                path=str(path),
+                keys=sorted(data.files),
+                segmented_points=_debug_array_summary(_npz_array(data, "segmented_points")),
+                segmented_colors=_debug_array_summary(_npz_array(data, "segmented_colors")),
+                segmented_labels=_debug_array_summary(_npz_array(data, "labels"), label_values=True),
+                segmented_branch_ids=_debug_array_summary(_npz_array(data, "segmented_branch_ids"), label_values=True),
+                voxel_points=_debug_array_summary(_npz_array(data, "voxel_segmented_points")),
+                voxel_colors=_debug_array_summary(_npz_array(data, "voxel_segmented_colors")),
+                voxel_labels=_debug_array_summary(_npz_array(data, "voxel_labels"), label_values=True),
+                voxel_branch_ids=_debug_array_summary(_npz_array(data, "voxel_branch_ids"), label_values=True),
+            )
             points, colors, normals = self._restore_point_state(data, "segmented")
             if points is not None:
                 self.segmented_pcd = _make_point_cloud_with_normals(points, colors, normals)
@@ -658,33 +1172,66 @@ class WebWorkflowSession:
                     self.voxel_segmented_branches = json.loads(str(branches_json.reshape(-1)[0]))
                 except (TypeError, json.JSONDecodeError):
                     self.voxel_segmented_branches = []
+        _project_debug_log(
+            "segmented_state_restore_complete",
+            session_id=self.session_id,
+            current_file=self.current_pbr_file,
+            segmented_pcd=_debug_pcd_summary(self.segmented_pcd),
+            segmented_labels=_debug_array_summary(self.segmented_labels, label_values=True),
+            segmented_branch_ids=_debug_array_summary(self.segmented_branch_ids, label_values=True),
+            segmented_branch_count=len(self.segmented_branches or []),
+            voxel_points=_debug_array_summary(self.voxel_segmented_points),
+            voxel_colors=_debug_array_summary(self.voxel_segmented_colors),
+            voxel_labels=_debug_array_summary(self.voxel_segmented_labels, label_values=True),
+            voxel_branch_ids=_debug_array_summary(self.voxel_segmented_branch_ids, label_values=True),
+            voxel_branch_count=len(self.voxel_segmented_branches or []),
+        )
 
     def _restore_prepared_mesh_npz(self, path: Path) -> None:
         with np.load(path, allow_pickle=False) as data:
-            rock_points, rock_colors, rock_normals = self._restore_point_state(data, "rock")
-            bottom_points, bottom_colors, bottom_normals = self._restore_point_state(data, "bottom")
-            if rock_points is None or bottom_points is None:
-                return
-            rock_pcd = _make_point_cloud_with_normals(rock_points, rock_colors, rock_normals)
-            bottom_pcd = _make_point_cloud_with_normals(bottom_points, bottom_colors, bottom_normals)
-            combined_points, combined_colors, combined_normals = self._restore_point_state(data, "combined")
-            if combined_points is None:
-                combined_points = np.vstack((rock_points, bottom_points))
-                combined_colors = np.vstack((
-                    np.full((len(rock_points), 3), [1.0, 0.0, 0.0]),
-                    np.full((len(bottom_points), 3), [0.0, 1.0, 0.0]),
-                ))
-                rock_normal_array = np.asarray(rock_pcd.normals) if rock_pcd.has_normals() else np.zeros_like(rock_points)
-                bottom_normal_array = np.asarray(bottom_pcd.normals) if bottom_pcd.has_normals() else np.zeros_like(bottom_points)
-                combined_normals = np.vstack((rock_normal_array, bottom_normal_array))
-            self.prepared_mesh_data = {
-                "rock_pcd": rock_pcd,
-                "bottom_pcd": bottom_pcd,
-                "combined_points": combined_points,
-                "combined_colors": combined_colors,
-                "combined_normals": combined_normals,
-                "preparation_result": None,
-            }
+            restored_any = False
+            for target in ["rock", "pedestal"]:
+                object_points, object_colors, object_normals = self._restore_point_state(data, f"{target}_object")
+                interface_points, interface_colors, interface_normals = self._restore_point_state(
+                    data,
+                    f"{target}_interface",
+                    allow_empty=True,
+                )
+                if object_points is None or interface_points is None:
+                    continue
+                object_pcd = _make_point_cloud_with_normals(object_points, object_colors, object_normals)
+                interface_pcd = _make_point_cloud_with_normals(interface_points, interface_colors, interface_normals)
+                state = self._build_prepared_mesh_state(target, object_pcd, interface_pcd, preparation_result=None)
+                combined_points, combined_colors, combined_normals = self._restore_point_state(data, f"{target}_combined")
+                if combined_points is not None:
+                    state.update({
+                        "combined_points": combined_points,
+                        "combined_colors": combined_colors,
+                        "combined_normals": combined_normals,
+                    })
+                self._set_prepared_mesh_state(target, state)
+                ready_value = _npz_array(data, f"{target}_normal_display_ready")
+                self.normals_display_ready_by_target[target] = bool(ready_value.reshape(-1)[0]) if ready_value is not None and ready_value.size else False
+                restored_any = True
+
+            if not restored_any:
+                rock_points, rock_colors, rock_normals = self._restore_point_state(data, "rock")
+                bottom_points, bottom_colors, bottom_normals = self._restore_point_state(data, "bottom")
+                if rock_points is None or bottom_points is None:
+                    self._sync_prepared_mesh_aliases()
+                    return
+                rock_pcd = _make_point_cloud_with_normals(rock_points, rock_colors, rock_normals)
+                bottom_pcd = _make_point_cloud_with_normals(bottom_points, bottom_colors, bottom_normals)
+                state = self._build_prepared_mesh_state("rock", rock_pcd, bottom_pcd, preparation_result=None)
+                combined_points, combined_colors, combined_normals = self._restore_point_state(data, "combined")
+                if combined_points is not None:
+                    state.update({
+                        "combined_points": combined_points,
+                        "combined_colors": combined_colors,
+                        "combined_normals": combined_normals,
+                    })
+                self._set_prepared_mesh_state("rock", state)
+            self._sync_prepared_mesh_aliases()
 
     def _write_marker_las(self, path: Path) -> None:
         pcd = self._require_pcd()
@@ -762,6 +1309,9 @@ class WebWorkflowSession:
                 "interface_preview_metadata": self.interface_preview_metadata,
                 "interface_edit_draft": self._serialize_interface_draft() if self.interface_edit_draft else None,
                 "normals_display_ready": self.normals_display_ready,
+                "normals_display_ready_by_target": dict(self.normals_display_ready_by_target),
+                "mesh_prepared_targets": self._prepared_mesh_target_summary(),
+                "analysis_results": self.analysis_results,
                 "summary": self.summary(),
             },
             "artifacts": artifacts,
@@ -810,7 +1360,7 @@ class WebWorkflowSession:
                 artifacts["segmented_state"] = {"path": "state/segmented_state.npz"}
 
             prepared_state: Path | None = None
-            if self.prepared_mesh_data:
+            if any(bool(data) for data in self.prepared_mesh_states.values()):
                 prepared_state = temp_dir / "prepared_mesh.npz"
                 self._write_prepared_mesh_npz(prepared_state)
                 artifacts["prepared_mesh_state"] = {"path": "state/prepared_mesh.npz"}
@@ -824,14 +1374,41 @@ class WebWorkflowSession:
             if self.segmented_pcd_file_path and Path(self.segmented_pcd_file_path).exists():
                 segmented_name = _safe_archive_name(Path(self.segmented_pcd_file_path).name, "segmented.las")
                 artifacts["segmented_point_cloud"] = {"path": f"assets/segmented/{segmented_name}", "filename": segmented_name}
-            if self.mesh_path and Path(self.mesh_path).exists():
-                mesh_name = _safe_archive_name(Path(self.mesh_path).name, "mesh.ply")
+            rock_mesh_path = self._mesh_output_path("rock")
+            pedestal_mesh_path = self._mesh_output_path("pedestal")
+            if rock_mesh_path and Path(rock_mesh_path).exists():
+                mesh_name = _safe_archive_name(Path(rock_mesh_path).name, "mesh.ply")
                 artifacts["mesh"] = {"path": f"assets/mesh/{mesh_name}", "filename": mesh_name}
+            if pedestal_mesh_path and Path(pedestal_mesh_path).exists():
+                pedestal_mesh_name = _safe_archive_name(Path(pedestal_mesh_path).name, "pedestal_mesh.ply")
+                artifacts["pedestal_mesh"] = {
+                    "path": f"assets/mesh/{pedestal_mesh_name}",
+                    "filename": pedestal_mesh_name,
+                }
             if self.analysis_csv_path and Path(self.analysis_csv_path).exists():
                 analysis_name = _safe_archive_name(Path(self.analysis_csv_path).name, "analysis.csv")
                 artifacts["analysis"] = {"path": f"assets/analysis/{analysis_name}", "filename": analysis_name}
 
             manifest = self._project_manifest({**(ui_state or {}), "project_filename": project_filename}, artifacts, app_build)
+            _project_debug_log(
+                "project_export_manifest",
+                session_id=self.session_id,
+                current_file=self.current_pbr_file,
+                archive_path=str(archive_path),
+                artifact_keys=sorted(artifacts.keys()),
+                has_segmented_state="segmented_state" in artifacts,
+                has_segmented_las="segmented_point_cloud" in artifacts,
+                status=self.status.__dict__,
+                segmented_pcd=_debug_pcd_summary(self.segmented_pcd),
+                segmented_labels=_debug_array_summary(self.segmented_labels, label_values=True),
+                segmented_branch_ids=_debug_array_summary(self.segmented_branch_ids, label_values=True),
+                segmented_branch_count=len(self.segmented_branches or []),
+                voxel_points=_debug_array_summary(self.voxel_segmented_points),
+                voxel_colors=_debug_array_summary(self.voxel_segmented_colors),
+                voxel_labels=_debug_array_summary(self.voxel_segmented_labels, label_values=True),
+                voxel_branch_ids=_debug_array_summary(self.voxel_segmented_branch_ids, label_values=True),
+                voxel_branch_count=len(self.voxel_segmented_branches or []),
+            )
 
             with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr("project.json", json.dumps(manifest, indent=2))
@@ -846,7 +1423,9 @@ class WebWorkflowSession:
                 if "segmented_point_cloud" in artifacts:
                     archive.write(Path(self.segmented_pcd_file_path), artifacts["segmented_point_cloud"]["path"])
                 if "mesh" in artifacts:
-                    archive.write(Path(self.mesh_path), artifacts["mesh"]["path"])
+                    archive.write(Path(rock_mesh_path), artifacts["mesh"]["path"])
+                if "pedestal_mesh" in artifacts:
+                    archive.write(Path(pedestal_mesh_path), artifacts["pedestal_mesh"]["path"])
                 if "analysis" in artifacts:
                     archive.write(Path(self.analysis_csv_path), artifacts["analysis"]["path"])
 
@@ -925,7 +1504,14 @@ class WebWorkflowSession:
                 "preview_metadata": deepcopy(draft.get("metadata", {}) or {}),
                 "history": [],
             }
-        self.normals_display_ready = bool(workflow_state.get("normals_display_ready", False))
+        ready_by_target = workflow_state.get("normals_display_ready_by_target")
+        if isinstance(ready_by_target, dict):
+            for target in MESH_TARGETS:
+                if target in ready_by_target:
+                    self.normals_display_ready_by_target[target] = bool(ready_by_target[target])
+        else:
+            self.normals_display_ready_by_target["rock"] = bool(workflow_state.get("normals_display_ready", False))
+        self._sync_prepared_mesh_aliases()
 
     def import_project(self, archive_path: Path) -> dict[str, Any]:
         try:
@@ -942,6 +1528,20 @@ class WebWorkflowSession:
 
                 artifacts = manifest.get("artifacts", {}) or {}
                 workflow_state = manifest.get("workflow_state", {}) or {}
+                _project_debug_log(
+                    "project_import_start",
+                    session_id=self.session_id,
+                    archive_path=str(archive_path),
+                    archive_members=sorted(names),
+                    artifact_keys=sorted(artifacts.keys()),
+                    artifact_paths={key: value.get("path") for key, value in artifacts.items() if isinstance(value, dict)},
+                    project_filename=manifest.get("project_filename"),
+                    ui_state=manifest.get("ui_state", {}) or {},
+                    workflow_status=workflow_state.get("status", {}) or {},
+                    workflow_summary=workflow_state.get("summary", {}) or {},
+                    has_segmented_state="segmented_state" in artifacts,
+                    has_segmented_las="segmented_point_cloud" in artifacts,
+                )
 
                 self.reset_runtime()
                 raw_path = self._copy_project_member(
@@ -992,6 +1592,7 @@ class WebWorkflowSession:
                 self.current_pbr_file = workflow_state.get("current_file") or self.current_pbr_file or "point_cloud"
                 self.epsg_code = workflow_state.get("epsg_code", self.epsg_code)
                 self._restore_interface_state(workflow_state)
+                self.analysis_results = workflow_state.get("analysis_results") or None
                 self._project_status_from_dict(workflow_state.get("status"))
 
                 segmented_path = self._copy_project_member(
@@ -1009,10 +1610,20 @@ class WebWorkflowSession:
                     f"{self.current_pbr_file}_mesh.ply",
                 )
                 if mesh_path is not None:
-                    self.mesh_path = str(mesh_path)
                     mesh = o3d.io.read_triangle_mesh(str(mesh_path))
                     if mesh is not None and len(mesh.triangles) > 0:
-                        self.mesh_processor.reconstructed_mesh = mesh
+                        self._set_reconstructed_mesh_state("rock", mesh, mesh_path)
+
+                pedestal_mesh_path = self._copy_project_member(
+                    archive,
+                    (artifacts.get("pedestal_mesh") or {}).get("path"),
+                    self.output_dir,
+                    f"{self.current_pbr_file}_pedestal_mesh.ply",
+                )
+                if pedestal_mesh_path is not None:
+                    pedestal_mesh = o3d.io.read_triangle_mesh(str(pedestal_mesh_path))
+                    if pedestal_mesh is not None and len(pedestal_mesh.triangles) > 0:
+                        self._set_reconstructed_mesh_state("pedestal", pedestal_mesh, pedestal_mesh_path)
 
                 analysis_path = self._copy_project_member(
                     archive,
@@ -1021,6 +1632,10 @@ class WebWorkflowSession:
                     f"{self.current_pbr_file}_analysis.csv",
                 )
                 self.analysis_csv_path = str(analysis_path) if analysis_path is not None else None
+                if self.analysis_results is None and self.analysis_csv_path:
+                    self.analysis_results = self._load_analysis_results_from_csv(
+                        Path(self.analysis_csv_path)
+                    )
 
                 if self.segmented_pcd is None or self.segmented_labels is None:
                     self.status.segmentation_ready = False
@@ -1028,17 +1643,38 @@ class WebWorkflowSession:
                     self.status.voxel_segmentation_ready = False
                 else:
                     self.status.voxel_segmentation_ready = True
-                if not self.prepared_mesh_data:
+                self._sync_prepared_mesh_aliases()
+                if not any(bool(data) for data in self.prepared_mesh_states.values()):
                     self.status.mesh_prepared = False
-                if not self.mesh_path:
+                else:
+                    self.status.mesh_prepared = True
+                if not self._mesh_output_path("rock"):
                     self.status.mesh_completed = False
                 if not self.analysis_csv_path:
                     self.status.analysis_completed = False
+                    self.analysis_results = None
                 self.status.point_cloud_loaded = True
                 self.status.seeds_ready = bool(self.rock_seeds and self.pedestal_seeds)
                 self.status.manual_interface_ready = self._has_manual_interface()
                 self.status.auto_interface_ready = bool(self.status.auto_interface_ready or self._has_auto_interface())
                 self.status.interface_ready = bool(self.status.manual_interface_ready or self.status.auto_interface_ready or (self.basal_points is not None and len(self.basal_points)))
+                _project_debug_log(
+                    "project_import_complete",
+                    session_id=self.session_id,
+                    archive_path=str(archive_path),
+                    current_file=self.current_pbr_file,
+                    summary=self.summary(),
+                    segmented_pcd=_debug_pcd_summary(self.segmented_pcd),
+                    segmented_labels=_debug_array_summary(self.segmented_labels, label_values=True),
+                    segmented_branch_ids=_debug_array_summary(self.segmented_branch_ids, label_values=True),
+                    segmented_branch_count=len(self.segmented_branches or []),
+                    voxel_points=_debug_array_summary(self.voxel_segmented_points),
+                    voxel_colors=_debug_array_summary(self.voxel_segmented_colors),
+                    voxel_labels=_debug_array_summary(self.voxel_segmented_labels, label_values=True),
+                    voxel_branch_ids=_debug_array_summary(self.voxel_segmented_branch_ids, label_values=True),
+                    voxel_branch_count=len(self.voxel_segmented_branches or []),
+                    segmented_las_path=self.segmented_pcd_file_path,
+                )
 
                 return {
                     "summary": self.summary(),
@@ -3310,6 +3946,221 @@ class WebWorkflowSession:
             path_indices = path_indices[(path_indices >= 0) & (path_indices < point_count)]
         return np.unique(path_indices.astype(int))
 
+    def _interface_metadata_snapshot(self) -> dict[str, Any]:
+        return {
+            "manual_basal_points": self.manual_basal_points.copy() if self.manual_basal_points is not None else None,
+            "manual_dense_basal_parts": [part.copy() for part in self.manual_dense_basal_parts],
+            "manual_dense_basal_parts_is_lateral": list(self.manual_dense_basal_parts_is_lateral),
+            "manual_basal_parts_metadata": deepcopy(self.manual_basal_parts_metadata),
+            "auto_basal_points": self.auto_basal_points.copy() if self.auto_basal_points is not None else None,
+            "auto_basal_parts_metadata": deepcopy(self.auto_basal_parts_metadata),
+            "basal_points": self.basal_points.copy() if self.basal_points is not None else None,
+            "dense_basal_parts": [part.copy() for part in self.dense_basal_parts],
+            "dense_basal_parts_is_lateral": list(self.dense_basal_parts_is_lateral),
+            "basal_parts_metadata": deepcopy(self.basal_parts_metadata),
+            "interface_source": self.interface_source,
+            "display_interface_source": self.display_interface_source,
+            "manual_interface_ready": bool(self.status.manual_interface_ready),
+            "auto_interface_ready": bool(self.status.auto_interface_ready),
+            "interface_ready": bool(self.status.interface_ready),
+        }
+
+    def _restore_interface_metadata_snapshot(self, snapshot: dict[str, Any] | None) -> None:
+        if not snapshot:
+            return
+        self.manual_basal_points = (
+            np.asarray(snapshot["manual_basal_points"], dtype=int).copy()
+            if snapshot.get("manual_basal_points") is not None
+            else None
+        )
+        self.manual_dense_basal_parts = [np.asarray(part, dtype=float).copy() for part in snapshot.get("manual_dense_basal_parts", [])]
+        self.manual_dense_basal_parts_is_lateral = list(snapshot.get("manual_dense_basal_parts_is_lateral", []))
+        self.manual_basal_parts_metadata = deepcopy(snapshot.get("manual_basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.auto_basal_points = (
+            np.asarray(snapshot["auto_basal_points"], dtype=int).copy()
+            if snapshot.get("auto_basal_points") is not None
+            else None
+        )
+        self.auto_basal_parts_metadata = deepcopy(snapshot.get("auto_basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.basal_points = (
+            np.asarray(snapshot["basal_points"], dtype=int).copy()
+            if snapshot.get("basal_points") is not None
+            else None
+        )
+        self.dense_basal_parts = [np.asarray(part, dtype=float).copy() for part in snapshot.get("dense_basal_parts", [])]
+        self.dense_basal_parts_is_lateral = list(snapshot.get("dense_basal_parts_is_lateral", []))
+        self.basal_parts_metadata = deepcopy(snapshot.get("basal_parts_metadata") or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        self.interface_source = snapshot.get("interface_source")
+        self.display_interface_source = snapshot.get("display_interface_source")
+        self.status.manual_interface_ready = bool(snapshot.get("manual_interface_ready"))
+        self.status.auto_interface_ready = bool(snapshot.get("auto_interface_ready"))
+        self.status.interface_ready = bool(snapshot.get("interface_ready"))
+
+    def _sync_interface_status_after_metadata_change(self) -> None:
+        self.status.manual_interface_ready = self._has_manual_interface()
+        self.status.auto_interface_ready = self._has_auto_interface()
+        self.status.interface_ready = bool(self.status.manual_interface_ready or self.status.auto_interface_ready)
+        if self.display_interface_source == "manual" and not self.status.manual_interface_ready:
+            self.display_interface_source = "auto" if self.status.auto_interface_ready else None
+        if self.display_interface_source == "auto" and not self.status.auto_interface_ready:
+            self.display_interface_source = "manual" if self.status.manual_interface_ready else None
+        if self.interface_source == "manual" and not self.status.manual_interface_ready:
+            self.interface_source = "auto" if self.status.auto_interface_ready else None
+        if self.interface_source == "auto" and not self.status.auto_interface_ready:
+            self.interface_source = "manual" if self.status.manual_interface_ready else None
+
+    def _filter_interface_metadata_removed_indices(
+        self,
+        metadata: dict[str, Any] | None,
+        removed: set[int],
+    ) -> tuple[dict[str, Any], list[np.ndarray], np.ndarray, int]:
+        pcd = self._require_pcd()
+        all_points = np.asarray(pcd.points, dtype=float)
+        updated = deepcopy(metadata or {
+            "parts": [],
+            "close_loop": False,
+            "num_parts": 0,
+            "has_lateral_parts": False,
+            "palette": [],
+        })
+        new_parts: list[dict[str, Any]] = []
+        dense_parts: list[np.ndarray] = []
+        all_indices: list[int] = []
+        removed_count = 0
+
+        for part in updated.get("parts", []) or []:
+            point_indices = np.asarray(part.get("point_indices", []) or part.get("selected_indices", []) or [], dtype=int)
+            point_indices = point_indices[(point_indices >= 0) & (point_indices < len(all_points))]
+            if len(point_indices) == 0:
+                continue
+
+            keep_mask = np.asarray([int(idx) not in removed for idx in point_indices], dtype=bool)
+            removed_count += int(np.count_nonzero(~keep_mask))
+            kept_indices = point_indices[keep_mask]
+            if len(kept_indices) == 0:
+                continue
+
+            dense_points = np.asarray(part.get("dense_points", []), dtype=float)
+            if dense_points.ndim == 2 and dense_points.shape[1] == 3 and len(dense_points) == len(point_indices):
+                kept_dense_points = dense_points[keep_mask]
+            else:
+                kept_dense_points = all_points[kept_indices]
+
+            selected_indices = self._unique_ordered_indices(part.get("selected_indices", []) or [])
+            selected_indices = [int(idx) for idx in selected_indices if int(idx) not in removed]
+            if len(kept_indices) >= 2:
+                sparse = self._sparse_part_from_remaining_path(kept_indices, selected_indices, bool(part.get("is_lateral", False)))
+                if sparse is not None:
+                    selected_indices = sparse["selected_indices"]
+            elif len(selected_indices) == 0:
+                selected_indices = kept_indices.astype(int).tolist()
+
+            filtered = deepcopy(part)
+            filtered["id"] = len(new_parts) + 1
+            filtered["selected_indices"] = selected_indices
+            filtered["original_points"] = all_points[np.asarray(selected_indices, dtype=int)].astype(float).tolist() if selected_indices else []
+            filtered["point_indices"] = kept_indices.astype(int).tolist()
+            filtered["dense_points"] = kept_dense_points.astype(float).tolist()
+            filtered["num_points"] = int(len(kept_indices))
+            new_parts.append(filtered)
+            dense_parts.append(kept_dense_points.astype(float))
+            all_indices.extend(kept_indices.astype(int).tolist())
+
+        new_metadata = {
+            **updated,
+            "parts": new_parts,
+            "close_loop": False if removed_count else bool(updated.get("close_loop", False)),
+            "num_parts": len(new_parts),
+            "has_lateral_parts": any(bool(part.get("is_lateral")) for part in new_parts),
+            "palette": updated.get("palette") or [list(color) for color in INTERFACE_PART_COLOR_CYCLE],
+        }
+        unique_indices = np.unique(np.asarray(all_indices, dtype=int)) if all_indices else np.asarray([], dtype=int)
+        return new_metadata, dense_parts, unique_indices, removed_count
+
+    def _remove_saved_interface_path_indices(self, source_indices: np.ndarray) -> int:
+        removed = {int(idx) for idx in np.asarray(source_indices, dtype=int).reshape(-1) if int(idx) >= 0}
+        if not removed:
+            return 0
+        display_state = self._display_interface_state()
+        source = str(display_state.get("source") if display_state else self.display_interface_source or self.interface_source or "manual")
+        if source == "auto":
+            metadata, dense_parts, basal_indices, removed_count = self._filter_interface_metadata_removed_indices(
+                self.auto_basal_parts_metadata,
+                removed,
+            )
+            self.auto_basal_parts_metadata = metadata
+            self.auto_basal_points = basal_indices
+            if self.display_interface_source == "auto" or self.interface_source == "auto":
+                self.basal_parts_metadata = deepcopy(metadata)
+                self.dense_basal_parts = [part.copy() for part in dense_parts]
+                self.dense_basal_parts_is_lateral = _metadata_lateral_flags(metadata)
+                self.basal_points = basal_indices.copy()
+        else:
+            metadata, dense_parts, basal_indices, removed_count = self._filter_interface_metadata_removed_indices(
+                self.manual_basal_parts_metadata,
+                removed,
+            )
+            self.manual_basal_parts_metadata = metadata
+            self.manual_dense_basal_parts = [part.copy() for part in dense_parts]
+            self.manual_dense_basal_parts_is_lateral = _metadata_lateral_flags(metadata)
+            self.manual_basal_points = basal_indices
+            if self.display_interface_source in {None, "manual"} or self.interface_source in {None, "manual"}:
+                self.basal_parts_metadata = deepcopy(metadata)
+                self.dense_basal_parts = [part.copy() for part in dense_parts]
+                self.dense_basal_parts_is_lateral = _metadata_lateral_flags(metadata)
+                self.basal_points = basal_indices.copy()
+                self.interface_source = "manual" if len(basal_indices) else self.interface_source
+                self.display_interface_source = "manual" if len(basal_indices) else self.display_interface_source
+
+        self._sync_interface_status_after_metadata_change()
+        return int(removed_count)
+
+    def _mesh_prepared_interface_path_arrays(
+        self,
+        start_index: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if self.pcd is None:
+            empty_points = np.empty((0, 3), dtype=float)
+            empty_indices = np.empty((0,), dtype=int)
+            return empty_points, empty_points.copy(), empty_points.copy(), empty_indices, empty_indices
+        interface_state = self._display_interface_state()
+        if not interface_state:
+            empty_points = np.empty((0, 3), dtype=float)
+            empty_indices = np.empty((0,), dtype=int)
+            return empty_points, empty_points.copy(), empty_points.copy(), empty_indices, empty_indices
+
+        all_points = np.asarray(self.pcd.points, dtype=float)
+        path_indices = np.asarray(interface_state.get("indices", []), dtype=int).reshape(-1)
+        path_indices = np.unique(path_indices[(path_indices >= 0) & (path_indices < len(all_points))])
+        if len(path_indices) == 0:
+            empty_points = np.empty((0, 3), dtype=float)
+            empty_indices = np.empty((0,), dtype=int)
+            return empty_points, empty_points.copy(), empty_points.copy(), empty_indices, empty_indices
+
+        path_points = all_points[path_indices]
+        path_colors = np.tile(np.asarray(INTERFACE_GREEN, dtype=float), (len(path_points), 1))
+        path_normals = self._estimate_local_normals(path_points)
+        payload_indices = np.arange(int(start_index), int(start_index) + len(path_points), dtype=int)
+        return path_points, path_colors, path_normals, payload_indices, path_indices.astype(int)
+
     @staticmethod
     def _sample_interface_indices(indices: np.ndarray, max_count: int = 500) -> np.ndarray:
         unique = np.unique(np.asarray(indices, dtype=int).reshape(-1))
@@ -3591,6 +4442,79 @@ class WebWorkflowSession:
             point_count,
         )
 
+    @staticmethod
+    def _is_pedestal_branch(branch: dict[str, Any]) -> bool:
+        class_label = str(branch.get("class_label", "")).strip().lower()
+        if class_label == "pedestal":
+            return True
+        try:
+            return int(branch.get("region_index")) == 0
+        except (TypeError, ValueError):
+            return str(branch.get("label", "")).strip().lower().startswith("pedestal")
+
+    def _pedestal_branch_options(self) -> list[dict[str, Any]]:
+        voxel_by_id: dict[int, dict[str, Any]] = {}
+        for branch in self._voxel_branch_summaries():
+            if not self._is_pedestal_branch(branch):
+                continue
+            try:
+                voxel_by_id[int(branch.get("branch_id"))] = branch
+            except (TypeError, ValueError):
+                continue
+
+        dense_by_id: dict[int, dict[str, Any]] = {}
+        for branch in self._segmented_branch_summaries():
+            if not self._is_pedestal_branch(branch):
+                continue
+            try:
+                dense_by_id[int(branch.get("branch_id"))] = branch
+            except (TypeError, ValueError):
+                continue
+
+        branch_ids = set(voxel_by_id) if voxel_by_id else set(dense_by_id)
+        options: list[dict[str, Any]] = []
+        for branch_id in sorted(branch_ids):
+            dense = dense_by_id.get(branch_id, {})
+            voxel = voxel_by_id.get(branch_id, {})
+            source = {**voxel, **dense}
+            options.append({
+                "branch_id": int(branch_id),
+                "label": source.get("label") or f"Pedestal seed {branch_id + 1}",
+                "class_label": "pedestal",
+                "seed_index": source.get("seed_index"),
+                "color": source.get("color") or BRANCH_COLOR_PALETTE[branch_id % len(BRANCH_COLOR_PALETTE)],
+                "rg_node_count": int(voxel.get("node_count", 0) or 0),
+                "dense_node_count": int(dense.get("node_count", 0) or 0),
+                "node_count": int(dense.get("node_count", voxel.get("node_count", 0)) or 0),
+            })
+        return options
+
+    def _selected_pedestal_rg_branch_points(self, selected_branch_ids: list[int]) -> np.ndarray:
+        if not selected_branch_ids:
+            return np.empty((0, 3), dtype=np.float64)
+
+        if (
+            self.voxel_segmented_points is None
+            or self.voxel_segmented_labels is None
+            or self.voxel_segmented_branch_ids is None
+        ):
+            raise ValueError("Selected pedestal seed branches require RG Result data. Run region growing first.")
+
+        voxel_points = np.asarray(self.voxel_segmented_points, dtype=np.float64)
+        voxel_labels = np.asarray(self.voxel_segmented_labels, dtype=int).reshape(-1)
+        voxel_branch_ids = np.asarray(self.voxel_segmented_branch_ids, dtype=int).reshape(-1)
+        if (
+            voxel_points.ndim != 2
+            or voxel_points.shape[1] != 3
+            or len(voxel_labels) != len(voxel_points)
+            or len(voxel_branch_ids) != len(voxel_points)
+        ):
+            raise ValueError("RG Result branch data is incomplete. Re-run region growing.")
+
+        selected = np.asarray(selected_branch_ids, dtype=int)
+        mask = np.isin(voxel_branch_ids, selected) & (voxel_labels == 0)
+        return voxel_points[np.flatnonzero(mask)]
+
     def _voxel_seed_markers(self) -> list[dict[str, Any]]:
         if self.voxel_segmented_points is None or len(self.voxel_segmented_points) == 0:
             return []
@@ -3690,13 +4614,14 @@ class WebWorkflowSession:
             return self.basal_parts_metadata
         return self.basal_points
 
-    def _invalidate_mesh_outputs(self) -> None:
-        self.mesh_processor.reconstructed_mesh = None
-        self.mesh_processor.temp_mesh_path = None
-        self.mesh_path = None
-        self.analysis_csv_path = None
-        self.status.mesh_completed = False
-        self.status.analysis_completed = False
+    def _invalidate_mesh_outputs(self, target: str | None = "rock") -> None:
+        mesh_target = self._mesh_target(target)
+        self._set_reconstructed_mesh_state(mesh_target, None, None)
+        if mesh_target == "rock":
+            self.mesh_processor.temp_mesh_path = None
+            self.analysis_csv_path = None
+            self.analysis_results = None
+            self.status.analysis_completed = False
 
     def _set_automatic_interface_from_segmentation(self, labels: np.ndarray | None = None) -> np.ndarray:
         label_source = labels if labels is not None else self.segmented_labels
@@ -3810,16 +4735,8 @@ class WebWorkflowSession:
         self.status.voxel_segmentation_ready = False
         self.status.segmentation_ready = False
         self.status.last_segmentation_mode = segmentation_mode
-        self.status.mesh_prepared = False
-        self.status.mesh_completed = False
-        self.status.analysis_completed = False
-        self.prepared_mesh_data = None
-        self.normals_display_ready = False
-        self.noise_removal_history = []
-        self.mesh_processor.reconstructed_mesh = None
-        self.mesh_processor.temp_mesh_path = None
-        self.mesh_path = None
-        self.analysis_csv_path = None
+        self._reset_prepared_mesh_states()
+        self._reset_mesh_outputs()
 
         self.segmenter = RegionGrowingSegmentation(
             pcd,
@@ -3899,16 +4816,8 @@ class WebWorkflowSession:
         self.segmented_labels = labels
         self.status.segmentation_ready = True
         self.status.last_segmentation_mode = segmentation_mode
-        self.status.mesh_prepared = False
-        self.status.mesh_completed = False
-        self.status.analysis_completed = False
-        self.prepared_mesh_data = None
-        self.normals_display_ready = False
-        self.noise_removal_history = []
-        self.mesh_processor.reconstructed_mesh = None
-        self.mesh_processor.temp_mesh_path = None
-        self.mesh_path = None
-        self.analysis_csv_path = None
+        self._reset_prepared_mesh_states()
+        self._reset_mesh_outputs()
         auto_interface_indices = np.asarray([], dtype=int)
         if not used_manual_interface_constraint:
             auto_interface_indices = self._set_automatic_interface_from_segmentation()
@@ -3933,15 +4842,14 @@ class WebWorkflowSession:
             "summary": self.summary(),
         }
 
-    def prepare_mesh(self) -> dict[str, Any]:
-        if self.segmented_pcd is None or self.segmented_labels is None:
-            raise ValueError("Run segmentation before preparing the mesh.")
-        pcd = self._require_pcd()
+    def _ensure_interface_for_mesh_preparation(self) -> None:
         if self.status.last_segmentation_mode == "icrg":
             self._activate_manual_interface_for_segmentation()
         elif self.interface_source == "manual" or self.basal_points is None or len(self.basal_points) == 0:
             self._set_automatic_interface_from_segmentation()
 
+    def _prepare_rock_mesh_state(self) -> tuple[dict[str, Any], int, int]:
+        pcd = self._require_pcd()
         result = self.mesh_processor.prepare_bottom_face(
             pcd,
             labels=self.segmented_labels,
@@ -3951,53 +4859,165 @@ class WebWorkflowSession:
             use_dbscan_cleaning=False,
             basal_parts_metadata=self.basal_parts_metadata,
         )
-        rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = self.mesh_processor.compute_normals_for_visualization(
+        object_pcd, interface_pcd, _, _, _ = self.mesh_processor.compute_normals_for_visualization(
             result.rock_points,
             result.bottom_points,
             k=int(_deep_get(self.config, "normals.k", 200)),
         )
-        self.prepared_mesh_data = {
-            "rock_pcd": rock_pcd,
-            "bottom_pcd": bottom_pcd,
-            "combined_points": combined_points,
-            "combined_colors": combined_colors,
-            "combined_normals": combined_normals,
-            "preparation_result": result,
+        state = self._build_prepared_mesh_state("rock", object_pcd, interface_pcd, result)
+        return state, int(len(object_pcd.points)), int(len(interface_pcd.points))
+
+    def _prepare_pedestal_mesh_state(
+        self,
+        *,
+        include_label_propagation_pedestal: bool | None = None,
+        pedestal_branch_ids: list[int] | None = None,
+    ) -> tuple[dict[str, Any], int, int, dict[str, Any]]:
+        if self.segmented_labels is None:
+            raise ValueError("Run segmentation before preparing the pedestal mesh.")
+        pcd = self._require_pcd()
+        points = np.asarray(pcd.points, dtype=np.float64)
+        labels = np.asarray(self.segmented_labels, dtype=int).reshape(-1)
+        if len(labels) != len(points):
+            raise ValueError("Segmented labels do not match the point cloud.")
+
+        selected_branch_ids = sorted({
+            int(value)
+            for value in (pedestal_branch_ids or [])
+            if isinstance(value, (int, np.integer)) or str(value).strip().lstrip("-").isdigit()
+        })
+        include_all = (
+            bool(include_label_propagation_pedestal)
+            if include_label_propagation_pedestal is not None
+            else not selected_branch_ids
+        )
+
+        object_sources: list[np.ndarray] = []
+        dense_point_count = 0
+        rg_point_count = 0
+        pedestal_mask = np.zeros(len(points), dtype=bool)
+        if include_all:
+            pedestal_mask |= labels == 0
+            pedestal_indices = np.flatnonzero(pedestal_mask)
+            if len(pedestal_indices):
+                dense_points = points[pedestal_indices]
+                dense_point_count = int(len(dense_points))
+                object_sources.append(dense_points)
+
+        if selected_branch_ids and not include_all:
+            rg_points = self._selected_pedestal_rg_branch_points(selected_branch_ids)
+            rg_point_count = int(len(rg_points))
+            if len(rg_points):
+                object_sources.append(rg_points)
+
+        if not object_sources:
+            raise ValueError("No pedestal/support points match the selected mesh preparation options.")
+
+        object_points = np.vstack(object_sources).astype(np.float64, copy=False)
+        normal_k = int(_deep_get(self.config, "normals.k", 200))
+        object_pcd = self._point_cloud_with_basic_normals(object_points, normal_k)
+        interface_pcd = o3d.geometry.PointCloud()
+        empty_points = np.empty((0, 3), dtype=np.float64)
+        interface_pcd.points = o3d.utility.Vector3dVector(empty_points)
+        interface_pcd.colors = o3d.utility.Vector3dVector(empty_points)
+        interface_pcd.normals = o3d.utility.Vector3dVector(empty_points)
+        state = self._build_prepared_mesh_state("pedestal", object_pcd, interface_pcd, preparation_result=None)
+        selection = {
+            "include_label_propagation_pedestal": bool(include_all),
+            "selected_pedestal_branch_ids": selected_branch_ids,
+            "selected_dense_point_count": dense_point_count,
+            "selected_rg_point_count": rg_point_count,
+            "selected_point_count": int(len(object_points)),
         }
-        self.normals_display_ready = False
-        self.status.mesh_prepared = True
-        self._invalidate_mesh_outputs()
-        normal_diagnostics = self._normal_diagnostics(combined_points, combined_normals)
+        return state, int(len(object_pcd.points)), int(len(interface_pcd.points)), selection
+
+    def prepare_mesh(
+        self,
+        target: str | None = "rock",
+        reset: bool = False,
+        include_label_propagation_pedestal: bool | None = None,
+        pedestal_branch_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        if self.segmented_pcd is None or self.segmented_labels is None:
+            raise ValueError("Run segmentation before preparing the mesh.")
+        mesh_target = self._mesh_target(target)
+        selection: dict[str, Any] = {}
+        existing_state = self.prepared_mesh_states.get(mesh_target)
+        if existing_state and not reset:
+            self.prepared_mesh_reset_previews[mesh_target] = None
+            self._sync_prepared_mesh_aliases()
+            normal_diagnostics = self._normal_diagnostics(existing_state["combined_points"], existing_state["combined_normals"])
+            return {
+                "target": mesh_target,
+                "loaded_existing": True,
+                "reset_preview": False,
+                "object_point_count": int(len(existing_state["object_pcd"].points)),
+                "interface_fill_point_count": int(len(existing_state["interface_pcd"].points)),
+                "rock_point_count": int(len(existing_state["object_pcd"].points)) if mesh_target == "rock" else 0,
+                "pedestal_point_count": int(len(existing_state["object_pcd"].points)) if mesh_target == "pedestal" else 0,
+                "bottom_point_count": int(len(existing_state["interface_pcd"].points)),
+                "normal_segment_count": normal_diagnostics["segment_count"],
+                "normal_diagnostics": normal_diagnostics,
+                "summary": self.summary(),
+            }
+        if mesh_target == "rock":
+            self._ensure_interface_for_mesh_preparation()
+            state, object_count, interface_count = self._prepare_rock_mesh_state()
+        else:
+            state, object_count, interface_count, selection = self._prepare_pedestal_mesh_state(
+                include_label_propagation_pedestal=include_label_propagation_pedestal,
+                pedestal_branch_ids=pedestal_branch_ids,
+            )
+        if reset:
+            self._set_prepared_mesh_reset_preview(mesh_target, state)
+        else:
+            self._set_prepared_mesh_state(mesh_target, state)
+            self._set_normals_display_ready(mesh_target, False)
+            self._prepared_mesh_history(mesh_target).clear()
+            self._invalidate_mesh_outputs(mesh_target)
+        normal_diagnostics = self._normal_diagnostics(state["combined_points"], state["combined_normals"])
         return {
-            "rock_point_count": int(len(rock_pcd.points)),
-            "bottom_point_count": int(len(bottom_pcd.points)),
+            "target": mesh_target,
+            "loaded_existing": False,
+            "reset_preview": bool(reset),
+            "object_point_count": object_count,
+            "interface_fill_point_count": interface_count,
+            "rock_point_count": object_count if mesh_target == "rock" else 0,
+            "pedestal_point_count": object_count if mesh_target == "pedestal" else 0,
+            "bottom_point_count": interface_count,
             "normal_segment_count": normal_diagnostics["segment_count"],
             "normal_diagnostics": normal_diagnostics,
+            **selection,
             "summary": self.summary(),
         }
 
-    def compute_normals(self, method: Literal["pymeshlab", "open3d"] = "pymeshlab", k: int = 200) -> dict[str, Any]:
-        if not self.prepared_mesh_data:
-            raise ValueError("Prepare the mesh before computing normals.")
-        rock_points = np.asarray(self.prepared_mesh_data["rock_pcd"].points)
-        bottom_points = np.asarray(self.prepared_mesh_data["bottom_pcd"].points)
-        rock_pcd, bottom_pcd, combined_points, combined_colors, combined_normals = self._compute_prepared_normals(
-            rock_points,
-            bottom_points,
+    def compute_normals(
+        self,
+        method: Literal["pymeshlab", "open3d"] = "pymeshlab",
+        k: int = 200,
+        target: str | None = "rock",
+    ) -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        preview_active = self.prepared_mesh_reset_previews.get(mesh_target) is not None
+        data = self._visible_prepared_mesh_state(mesh_target)
+        object_pcd, interface_pcd, combined_points, _, combined_normals = self._compute_prepared_normals(
+            np.asarray(data["object_pcd"].points),
+            np.asarray(data["interface_pcd"].points),
             method=method,
             k=k,
         )
-        self.prepared_mesh_data.update({
-            "rock_pcd": rock_pcd,
-            "bottom_pcd": bottom_pcd,
-            "combined_points": combined_points,
-            "combined_colors": combined_colors,
-            "combined_normals": combined_normals,
-        })
-        self.normals_display_ready = True
-        self._invalidate_mesh_outputs()
+        state = self._build_prepared_mesh_state(mesh_target, object_pcd, interface_pcd, data.get("preparation_result"))
+        if preview_active:
+            self.prepared_mesh_reset_previews[mesh_target] = state
+            self._sync_prepared_mesh_aliases()
+        else:
+            self._set_prepared_mesh_state(mesh_target, state)
+        self._set_normals_display_ready(mesh_target, True)
+        if not preview_active:
+            self._invalidate_mesh_outputs(mesh_target)
         normal_diagnostics = self._normal_diagnostics(combined_points, combined_normals)
         return {
+            "target": mesh_target,
             "method": method,
             "k": int(k),
             "normal_segment_count": normal_diagnostics["segment_count"],
@@ -4014,16 +5034,20 @@ class WebWorkflowSession:
         k: int | None = None,
     ) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud, np.ndarray, np.ndarray, np.ndarray]:
         normal_method = str(method or _deep_get(self.config, "normals.method", "pymeshlab")).lower()
+        object_points = np.asarray(rock_points, dtype=np.float64).reshape((-1, 3))
+        interface_points = np.asarray(bottom_points, dtype=np.float64).reshape((-1, 3))
+        normal_k = max(3, int(k if k is not None else _deep_get(self.config, "normals.k", 200)))
+        if len(interface_points) == 0:
+            return self._compute_basic_open3d_normals(object_points, interface_points, normal_k)
         if normal_method == "open3d":
             compute_fn = self.mesh_processor.compute_normals_for_visualization_separate
         else:
             compute_fn = self.mesh_processor.compute_normals_for_visualization
 
-        normal_k = max(3, int(k if k is not None else _deep_get(self.config, "normals.k", 200)))
         try:
             return compute_fn(
-                np.asarray(rock_points, dtype=np.float64),
-                np.asarray(bottom_points, dtype=np.float64),
+                object_points,
+                interface_points,
                 k=normal_k,
             )
         except Exception as exc:
@@ -4086,45 +5110,37 @@ class WebWorkflowSession:
 
     def _update_prepared_mesh_data(
         self,
+        target: str,
         rock_pcd: o3d.geometry.PointCloud,
         bottom_pcd: o3d.geometry.PointCloud,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        rock_points = np.asarray(rock_pcd.points)
-        bottom_points = np.asarray(bottom_pcd.points)
-        combined_points = np.vstack((rock_points, bottom_points))
-        combined_colors = np.vstack((
-            np.full((len(rock_points), 3), [1.0, 0.0, 0.0]),
-            np.full((len(bottom_points), 3), [0.0, 1.0, 0.0]),
-        ))
-        rock_normals = np.asarray(rock_pcd.normals) if rock_pcd.has_normals() else np.zeros_like(rock_points)
-        bottom_normals = np.asarray(bottom_pcd.normals) if bottom_pcd.has_normals() else np.zeros_like(bottom_points)
-        combined_normals = np.vstack((rock_normals, bottom_normals))
-        self.prepared_mesh_data.update({
-            "rock_pcd": rock_pcd,
-            "bottom_pcd": bottom_pcd,
-            "combined_points": combined_points,
-            "combined_colors": combined_colors,
-            "combined_normals": combined_normals,
-        })
-        return combined_points, combined_colors, combined_normals
+        state = self._build_prepared_mesh_state(
+            target,
+            rock_pcd,
+            bottom_pcd,
+            self._prepared_mesh_state(target).get("preparation_result"),
+        )
+        self._set_prepared_mesh_state(target, state)
+        return state["combined_points"], state["combined_colors"], state["combined_normals"]
 
     def remove_noise(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not self.prepared_mesh_data:
-            raise ValueError("Prepare the mesh before removing noise.")
         params = params or {}
+        mesh_target = self._mesh_target(params.get("target", "rock"))
+        self._commit_prepared_mesh_reset_preview(mesh_target)
+        data = self._prepared_mesh_state(mesh_target)
         method = str(params.get("method", "sor")).lower()
         if method not in {"sor", "dbscan", "sor_dbscan"}:
             raise ValueError("Denoise method must be 'sor', 'dbscan', or 'sor_dbscan'.")
-        self.noise_removal_history.append(dict(self.prepared_mesh_data))
+        self._prepared_mesh_history(mesh_target).append(self._clone_prepared_mesh_state(data))
 
-        rock_pcd = self.prepared_mesh_data["rock_pcd"]
-        bottom_pcd = self.prepared_mesh_data["bottom_pcd"]
-        initial_count = len(rock_pcd.points)
+        object_pcd = data["object_pcd"]
+        interface_pcd = data["interface_pcd"]
+        initial_count = len(object_pcd.points)
 
         if method in {"sor", "sor_dbscan"}:
             sor_neighbors = max(3, int(params.get("sor_neighbors", _deep_get(self.config, "filters.k_neighbors", 10))))
             sor_std_ratio = max(0.01, float(params.get("sor_std_ratio", _deep_get(self.config, "filters.std_ratio", 2.0))))
-            rock_pcd, _ = rock_pcd.remove_statistical_outlier(
+            object_pcd, _ = object_pcd.remove_statistical_outlier(
                 nb_neighbors=sor_neighbors,
                 std_ratio=sor_std_ratio,
             )
@@ -4135,8 +5151,8 @@ class WebWorkflowSession:
                 "dbscan_min_points",
                 _deep_get(self.config, "filters.cluster_dbscan_min_points", 20),
             )))
-            rock_pcd = self.mesh_processor.clean_outliers_dbscan(
-                rock_pcd,
+            object_pcd = self.mesh_processor.clean_outliers_dbscan(
+                object_pcd,
                 eps=dbscan_eps,
                 min_samples=dbscan_min_points,
                 return_inlier_indices=False,
@@ -4144,21 +5160,26 @@ class WebWorkflowSession:
 
         normal_method = str(params.get("normal_method", _deep_get(self.config, "normals.method", "pymeshlab"))).lower()
         normal_k = max(3, int(params.get("normal_k", _deep_get(self.config, "normals.k", 200))))
-        rock_pcd, bottom_pcd, combined_points, _, combined_normals = self._compute_prepared_normals(
-            np.asarray(rock_pcd.points),
-            np.asarray(bottom_pcd.points),
+        object_pcd, interface_pcd, combined_points, _, combined_normals = self._compute_prepared_normals(
+            np.asarray(object_pcd.points),
+            np.asarray(interface_pcd.points),
             method=normal_method,
             k=normal_k,
         )
-        self._update_prepared_mesh_data(rock_pcd, bottom_pcd)
-        self.normals_display_ready = False
-        self._invalidate_mesh_outputs()
+        self._update_prepared_mesh_data(mesh_target, object_pcd, interface_pcd)
+        self._set_normals_display_ready(mesh_target, False)
+        self._invalidate_mesh_outputs(mesh_target)
         normal_diagnostics = self._normal_diagnostics(combined_points, combined_normals)
         return {
+            "target": mesh_target,
             "method": method,
-            "initial_rock_point_count": int(initial_count),
-            "rock_point_count": int(len(rock_pcd.points)),
-            "removed_rock_point_count": int(max(0, initial_count - len(rock_pcd.points))),
+            "initial_object_point_count": int(initial_count),
+            "object_point_count": int(len(object_pcd.points)),
+            "removed_object_point_count": int(max(0, initial_count - len(object_pcd.points))),
+            "initial_rock_point_count": int(initial_count) if mesh_target == "rock" else 0,
+            "rock_point_count": int(len(object_pcd.points)) if mesh_target == "rock" else 0,
+            "removed_rock_point_count": int(max(0, initial_count - len(object_pcd.points))) if mesh_target == "rock" else 0,
+            "pedestal_point_count": int(len(object_pcd.points)) if mesh_target == "pedestal" else 0,
             "normal_method": normal_method,
             "normal_k": normal_k,
             "normal_segment_count": normal_diagnostics["segment_count"],
@@ -4166,72 +5187,260 @@ class WebWorkflowSession:
             "summary": self.summary(),
         }
 
-    def manual_remove_prepared_points(self, selected_indices: list[int]) -> dict[str, Any]:
-        if not self.prepared_mesh_data:
-            raise ValueError("Prepare the mesh before manually removing points.")
+    def manual_remove_prepared_points(self, selected_indices: list[int], target: str | None = "rock") -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        self._commit_prepared_mesh_reset_preview(mesh_target)
+        data = self._prepared_mesh_state(mesh_target)
         if not selected_indices:
             raise ValueError("Select at least one prepared point to remove.")
 
-        rock_pcd = self.prepared_mesh_data["rock_pcd"]
-        bottom_pcd = self.prepared_mesh_data["bottom_pcd"]
-        rock_count = len(rock_pcd.points)
-        bottom_count = len(bottom_pcd.points)
-        total_count = rock_count + bottom_count
-        initial_rock_count = int(rock_count)
-        initial_bottom_count = int(bottom_count)
+        object_pcd = data["object_pcd"]
+        interface_pcd = data["interface_pcd"]
+        object_count = len(object_pcd.points)
+        interface_count = len(interface_pcd.points)
+        combined_count = object_count + interface_count
+        path_source_indices = np.empty((0,), dtype=int)
+        if mesh_target == "rock":
+            _, _, _, _, path_source_indices = self._mesh_prepared_interface_path_arrays(combined_count)
+        total_count = combined_count + len(path_source_indices)
+        initial_object_count = int(object_count)
+        initial_interface_count = int(interface_count)
         selected = np.unique(np.asarray(selected_indices, dtype=int))
         valid = selected[(selected >= 0) & (selected < total_count)]
-        rock_removable = valid[valid < rock_count]
-        bottom_removable = valid[valid >= rock_count] - rock_count
+        object_removable = valid[valid < object_count]
+        interface_removable = valid[(valid >= object_count) & (valid < combined_count)] - object_count
+        path_removable_positions = valid[valid >= combined_count] - combined_count
+        path_removable_source_indices = (
+            path_source_indices[path_removable_positions]
+            if len(path_removable_positions)
+            else np.empty((0,), dtype=int)
+        )
         if len(valid) == 0:
             raise ValueError("The polygon did not select any removable prepared points.")
-        if rock_count > 0 and len(rock_removable) >= rock_count:
-            raise ValueError("Manual removal would remove all prepared rock points.")
-        if bottom_count > 0 and len(bottom_removable) >= bottom_count:
-            raise ValueError("Manual removal would remove all interpolated bottom-face points.")
+        if object_count > 0 and len(object_removable) >= object_count:
+            raise ValueError(f"Manual removal would remove all prepared {mesh_target} points.")
+        if interface_count > 0 and len(interface_removable) >= interface_count:
+            raise ValueError("Manual removal would remove all interface-fill points.")
 
-        self.noise_removal_history.append(dict(self.prepared_mesh_data))
-        rock_keep_indices = np.setdiff1d(np.arange(rock_count, dtype=int), rock_removable, assume_unique=False)
-        bottom_keep_indices = np.setdiff1d(np.arange(bottom_count, dtype=int), bottom_removable, assume_unique=False)
-        rock_pcd = rock_pcd.select_by_index(rock_keep_indices.astype(int).tolist())
-        bottom_pcd = bottom_pcd.select_by_index(bottom_keep_indices.astype(int).tolist())
-        self._update_prepared_mesh_data(rock_pcd, bottom_pcd)
-        self.normals_display_ready = False
-        self._invalidate_mesh_outputs()
+        history_state = self._clone_prepared_mesh_state(data)
+        if len(path_removable_source_indices):
+            history_state["__interface_metadata_snapshot"] = self._interface_metadata_snapshot()
+        self._prepared_mesh_history(mesh_target).append(history_state)
+        object_keep_indices = np.setdiff1d(np.arange(object_count, dtype=int), object_removable, assume_unique=False)
+        interface_keep_indices = np.setdiff1d(np.arange(interface_count, dtype=int), interface_removable, assume_unique=False)
+        object_pcd = object_pcd.select_by_index(object_keep_indices.astype(int).tolist())
+        interface_pcd = interface_pcd.select_by_index(interface_keep_indices.astype(int).tolist())
+        removed_interface_path_count = 0
+        if len(path_removable_source_indices):
+            removed_interface_path_count = self._remove_saved_interface_path_indices(path_removable_source_indices)
+        self._update_prepared_mesh_data(mesh_target, object_pcd, interface_pcd)
+        self._set_normals_display_ready(mesh_target, False)
+        self._invalidate_mesh_outputs(mesh_target)
+        remaining_interface_path_count = 0
+        if mesh_target == "rock":
+            _, _, _, _, remaining_path_indices = self._mesh_prepared_interface_path_arrays(
+                len(object_pcd.points) + len(interface_pcd.points)
+            )
+            remaining_interface_path_count = int(len(remaining_path_indices))
         return {
-            "removed_rock_point_count": int(len(rock_removable)),
-            "removed_interpolated_point_count": int(len(bottom_removable)),
+            "target": mesh_target,
+            "removed_object_point_count": int(len(object_removable)),
+            "removed_interface_fill_point_count": int(len(interface_removable)),
+            "removed_interface_path_point_count": int(removed_interface_path_count),
+            "removed_rock_point_count": int(len(object_removable)) if mesh_target == "rock" else 0,
+            "removed_interpolated_point_count": int(len(interface_removable)),
             "ignored_out_of_range_point_count": int(len(selected) - len(valid)),
-            "initial_rock_point_count": initial_rock_count,
-            "initial_interpolated_point_count": initial_bottom_count,
-            "rock_point_count": int(len(rock_pcd.points)),
-            "interpolated_point_count": int(len(bottom_pcd.points)),
+            "initial_object_point_count": initial_object_count,
+            "initial_interface_fill_point_count": initial_interface_count,
+            "initial_interface_path_point_count": int(len(path_source_indices)),
+            "initial_rock_point_count": initial_object_count if mesh_target == "rock" else 0,
+            "initial_interpolated_point_count": initial_interface_count,
+            "object_point_count": int(len(object_pcd.points)),
+            "interface_fill_point_count": int(len(interface_pcd.points)),
+            "interface_path_point_count": remaining_interface_path_count,
+            "rock_point_count": int(len(object_pcd.points)) if mesh_target == "rock" else 0,
+            "pedestal_point_count": int(len(object_pcd.points)) if mesh_target == "pedestal" else 0,
+            "interpolated_point_count": int(len(interface_pcd.points)),
             "summary": self.summary(),
         }
 
-    def undo_noise(self) -> dict[str, Any]:
-        if not self.noise_removal_history:
+    def select_height_above_ground_vegetation(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        params = params or {}
+        mesh_target = self._mesh_target(params.get("target", "pedestal"))
+        if mesh_target != "pedestal":
+            raise ValueError("Height Above Ground vegetation selection is only available for the pedestal target.")
+
+        data = self._visible_prepared_mesh_state(mesh_target)
+        object_points = np.asarray(data["object_pcd"].points, dtype=np.float64)
+        if len(object_points) == 0:
+            raise ValueError("No prepared pedestal points are available.")
+
+        grid_size = max(1e-6, float(params.get("grid_size", 0.05)))
+        height_threshold = max(0.0, float(params.get("height_threshold", 0.08)))
+        ground_percentile = float(np.clip(float(params.get("ground_percentile", 10.0)), 0.0, 100.0))
+        min_points_per_cell = max(1, int(params.get("min_points_per_cell", 3)))
+
+        xy = object_points[:, :2]
+        z = object_points[:, 2]
+        xy_min = np.min(xy, axis=0)
+        cells = np.floor((xy - xy_min) / grid_size).astype(np.int64)
+        grouped: dict[tuple[int, int], list[int]] = {}
+        for idx, cell in enumerate(cells):
+            grouped.setdefault((int(cell[0]), int(cell[1])), []).append(int(idx))
+
+        ground_by_cell: dict[tuple[int, int], float] = {}
+        for cell, indices in grouped.items():
+            if len(indices) >= min_points_per_cell:
+                ground_by_cell[cell] = float(np.percentile(z[np.asarray(indices, dtype=int)], ground_percentile))
+
+        global_ground = float(np.percentile(z, ground_percentile))
+        valid_cells = list(ground_by_cell.keys())
+        tree: cKDTree | None = None
+        valid_cell_array = np.empty((0, 2), dtype=float)
+        if valid_cells:
+            valid_cell_array = np.asarray(valid_cells, dtype=float)
+            tree = cKDTree(valid_cell_array)
+
+        ground_z = np.full(len(object_points), global_ground, dtype=np.float64)
+        for idx, cell in enumerate(cells):
+            key = (int(cell[0]), int(cell[1]))
+            if key in ground_by_cell:
+                ground_z[idx] = ground_by_cell[key]
+            elif tree is not None and len(valid_cell_array):
+                _, nearest_idx = tree.query(np.asarray([key], dtype=float), k=1)
+                nearest_key = valid_cells[int(np.asarray(nearest_idx).reshape(-1)[0])]
+                ground_z[idx] = ground_by_cell[nearest_key]
+
+        height_above_ground = z - ground_z
+        selected = np.flatnonzero(height_above_ground >= height_threshold).astype(int)
+        return {
+            "target": mesh_target,
+            "selected_indices": selected.tolist(),
+            "selected_count": int(len(selected)),
+            "point_count": int(len(object_points)),
+            "grid_size": grid_size,
+            "height_threshold": height_threshold,
+            "ground_percentile": ground_percentile,
+            "min_points_per_cell": min_points_per_cell,
+            "valid_ground_cell_count": int(len(valid_cells)),
+            "max_height_above_ground": float(np.max(height_above_ground)) if len(height_above_ground) else 0.0,
+            "summary": self.summary(),
+        }
+
+    def calculate_roughness(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        params = params or {}
+        mesh_target = self._mesh_target(params.get("target", "pedestal"))
+        if mesh_target != "pedestal":
+            raise ValueError("Roughness calculation is only available for the pedestal target.")
+
+        data = self._visible_prepared_mesh_state(mesh_target)
+        object_points = np.asarray(data["object_pcd"].points, dtype=np.float64)
+        if len(object_points) == 0:
+            raise ValueError("No prepared pedestal points are available.")
+
+        radius = max(1e-9, float(params.get("radius", 0.05)))
+        voxel_size = max(radius / 3.0, 1e-9)
+        min_neighbors = 3
+
+        voxel_keys = np.floor((object_points - np.min(object_points, axis=0)) / voxel_size).astype(np.int64)
+        grouped: dict[tuple[int, int, int], list[int]] = {}
+        for idx, key in enumerate(voxel_keys):
+            grouped.setdefault((int(key[0]), int(key[1]), int(key[2])), []).append(int(idx))
+        voxel_source_indices = list(grouped.values())
+        voxel_points = np.asarray(
+            [np.mean(object_points[np.asarray(indices, dtype=int)], axis=0) for indices in voxel_source_indices],
+            dtype=np.float64,
+        )
+        if len(voxel_points) == 0:
+            raise ValueError("No voxelized pedestal points are available.")
+
+        tree = cKDTree(voxel_points)
+        neighborhoods = tree.query_ball_point(voxel_points, r=radius)
+        voxel_roughness = np.full(len(voxel_points), np.nan, dtype=np.float64)
+        valid_count = 0
+        for idx, neighbor_indices in enumerate(neighborhoods):
+            if len(neighbor_indices) < min_neighbors:
+                continue
+            local_points = voxel_points[np.asarray(neighbor_indices, dtype=int)]
+            centroid = np.mean(local_points, axis=0)
+            centered = local_points - centroid
+            try:
+                _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            if len(singular_values) < 3 or not np.all(np.isfinite(singular_values)):
+                continue
+            normal = vh[-1]
+            normal_norm = np.linalg.norm(normal)
+            if normal_norm <= 1e-12:
+                continue
+            normal = normal / normal_norm
+            voxel_roughness[idx] = abs(float(np.dot(voxel_points[idx] - centroid, normal)))
+            valid_count += 1
+
+        _, nearest_voxel_indices = tree.query(object_points, k=1)
+        roughness = voxel_roughness[np.asarray(nearest_voxel_indices, dtype=int)]
+        finite = roughness[np.isfinite(roughness)]
+        roughness_values = [
+            float(value) if np.isfinite(value) else None
+            for value in roughness
+        ]
+        return {
+            "target": mesh_target,
+            "point_count": int(len(object_points)),
+            "radius": radius,
+            "voxel_size": voxel_size,
+            "voxel_point_count": int(len(voxel_points)),
+            "roughness_values": roughness_values,
+            "valid_roughness_count": int(valid_count),
+            "min_roughness": float(np.min(finite)) if len(finite) else 0.0,
+            "max_roughness": float(np.max(finite)) if len(finite) else 0.0,
+            "mean_roughness": float(np.mean(finite)) if len(finite) else 0.0,
+            "summary": self.summary(),
+        }
+
+    def undo_noise(self, target: str | None = "rock") -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        if self.prepared_mesh_reset_previews.get(mesh_target) is not None:
+            self.prepared_mesh_reset_previews[mesh_target] = None
+            self._sync_prepared_mesh_aliases()
+            if not self.prepared_mesh_states.get(mesh_target):
+                raise ValueError("No saved preparation is available after leaving the reset preview.")
+            return self.summary()
+        history = self._prepared_mesh_history(mesh_target)
+        if not history:
             raise ValueError("No noise removal step is available to undo.")
-        self.prepared_mesh_data = self.noise_removal_history.pop()
-        self.normals_display_ready = False
-        self._invalidate_mesh_outputs()
+        previous_state = history.pop()
+        metadata_snapshot = previous_state.pop("__interface_metadata_snapshot", None)
+        if metadata_snapshot is not None:
+            self._restore_interface_metadata_snapshot(metadata_snapshot)
+        self._set_prepared_mesh_state(mesh_target, previous_state)
+        self._set_normals_display_ready(mesh_target, False)
+        self._invalidate_mesh_outputs(mesh_target)
         return self.summary()
 
-    def prepared_normal_diagnostics(self) -> dict[str, Any]:
-        if not self.prepared_mesh_data:
-            raise ValueError("Prepare the mesh before inspecting normals.")
+    def prepared_normal_diagnostics(self, target: str | None = "rock") -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        data = self._visible_prepared_mesh_state(mesh_target)
         return self._normal_diagnostics(
-            self.prepared_mesh_data["combined_points"],
-            self.prepared_mesh_data.get("combined_normals"),
+            data["combined_points"],
+            data.get("combined_normals"),
         )
 
-    def reconstruct_mesh(self, depth: int = 8) -> dict[str, Any]:
-        if not self.prepared_mesh_data:
-            raise ValueError("Prepare the mesh before reconstruction.")
-        rock_pcd = self.prepared_mesh_data["rock_pcd"]
-        bottom_pcd = self.prepared_mesh_data["bottom_pcd"]
+    def reconstruct_mesh(self, depth: int = 8, target: str | None = "rock") -> dict[str, Any]:
+        mesh_target = self._mesh_target(target)
+        if mesh_target == "pedestal":
+            return self._reconstruct_pedestal_local_plane_filled_holes()
+        return self._reconstruct_rock_poisson(depth)
+
+    def _reconstruct_rock_poisson(self, depth: int = 8) -> dict[str, Any]:
+        rock_state = self.prepared_mesh_states.get("rock")
+        if not rock_state:
+            raise ValueError("Prepare the rock mesh before reconstruction.")
+        rock_pcd = rock_state["object_pcd"]
+        bottom_pcd = rock_state["interface_pcd"]
         if not rock_pcd.has_normals() or not bottom_pcd.has_normals():
-            raise ValueError("Compute normals before mesh reconstruction.")
+            raise ValueError("Compute rock normals before mesh reconstruction.")
 
         payload = {
             "rock_points": np.asarray(rock_pcd.points, dtype=np.float64).copy(),
@@ -4280,18 +5489,569 @@ class WebWorkflowSession:
 
         self.mesh_processor.reconstructed_mesh = mesh
         self.mesh_processor.temp_mesh_path = mesh_path
-        self.mesh_path = self.mesh_processor.save_mesh(self.output_dir / f"{self.current_pbr_file or 'point_cloud'}_mesh.ply")
-        self.status.mesh_completed = True
+        output_path = self.mesh_processor.save_mesh(self.output_dir / f"{self.current_pbr_file or 'point_cloud'}_mesh.ply")
+        self._set_reconstructed_mesh_state("rock", mesh, output_path)
         return {
+            "target": "rock",
+            "method": "poisson",
             "mesh_path": self.mesh_path,
             "vertex_count": int(len(mesh.vertices)),
             "triangle_count": int(len(mesh.triangles)),
             "summary": self.summary(),
         }
 
+    @staticmethod
+    def _pedestal_grid_resample(points: np.ndarray, grid_size: float, z_percentile: float = 50.0) -> np.ndarray:
+        origin = points[:, :2].min(axis=0)
+        cell = np.floor((points[:, :2] - origin) / grid_size).astype(np.int64)
+        _, inverse = np.unique(cell, axis=0, return_inverse=True)
+        out = np.zeros((int(inverse.max()) + 1, 3), dtype=np.float64)
+        for idx in range(len(out)):
+            group = points[inverse == idx]
+            out[idx, :2] = np.mean(group[:, :2], axis=0)
+            out[idx, 2] = float(np.percentile(group[:, 2], z_percentile))
+        return out
+
+    @staticmethod
+    def _pedestal_local_plane_fit_z(points: np.ndarray, radius: float, min_neighbors: int = 8) -> np.ndarray:
+        smoothed = points.copy()
+        tree = cKDTree(points[:, :2])
+        neighborhoods = tree.query_ball_point(points[:, :2], r=radius)
+        for idx, neighbors in enumerate(neighborhoods):
+            if len(neighbors) < min_neighbors:
+                continue
+            local = points[np.asarray(neighbors, dtype=int)]
+            design = np.c_[local[:, 0], local[:, 1], np.ones(len(local))]
+            try:
+                coeffs, *_ = np.linalg.lstsq(design, local[:, 2], rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            smoothed[idx, 2] = float(coeffs[0] * points[idx, 0] + coeffs[1] * points[idx, 1] + coeffs[2])
+        return smoothed
+
+    @staticmethod
+    def _pedestal_smoothstep(values: np.ndarray) -> np.ndarray:
+        values = np.clip(values, 0.0, 1.0)
+        return values * values * (3.0 - 2.0 * values)
+
+    @staticmethod
+    def _pedestal_smooth_valid_z_grid(z_grid: np.ndarray, valid: np.ndarray, sigma_cells: float) -> np.ndarray:
+        if sigma_cells <= 0:
+            return z_grid.copy()
+        valid = np.asarray(valid, dtype=bool)
+        z_grid = np.asarray(z_grid, dtype=np.float64)
+        finite_valid = valid & np.isfinite(z_grid)
+        if not np.any(finite_valid):
+            return z_grid.copy()
+
+        _, nearest_indices = distance_transform_edt(~finite_valid, return_indices=True)
+        filled = z_grid[tuple(nearest_indices)]
+        weights = valid.astype(np.float64)
+        smooth_values = gaussian_filter(np.where(valid, filled, 0.0) * weights, sigma_cells)
+        smooth_weights = gaussian_filter(weights, sigma_cells)
+        return np.divide(
+            smooth_values,
+            np.maximum(smooth_weights, 1e-12),
+            out=filled.copy(),
+        )
+
+    @staticmethod
+    def _pedestal_polynomial_design(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:
+        if degree >= 2:
+            return np.c_[np.ones_like(x), x, y, x * x, x * y, y * y]
+        return np.c_[np.ones_like(x), x, y]
+
+    def _pedestal_fit_polynomial_z(
+        self,
+        support_xy: np.ndarray,
+        support_z: np.ndarray,
+        query_xy: np.ndarray,
+        degree: int,
+    ) -> np.ndarray:
+        center = np.mean(support_xy, axis=0)
+        scale = max(float(np.max(np.linalg.norm(support_xy - center, axis=1))), 1e-9)
+        support_scaled = (support_xy - center) / scale
+        query_scaled = (query_xy - center) / scale
+        fit_degree = degree if len(support_xy) >= 8 else 1
+        design = self._pedestal_polynomial_design(support_scaled[:, 0], support_scaled[:, 1], fit_degree)
+        coeffs, *_ = np.linalg.lstsq(design, support_z, rcond=None)
+        query_design = self._pedestal_polynomial_design(query_scaled[:, 0], query_scaled[:, 1], fit_degree)
+        return np.asarray(query_design @ coeffs, dtype=np.float64)
+
+    def _pedestal_smooth_filled_holes(
+        self,
+        z_grid: np.ndarray,
+        xx: np.ndarray,
+        yy: np.ndarray,
+        measured_valid: np.ndarray,
+        filled_valid: np.ndarray,
+        hole_smooth_sigma_cells: float,
+        hole_feather_cells: float,
+        support_ring_cells: int,
+        surface_degree: int,
+    ) -> np.ndarray:
+        hole_mask = filled_valid & ~measured_valid
+        if not np.any(hole_mask):
+            return z_grid
+
+        filled_z = z_grid.copy()
+        finite_valid = filled_valid & np.isfinite(filled_z)
+        if not np.all(finite_valid[filled_valid]):
+            _, nearest_indices = distance_transform_edt(~finite_valid, return_indices=True)
+            filled_z = filled_z[tuple(nearest_indices)]
+
+        inpainted_z = filled_z.copy()
+        labels, count = label(hole_mask)
+        for component_id in range(1, count + 1):
+            component = labels == component_id
+            support = np.zeros_like(component, dtype=bool)
+            for ring_cells in (support_ring_cells, support_ring_cells * 2, support_ring_cells * 4):
+                support = binary_dilation(component, iterations=max(1, int(ring_cells))) & measured_valid & np.isfinite(filled_z)
+                if np.count_nonzero(support) >= 6:
+                    break
+            if np.count_nonzero(support) < 3:
+                continue
+
+            support_xy = np.c_[xx[support], yy[support]]
+            support_z = filled_z[support]
+            query_xy = np.c_[xx[component], yy[component]]
+            modeled_z = self._pedestal_fit_polynomial_z(support_xy, support_z, query_xy, degree=surface_degree)
+            inpainted_z[component] = modeled_z
+
+        if hole_smooth_sigma_cells > 0:
+            smoothed_z = self._pedestal_smooth_valid_z_grid(inpainted_z, filled_valid, hole_smooth_sigma_cells)
+        else:
+            smoothed_z = inpainted_z
+        distance_inside_hole = distance_transform_edt(hole_mask)
+        alpha = self._pedestal_smoothstep(distance_inside_hole / max(hole_feather_cells, 1e-12))
+
+        out = filled_z.copy()
+        out[hole_mask] = (
+            (1.0 - alpha[hole_mask]) * inpainted_z[hole_mask]
+            + alpha[hole_mask] * smoothed_z[hole_mask]
+        )
+        return out
+
+    def _pedestal_grid_surface_from_z_grid(
+        self,
+        xx: np.ndarray,
+        yy: np.ndarray,
+        z_grid: np.ndarray,
+        valid: np.ndarray,
+        smooth_sigma_cells: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        valid = np.asarray(valid, dtype=bool)
+        z_grid = np.asarray(z_grid, dtype=np.float64)
+        if not np.any(valid):
+            return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.int32)
+
+        filled = z_grid.copy()
+        finite_valid = valid & np.isfinite(filled)
+        if not np.all(finite_valid[valid]):
+            if not np.any(finite_valid):
+                return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.int32)
+            _, nearest_indices = distance_transform_edt(~finite_valid, return_indices=True)
+            filled = filled[tuple(nearest_indices)]
+
+        if smooth_sigma_cells > 0:
+            weights = valid.astype(np.float64)
+            smooth_values = gaussian_filter(np.where(valid, filled, 0.0) * weights, smooth_sigma_cells)
+            smooth_weights = gaussian_filter(weights, smooth_sigma_cells)
+            z_smooth = np.divide(
+                smooth_values,
+                np.maximum(smooth_weights, 1e-12),
+                out=filled.copy(),
+            )
+        else:
+            z_smooth = filled
+
+        index_grid = -np.ones(xx.shape, dtype=np.int64)
+        valid_positions = np.argwhere(valid)
+        vertices: list[list[float]] = []
+        for vertex_index, (row, col) in enumerate(valid_positions):
+            index_grid[row, col] = vertex_index
+            vertices.append([float(xx[row, col]), float(yy[row, col]), float(z_smooth[row, col])])
+        vertices_arr = np.asarray(vertices, dtype=np.float64)
+
+        triangles: list[list[int]] = []
+        rows, cols = valid.shape
+        for row in range(rows - 1):
+            for col in range(cols - 1):
+                v00 = int(index_grid[row, col])
+                v10 = int(index_grid[row, col + 1])
+                v01 = int(index_grid[row + 1, col])
+                v11 = int(index_grid[row + 1, col + 1])
+                if v00 >= 0 and v10 >= 0 and v11 >= 0:
+                    triangles.append([v00, v10, v11])
+                if v00 >= 0 and v11 >= 0 and v01 >= 0:
+                    triangles.append([v00, v11, v01])
+        return vertices_arr, np.asarray(triangles, dtype=np.int32)
+
+    def _pedestal_heightfield_surface(
+        self,
+        points: np.ndarray,
+        grid_size: float,
+        smooth_sigma_cells: float = 0.8,
+        max_nearest_distance: float | None = None,
+        fill_internal_holes: bool = True,
+        hole_smooth_sigma_cells: float = 1.5,
+        hole_feather_cells: float = 2.0,
+        hole_support_ring_cells: int = 6,
+        hole_surface_degree: int = 2,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        max_nearest_distance = max_nearest_distance or grid_size * 1.75
+        xy = points[:, :2]
+        min_xy = xy.min(axis=0) - grid_size
+        max_xy = xy.max(axis=0) + grid_size
+        xs = np.arange(min_xy[0], max_xy[0] + grid_size * 0.5, grid_size)
+        ys = np.arange(min_xy[1], max_xy[1] + grid_size * 0.5, grid_size)
+        xx, yy = np.meshgrid(xs, ys)
+        query_xy = np.c_[xx.ravel(), yy.ravel()]
+
+        try:
+            delaunay = Delaunay(xy)
+        except QhullError as exc:
+            raise ValueError("Pedestal local-plane reconstruction failed because points are not triangulatable in XY.") from exc
+        inside = delaunay.find_simplex(query_xy) >= 0
+        tree = cKDTree(xy)
+        nearest_dist, _ = tree.query(query_xy, k=1)
+        near_data = nearest_dist <= max_nearest_distance
+
+        linear = LinearNDInterpolator(xy, points[:, 2], fill_value=np.nan)
+        nearest = NearestNDInterpolator(xy, points[:, 2])
+        z = np.asarray(linear(query_xy), dtype=np.float64)
+        missing = ~np.isfinite(z)
+        z[missing] = nearest(query_xy[missing])
+
+        measured_valid = (inside & near_data).reshape(xx.shape)
+        if np.count_nonzero(measured_valid) < 3:
+            measured_valid = inside.reshape(xx.shape)
+        valid = measured_valid
+        if fill_internal_holes:
+            valid = binary_fill_holes(valid)
+        z_grid = z.reshape(xx.shape)
+        if fill_internal_holes and hole_smooth_sigma_cells > 0:
+            z_grid = self._pedestal_smooth_filled_holes(
+                z_grid,
+                xx=xx,
+                yy=yy,
+                measured_valid=measured_valid,
+                filled_valid=valid,
+                hole_smooth_sigma_cells=hole_smooth_sigma_cells,
+                hole_feather_cells=hole_feather_cells,
+                support_ring_cells=hole_support_ring_cells,
+                surface_degree=hole_surface_degree,
+            )
+        surface_points, surface_triangles = self._pedestal_grid_surface_from_z_grid(xx, yy, z_grid, valid, smooth_sigma_cells)
+        if len(surface_triangles) == 0 and np.any(inside):
+            surface_points, surface_triangles = self._pedestal_grid_surface_from_z_grid(
+                xx,
+                yy,
+                z_grid,
+                inside.reshape(xx.shape),
+                smooth_sigma_cells,
+            )
+        return surface_points, surface_triangles
+
+    def _reconstruct_pedestal_local_plane_filled_holes(self) -> dict[str, Any]:
+        pedestal_state = self.prepared_mesh_states.get("pedestal")
+        if not pedestal_state:
+            raise ValueError("Prepare the pedestal mesh before pedestal surface reconstruction.")
+        pedestal_pcd = pedestal_state["object_pcd"]
+        points = np.asarray(pedestal_pcd.points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
+            raise ValueError("At least three prepared pedestal points are required for pedestal surface reconstruction.")
+
+        finite_mask = np.all(np.isfinite(points), axis=1)
+        points = points[finite_mask]
+        if len(points) < 3:
+            raise ValueError("At least three finite pedestal points are required for pedestal surface reconstruction.")
+
+        xy = points[:, :2]
+        if np.linalg.matrix_rank(xy - np.mean(xy, axis=0)) < 2:
+            raise ValueError("Pedestal surface reconstruction requires pedestal points that span an XY area.")
+        xy_nn = cKDTree(xy).query(xy, k=2)[0][:, 1]
+        finite_spacing = xy_nn[np.isfinite(xy_nn) & (xy_nn > 0)]
+        median_spacing = float(np.median(finite_spacing)) if len(finite_spacing) else 0.025
+        p95_spacing = float(np.percentile(finite_spacing, 95)) if len(finite_spacing) else median_spacing
+        extent_xy = np.ptp(xy, axis=0)
+        max_extent = float(np.max(extent_xy))
+        grid_candidate = max(0.025, p95_spacing * 4.0)
+        grid_cap = max(0.005, max_extent / 40.0) if max_extent > 0 else grid_candidate
+        grid_size = min(grid_candidate, grid_cap)
+        local_radius = max(grid_size * 3.0, 0.075)
+        max_edge = max(grid_size * 2.8, 0.07)
+        hole_smooth_sigma_cells = 1.5
+        hole_feather_cells = 2.0
+        hole_support_ring_cells = 6
+        hole_surface_degree = 2
+
+        grid_points = self._pedestal_grid_resample(points, grid_size=grid_size, z_percentile=50.0)
+        if len(grid_points) < 3:
+            raise ValueError("Pedestal local-plane reconstruction produced too few grid samples.")
+        local_points = self._pedestal_local_plane_fit_z(grid_points, radius=local_radius)
+        surface_points, surface_triangles = self._pedestal_heightfield_surface(
+            local_points,
+            grid_size=grid_size,
+            smooth_sigma_cells=0.8,
+            max_nearest_distance=max_edge,
+            fill_internal_holes=True,
+            hole_smooth_sigma_cells=hole_smooth_sigma_cells,
+            hole_feather_cells=hole_feather_cells,
+            hole_support_ring_cells=hole_support_ring_cells,
+            hole_surface_degree=hole_surface_degree,
+        )
+        if len(surface_points) < 3 or len(surface_triangles) == 0:
+            raise ValueError("Pedestal local-plane filled-hole reconstruction produced no valid mesh surface.")
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(surface_points)
+        mesh.triangles = o3d.utility.Vector3iVector(surface_triangles)
+        mesh.compute_vertex_normals()
+        mesh.compute_triangle_normals()
+        mesh.paint_uniform_color([0.55, 0.57, 0.55])
+
+        output_path = self.output_dir / f"{self.current_pbr_file or 'point_cloud'}_pedestal_local_plane_filled_holes_mesh.ply"
+        o3d.io.write_triangle_mesh(str(output_path), mesh)
+        self._set_reconstructed_mesh_state("pedestal", mesh, output_path)
+        return {
+            "target": "pedestal",
+            "method": PEDESTAL_MESH_METHOD,
+            "method_label": PEDESTAL_MESH_METHOD_LABEL,
+            "mesh_path": str(output_path),
+            "vertex_count": int(len(mesh.vertices)),
+            "triangle_count": int(len(mesh.triangles)),
+            "source_point_count": int(len(points)),
+            "grid_point_count": int(len(grid_points)),
+            "surface_point_count": int(len(surface_points)),
+            "grid_size": grid_size,
+            "local_plane_radius": local_radius,
+            "max_triangle_edge": max_edge,
+            "hole_smooth_sigma_cells": hole_smooth_sigma_cells,
+            "hole_feather_cells": hole_feather_cells,
+            "hole_support_ring_cells": hole_support_ring_cells,
+            "hole_surface_degree": hole_surface_degree,
+            "summary": self.summary(),
+        }
+
+    @staticmethod
+    def _analysis_vector(results: dict[str, Any] | None, key: str) -> np.ndarray | None:
+        if not results or key not in results:
+            return None
+        try:
+            vector = np.asarray(results[key], dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if vector.size < 3 or not np.all(np.isfinite(vector[:3])):
+            return None
+        return vector[:3]
+
+    @staticmethod
+    def _analysis_float(results: dict[str, Any] | None, key: str) -> float | None:
+        if not results or key not in results:
+            return None
+        try:
+            value = float(results[key])
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
+    @staticmethod
+    def _analysis_value_from_csv(value: str) -> Any:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            try:
+                return float(text)
+            except ValueError:
+                return text
+
+    def _load_analysis_results_from_csv(self, csv_path: Path) -> dict[str, Any] | None:
+        if not csv_path.exists():
+            return None
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))
+        except Exception as exc:
+            logging.warning("Could not read analysis CSV for analysis view: %s", exc)
+            return None
+        if not rows:
+            return None
+        row = rows[-1]
+        for candidate in reversed(rows):
+            if str(candidate.get("pbr_name", "")) == str(self.current_pbr_file or ""):
+                row = candidate
+                break
+        keys = [
+            "center_of_mass",
+            "height",
+            "width",
+            "length",
+            "major_orientations",
+            "height_width_ratio",
+            "height_width_face",
+            "length_width_ratio",
+            "length_width_face",
+            "alpha_angle",
+            "alpha_rectangular",
+            "beta_angle",
+        ]
+        restored = {
+            key: self._analysis_value_from_csv(row[key])
+            for key in keys
+            if key in row and row[key] not in (None, "")
+        }
+        return restored or None
+
+    def _analysis_view_payload(self, mesh_url: str | None) -> dict[str, Any]:
+        self._get_reconstructed_mesh_state("rock")
+        if not self.status.analysis_completed or not self.analysis_results:
+            raise ValueError("Run analysis before opening the analysis view.")
+
+        mesh, _ = self._get_reconstructed_mesh_state("rock")
+
+        vertices = np.asarray(mesh.vertices, dtype=float)
+        mesh_bounds = _point_bounds(vertices)
+        extent = np.asarray(mesh_bounds["max"], dtype=float) - np.asarray(mesh_bounds["min"], dtype=float)
+        diagonal = float(np.linalg.norm(extent))
+        if not np.isfinite(diagonal) or diagonal <= 0:
+            diagonal = 1.0
+
+        results = self.analysis_results
+        center_of_mass = self._analysis_vector(results, "center_of_mass")
+        alpha_point = self._analysis_vector(results, "min_alpha_basal_point")
+        if alpha_point is None and self.basal_points is not None and len(self.basal_points) > 0:
+            alpha_point = np.asarray(self._require_pcd().points)[int(self.basal_points[0])]
+        if center_of_mass is None:
+            raise ValueError("Analysis results do not include a center of mass.")
+
+        triangle_count = max(1, len(mesh.triangles))
+        sample_count = int(np.clip(max(len(vertices) * 2, triangle_count * 2), 6000, 90000))
+        try:
+            sampled_pcd = mesh.sample_points_uniformly(
+                number_of_points=sample_count,
+                use_triangle_normal=False,
+            )
+        except TypeError:
+            sampled_pcd = mesh.sample_points_uniformly(number_of_points=sample_count)
+        sampled_points = np.asarray(sampled_pcd.points, dtype=float)
+        if sampled_points.ndim != 2 or sampled_points.shape[1] != 3 or len(sampled_points) == 0:
+            sampled_points = vertices
+
+        sampled_normals = np.asarray(sampled_pcd.normals, dtype=float) if sampled_pcd.has_normals() else None
+        if sampled_normals is None or sampled_normals.shape != sampled_points.shape:
+            temp_pcd = o3d.geometry.PointCloud()
+            temp_pcd.points = o3d.utility.Vector3dVector(sampled_points)
+            try:
+                temp_pcd.estimate_normals(
+                    search_param=o3d.geometry.KDTreeSearchParamKNN(knn=min(30, max(3, len(sampled_points))))
+                )
+                sampled_normals = np.asarray(temp_pcd.normals, dtype=float)
+            except RuntimeError:
+                sampled_normals = None
+        if sampled_normals is None or sampled_normals.shape != sampled_points.shape:
+            sampled_normals = np.zeros_like(sampled_points)
+            sampled_normals[:, 2] = 1.0
+
+        granite_base = np.array([0.54, 0.56, 0.54], dtype=float)
+        warm_mineral = np.array([0.64, 0.61, 0.55], dtype=float)
+        cool_mineral = np.array([0.42, 0.46, 0.48], dtype=float)
+        color_phase = sampled_points @ np.array([12.9898, 78.233, 37.719], dtype=float)
+        grain = np.mod(np.sin(color_phase) * 43758.5453, 1.0)
+        fine = np.mod(np.sin(color_phase * 2.37 + 19.19) * 24634.6345, 1.0)
+        sampled_colors = granite_base[None, :] * (1.0 - grain[:, None] * 0.26) + warm_mineral[None, :] * (grain[:, None] * 0.26)
+        cool_mask = grain > 0.72
+        sampled_colors[cool_mask] = sampled_colors[cool_mask] * 0.62 + cool_mineral[None, :] * 0.38
+        dark_mask = fine > 0.90
+        sampled_colors[dark_mask] = sampled_colors[dark_mask] * 0.45 + np.array([0.22, 0.23, 0.23]) * 0.55
+        light_mask = fine > 0.975
+        sampled_colors[light_mask] = sampled_colors[light_mask] * 0.55 + np.array([0.82, 0.81, 0.76]) * 0.45
+        sampled_colors = np.clip(sampled_colors, 0.0, 1.0)
+
+        gravity_axis = np.array([0.0, 0.0, -1.0])
+        gravity_length = max(0.1, diagonal * 0.6)
+        gravity_start = center_of_mass
+        gravity_end = center_of_mass + gravity_axis * gravity_length
+
+        analysis_markers = [
+            {
+                "index": -1,
+                "point": center_of_mass.astype(float).tolist(),
+                "color": [1.0, 0.86, 0.05],
+                "label": "Center of Mass",
+            },
+        ]
+        segments = [
+            {
+                "start": gravity_start.astype(float).tolist(),
+                "end": gravity_end.astype(float).tolist(),
+                "color": [0.10, 0.45, 1.0],
+                "label": "Gravity direction (-Z)",
+            },
+        ]
+        bounds_points = [vertices, gravity_start.reshape(1, 3), gravity_end.reshape(1, 3)]
+        if alpha_point is not None:
+            analysis_markers.append({
+                "index": -2,
+                "point": alpha_point.astype(float).tolist(),
+                "color": [1.0, 0.92, 0.18],
+                "label": "Alpha rocking point",
+            })
+            segments.append({
+                "start": center_of_mass.astype(float).tolist(),
+                "end": alpha_point.astype(float).tolist(),
+                "color": [1.0, 0.82, 0.0],
+                "label": "COM to alpha rocking point",
+            })
+            bounds_points.append(alpha_point.reshape(1, 3))
+
+        def metric(label: str, key: str, digits: int = 3, suffix: str = "") -> dict[str, str]:
+            value = self._analysis_float(results, key)
+            formatted = "--" if value is None else f"{value:.{digits}f}{suffix}"
+            return {"label": label, "value": formatted}
+
+        analysis_summary = {
+            "title": f"Analysis - {self.current_pbr_file or 'point cloud'}",
+            "metrics": [
+                metric("Height", "height"),
+                metric("Width", "width"),
+                metric("Length", "length"),
+                metric("Height/Width", "height_width_ratio"),
+                metric("Length/Width", "length_width_ratio"),
+                metric("Alpha angle", "alpha_angle", suffix=" deg"),
+                metric("Alpha rectangular", "alpha_rectangular", suffix=" deg"),
+                metric("Beta angle", "beta_angle", suffix=" deg"),
+            ],
+            "vectors": [
+                {"label": "COM", "value": center_of_mass.astype(float).round(4).tolist()},
+                {"label": "Alpha rocking point", "value": alpha_point.astype(float).round(4).tolist() if alpha_point is not None else None},
+            ],
+            "csv_path": self.analysis_csv_path,
+        }
+
+        scene_bounds = _point_bounds(np.vstack([sampled_points, *bounds_points]))
+        payload: dict[str, Any] = {
+            "kind": "pointCloud",
+            "points": _array_to_list(sampled_points, precision=6),
+            "colors": _array_to_list(sampled_colors, precision=4),
+            "normals": _array_to_list(sampled_normals, precision=5),
+            "indices": (np.arange(len(sampled_points), dtype=int) + 10_000_000).tolist(),
+            "bounds": _point_bounds(sampled_points),
+            "scene_bounds": scene_bounds,
+            "markers": [],
+            "analysis_markers": analysis_markers,
+            "analysis_segments": segments,
+            "analysis_summary": _to_jsonable(analysis_summary),
+            "total_points": int(len(sampled_points)),
+            "rendered_points": int(len(sampled_points)),
+        }
+        return payload
+
     def analyze(self) -> dict[str, Any]:
-        if self.mesh_processor.reconstructed_mesh is None:
-            raise ValueError("Complete mesh reconstruction before analysis.")
+        rock_mesh, rock_mesh_path = self._get_reconstructed_mesh_state("rock")
         pcd = self._require_pcd()
         if self.basal_points is None or len(self.basal_points) == 0:
             raise ValueError("Define interface constraints before running analysis.")
@@ -4303,7 +6063,7 @@ class WebWorkflowSession:
             raise ValueError("No pedestal points are available for beta-angle analysis.")
         basal_coords = np.asarray(pcd.points)[self.basal_points]
         results = self.geometric_analyzer.compute_geometric_properties(
-            self.mesh_processor.reconstructed_mesh,
+            rock_mesh,
             basal_coords,
             pedestal_points,
             lateral_flags=None,
@@ -4313,7 +6073,7 @@ class WebWorkflowSession:
             self.current_pbr_file or "point_cloud",
             self.input_path or "",
             self.segmented_pcd_file_path or "",
-            self.mesh_path or "",
+            rock_mesh_path,
             smoothness_threshold=float(_deep_get(self.config, "thresholds.smoothness", 0.9)),
             curvature_threshold=float(_deep_get(self.config, "thresholds.curvature", 0.1)),
             proximity_threshold=float(_deep_get(self.config, "thresholds.basal_proximity", 0.05)),
@@ -4327,22 +6087,104 @@ class WebWorkflowSession:
             key: (value.tolist() if isinstance(value, np.ndarray) else value)
             for key, value in results.items()
         }
+        self.analysis_results = _to_jsonable(serializable_results)
         return {
-            "results": serializable_results,
+            "results": self.analysis_results,
             "analysis_csv_path": self.analysis_csv_path,
+            "view": "analysis",
             "summary": self.summary(),
         }
+
+    def _combined_reconstruction_payload(self) -> dict[str, Any]:
+        components: list[dict[str, Any]] = []
+        bounds_sources: list[np.ndarray] = []
+        total_points = 0
+        for target in ["rock", "pedestal"]:
+            source = self._combined_component_source(target)
+            color = [0.5, 0.5, 0.5] if target == "rock" else [0.10, 0.36, 0.95]
+            if source["source"] == "mesh":
+                mesh, path = self._get_reconstructed_mesh_state(target)
+                vertices = np.asarray(mesh.vertices, dtype=float)
+                if len(vertices):
+                    bounds_sources.append(vertices)
+                total_points += int(len(vertices))
+                components.append({
+                    "kind": "mesh",
+                    "target": target,
+                    "source": "mesh",
+                    "url": f"/api/sessions/{self.session_id}/downloads/{'pedestal_mesh' if target == 'pedestal' else 'mesh'}",
+                    "mesh_path": path,
+                    "vertex_count": int(len(vertices)),
+                    "triangle_count": int(len(mesh.triangles)),
+                    "color": color,
+                    "wire_color": [0.13, 0.17, 0.17],
+                    "show_wireframe": False,
+                })
+                continue
+
+            points, colors, normals, indices = self._segmented_points_for_target(target)
+            if len(points) == 0:
+                raise ValueError(
+                    f"No reconstructed {target} mesh or segmented {target} point cloud is available."
+                )
+            bounds_sources.append(points)
+            total_points += int(len(points))
+            component: dict[str, Any] = {
+                "kind": "pointCloud",
+                "target": target,
+                "source": "segmentation",
+                "points": _array_to_list(points, precision=6),
+                "colors": _array_to_list(colors, precision=4),
+                "indices": indices.astype(int).tolist(),
+                "point_count": int(len(points)),
+            }
+            if normals is not None and normals.shape == points.shape:
+                component["normals"] = _array_to_list(normals, precision=5)
+            components.append(component)
+
+        if len(components) != 2:
+            raise ValueError("Both rock and pedestal sources are required.")
+        if not all(component.get("source") in {"mesh", "segmentation"} for component in components):
+            raise ValueError("Both rock and pedestal sources are required.")
+
+        bounds_points = np.vstack(bounds_sources) if bounds_sources else np.empty((0, 3), dtype=float)
+        payload = {
+            "kind": "combinedMesh",
+            "components": components,
+            "total_points": int(total_points),
+            "rendered_points": int(total_points),
+            "bounds": _point_bounds(bounds_points),
+            "scene_bounds": self._scene_bounds_for_payload(bounds_points),
+            "combined_reconstruction": self._combined_reconstruction_summary(),
+        }
+        return payload
 
     def viewer_payload(
         self,
         view_name: str,
         mesh_url: str | None = None,
         color_mode: str | None = None,
+        mesh_target: str | None = None,
     ) -> dict[str, Any]:
+        if view_name == "analysis":
+            return self._analysis_view_payload(mesh_url)
+
+        if view_name == "combined_mesh":
+            return self._combined_reconstruction_payload()
+
         if view_name == "mesh":
-            if not self.mesh_path:
-                raise ValueError("No reconstructed mesh is available.")
-            payload: dict[str, Any] = {"kind": "mesh", "url": mesh_url, "show_wireframe": True}
+            target = self._mesh_target(mesh_target or "rock")
+            mesh, path = self._get_reconstructed_mesh_state(target)
+            payload: dict[str, Any] = {
+                "kind": "mesh",
+                "url": mesh_url,
+                "show_wireframe": False,
+                "mesh_target": target,
+                "mesh_method": "poisson" if target == "rock" else PEDESTAL_MESH_METHOD,
+                "vertex_count": int(len(mesh.vertices)),
+                "triangle_count": int(len(mesh.triangles)),
+                "mesh_path": path,
+            }
             if self.scene_bounds is not None:
                 payload["scene_bounds"] = self.scene_bounds
             return payload
@@ -4370,15 +6212,11 @@ class WebWorkflowSession:
                 colors = np.asarray(pcd.colors)
                 normals = self._ensure_view_normals(pcd)
             indices = np.arange(len(points), dtype=int)
-            interface_state = self._display_interface_state()
             return self._point_payload(
                 points,
-                self._overlay_interface_colors(colors, indices, interface_state),
+                colors,
                 indices,
-                markers=self._markers_with_interface(
-                    self._current_markers(include_interface=False),
-                    interface_state,
-                ),
+                markers=self._current_markers(include_interface=False),
                 normals=self._cached_normals_for_points(points, normals),
             )
         elif view_name == "interface":
@@ -4417,20 +6255,6 @@ class WebWorkflowSession:
                 ),
                 normals=self._cached_normals_for_points(points, normals),
             )
-            interface_points, interface_normals = self._interface_normal_arrays(interface_metadata)
-            if self.normals_display_ready and interface_points is not None and interface_normals is not None:
-                payload["normal_segments"] = self._normal_segments(
-                    interface_points,
-                    interface_normals,
-                    scale_points=np.asarray(points),
-                    scale_fraction=NORMAL_VECTOR_SCALE_FRACTION,
-                )
-                payload["normal_diagnostics"] = self._normal_diagnostics(
-                    interface_points,
-                    interface_normals,
-                    scale_points=np.asarray(points),
-                    scale_fraction=NORMAL_VECTOR_SCALE_FRACTION,
-                )
             return payload
         elif view_name == "voxel_segmented":
             if self.voxel_segmented_points is None or self.voxel_segmented_colors is None:
@@ -4453,6 +6277,19 @@ class WebWorkflowSession:
             seed_branches = self._voxel_branch_summaries()
             if seed_branches:
                 payload["seed_branches"] = seed_branches
+            _project_debug_log(
+                "viewer_payload_voxel_segmented",
+                session_id=self.session_id,
+                current_file=self.current_pbr_file,
+                payload_colors=_debug_array_summary(np.asarray(payload.get("colors", []), dtype=float)),
+                payload_points=_debug_array_summary(np.asarray(payload.get("points", []), dtype=float)),
+                source_voxel_colors=_debug_array_summary(self.voxel_segmented_colors),
+                source_voxel_labels=_debug_array_summary(self.voxel_segmented_labels, label_values=True),
+                source_voxel_branch_ids=_debug_array_summary(self.voxel_segmented_branch_ids, label_values=True),
+                source_voxel_branch_count=len(self.voxel_segmented_branches or []),
+                payload_seed_branch_count=len(payload.get("seed_branches", []) or []),
+                label_counts=payload.get("label_counts"),
+            )
             return payload
         elif view_name == "segmented":
             pcd = self.segmented_pcd
@@ -4478,6 +6315,20 @@ class WebWorkflowSession:
                 if seed_branches:
                     payload["seed_branches"] = seed_branches
                 payload["segmented_color_mode"] = "multi_seed"
+                _project_debug_log(
+                    "viewer_payload_segmented",
+                    session_id=self.session_id,
+                    current_file=self.current_pbr_file,
+                    color_mode=color_mode,
+                    resolved_color_mode="multi_seed",
+                    payload_colors=_debug_array_summary(np.asarray(payload.get("colors", []), dtype=float)),
+                    pcd_colors=_debug_array_summary(np.asarray(pcd.colors) if pcd.has_colors() else None),
+                    segmented_labels=_debug_array_summary(self.segmented_labels, label_values=True),
+                    segmented_branch_ids=_debug_array_summary(self.segmented_branch_ids, label_values=True),
+                    segmented_branch_count=len(self.segmented_branches or []),
+                    payload_seed_branch_count=len(payload.get("seed_branches", []) or []),
+                    interface_overlay_source=self.display_interface_source,
+                )
                 return payload
             if pcd is not None:
                 points = np.asarray(pcd.points)
@@ -4500,28 +6351,71 @@ class WebWorkflowSession:
                 if seed_branches:
                     payload["seed_branches"] = seed_branches
                 payload["segmented_color_mode"] = "two_color"
+                _project_debug_log(
+                    "viewer_payload_segmented",
+                    session_id=self.session_id,
+                    current_file=self.current_pbr_file,
+                    color_mode=color_mode,
+                    resolved_color_mode="two_color",
+                    payload_colors=_debug_array_summary(np.asarray(payload.get("colors", []), dtype=float)),
+                    pcd_colors=_debug_array_summary(np.asarray(pcd.colors) if pcd.has_colors() else None),
+                    segmented_labels=_debug_array_summary(self.segmented_labels, label_values=True),
+                    segmented_branch_ids=_debug_array_summary(self.segmented_branch_ids, label_values=True),
+                    segmented_branch_count=len(self.segmented_branches or []),
+                    payload_seed_branch_count=len(payload.get("seed_branches", []) or []),
+                    interface_overlay_source=self.display_interface_source,
+                )
                 return payload
             markers = []
         elif view_name == "mesh_prepared":
-            if not self.prepared_mesh_data:
-                raise ValueError("No prepared mesh point cloud is available.")
+            target = self._mesh_target(mesh_target or "rock")
+            prepared_data = self._visible_prepared_mesh_state(target)
+            combined_points = np.asarray(prepared_data["combined_points"], dtype=float)
+            combined_colors = np.asarray(prepared_data["combined_colors"], dtype=float)
+            combined_normals = np.asarray(prepared_data.get("combined_normals"), dtype=float)
+            source_indices = np.arange(len(combined_points), dtype=int)
+            interface_path_count = 0
+            if target == "rock":
+                path_points, path_colors, path_normals, path_source_indices, path_original_indices = (
+                    self._mesh_prepared_interface_path_arrays(len(combined_points))
+                )
+                interface_path_count = int(len(path_points))
+                if interface_path_count:
+                    combined_points = np.vstack((combined_points, path_points))
+                    combined_colors = np.vstack((combined_colors, path_colors))
+                    if combined_normals.shape != np.asarray(prepared_data["combined_points"]).shape:
+                        combined_normals = np.zeros_like(np.asarray(prepared_data["combined_points"], dtype=float))
+                    combined_normals = np.vstack((combined_normals, path_normals))
+                    source_indices = np.concatenate((source_indices, path_source_indices))
+            markers = []
             payload = self._point_payload(
-                self.prepared_mesh_data["combined_points"],
-                self.prepared_mesh_data["combined_colors"],
-                np.arange(len(self.prepared_mesh_data["combined_points"]), dtype=int),
-                markers=self._markers_with_interface([]),
-                normals=self.prepared_mesh_data.get("combined_normals"),
+                combined_points,
+                combined_colors,
+                source_indices,
+                markers=markers,
+                normals=combined_normals,
             )
-            payload["rock_point_count"] = int(len(self.prepared_mesh_data["rock_pcd"].points))
-            payload["bottom_point_count"] = int(len(self.prepared_mesh_data["bottom_pcd"].points))
-            if self.normals_display_ready:
+            object_count = int(len(prepared_data["object_pcd"].points))
+            interface_count = int(len(prepared_data["interface_pcd"].points))
+            payload["mesh_target"] = target
+            payload["reset_preview"] = bool(self.prepared_mesh_reset_previews.get(target))
+            payload["prepared_saved"] = bool(self.prepared_mesh_states.get(target))
+            payload["object_point_count"] = object_count
+            payload["interface_fill_point_count"] = interface_count
+            payload["interface_path_point_count"] = interface_path_count
+            payload["rock_point_count"] = object_count if target == "rock" else 0
+            payload["pedestal_point_count"] = object_count if target == "pedestal" else 0
+            payload["bottom_point_count"] = interface_count
+            if target == "rock" and interface_path_count:
+                payload["interface_path_source_indices"] = path_original_indices.astype(int).tolist()
+            if self.normals_display_ready_by_target.get(target, False):
                 payload["normal_segments"] = self._normal_segments(
-                    self.prepared_mesh_data["combined_points"],
-                    self.prepared_mesh_data.get("combined_normals"),
+                    combined_points,
+                    combined_normals,
                 )
                 payload["normal_diagnostics"] = self._normal_diagnostics(
-                    self.prepared_mesh_data["combined_points"],
-                    self.prepared_mesh_data.get("combined_normals"),
+                    combined_points,
+                    combined_normals,
                 )
             return payload
         else:
@@ -4776,14 +6670,19 @@ class WebWorkflowSession:
         return markers
 
     def download_path(self, kind: str) -> Path:
+        target = "rock"
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_kind in {"pedestal_mesh", "mesh_pedestal"}:
+            target = "pedestal"
+            normalized_kind = "mesh"
         lookup = {
             "segmented": self.segmented_pcd_file_path,
             "segmented_pcd": self.segmented_pcd_file_path,
-            "mesh": self.mesh_path,
+            "mesh": self._mesh_output_path(target),
             "analysis": self.analysis_csv_path,
             "analysis_csv": self.analysis_csv_path,
         }
-        value = lookup.get(kind)
+        value = lookup.get(normalized_kind)
         if not value:
             raise ValueError(f"No downloadable file is available for '{kind}'.")
         path = Path(value)

@@ -10,22 +10,6 @@ import {
   useState
 } from "react";
 import {
-  Activity,
-  Check,
-  Circle,
-  Download,
-  FileUp,
-  Info,
-  Layers3,
-  Loader2,
-  Pickaxe,
-  Play,
-  RotateCcw,
-  Save,
-  Sparkles,
-  Triangle
-} from "lucide-react";
-import {
   clearInterfaceDraft as clearInterfaceDraftApi,
   createSession,
   createInterfaceDraftFromSource,
@@ -43,6 +27,7 @@ import {
   type DenoiseParams,
   type InterfaceDraft,
   type JobResponse,
+  type MeshTarget,
   type ProjectUiState,
   type SegmentParams,
   type SessionSummary,
@@ -51,7 +36,7 @@ import {
 import { PointCloudViewer } from "./PointCloudViewer";
 
 type PickMode = "rock" | "pedestal" | "interface";
-type ViewName = "raw" | "seeds" | "interface" | "voxel_segmented" | "segmented" | "mesh_prepared" | "mesh";
+type ViewName = "raw" | "seeds" | "interface" | "voxel_segmented" | "segmented" | "mesh_prepared" | "mesh" | "combined_mesh" | "analysis";
 
 type InterfacePartDraft = {
   selected_indices: number[];
@@ -61,6 +46,33 @@ type InterfacePartDraft = {
 type ScreenPoint = {
   x: number;
   y: number;
+};
+
+type HagVegetationParams = {
+  grid_size: number;
+  height_threshold: number;
+  ground_percentile: number;
+  min_points_per_cell: number;
+};
+
+type RoughnessParams = {
+  radius: number;
+  threshold: number;
+};
+
+type RoughnessStats = {
+  min_roughness?: number;
+  max_roughness?: number;
+  mean_roughness?: number;
+  valid_roughness_count?: number;
+  voxel_size?: number;
+  voxel_point_count?: number;
+};
+
+const PICKED_MARKER_COLORS: Record<PickMode, number> = {
+  rock: 0xff0d05,
+  pedestal: 0x003dff,
+  interface: 0x00ff00
 };
 
 type InterfaceMetadataPart = {
@@ -128,6 +140,18 @@ const defaultDenoiseParams: DenoiseParams = {
   dbscan_min_points: 20
 };
 
+const defaultHagVegetationParams: HagVegetationParams = {
+  grid_size: 0.05,
+  height_threshold: 0.08,
+  ground_percentile: 10,
+  min_points_per_cell: 3
+};
+
+const defaultRoughnessParams: RoughnessParams = {
+  radius: 0.05,
+  threshold: 0.01
+};
+
 const helpText = {
   pointSize:
     "Changes only the rendered point size. Increase it for sparse or distant clouds and decrease it when dense clouds look blotchy; segmentation and exports are unchanged.",
@@ -164,7 +188,9 @@ const viewHelp: Record<ViewName, string> = {
   voxel_segmented: "Show the immediate region-growing or ICRG labels on the voxelized point cloud before dense label propagation.",
   segmented: "Show the latest rock/support labels after running region growing or ICRG.",
   mesh_prepared: "Show the prepared point set used for normal estimation and mesh reconstruction.",
-  mesh: "Show mesh status after reconstruction; download the PLY from the Downloads panel."
+  mesh: "Show mesh status after reconstruction; download the PLY from the Downloads panel.",
+  combined_mesh: "Load rock and pedestal together. Existing meshes are used first; missing meshes fall back to segmented point clouds.",
+  analysis: "Show the reconstructed mesh with center of mass, Z axis, alpha point, and analysis metrics."
 };
 
 const viewLabels: Record<ViewName, string> = {
@@ -174,7 +200,9 @@ const viewLabels: Record<ViewName, string> = {
   voxel_segmented: "RG Result",
   segmented: "Segmented",
   mesh_prepared: "Mesh Prep",
-  mesh: "Mesh"
+  mesh: "Mesh",
+  combined_mesh: "Rock + Pedestal",
+  analysis: "Analysis"
 };
 
 const buttonHelp = {
@@ -195,10 +223,20 @@ const buttonHelp = {
   clearParts: "Remove staged interface parts and current interface picks.",
   runSegment: "Segment from seeds without using interface constraints.",
   runICRG: "Run interface-constrained region growing using the saved manual interface.",
-  prepareMesh: "Create the prepared rock point set used for normals, reconstruction, and analysis.",
+  prepareMesh: "Open the existing prepared target if available; otherwise prepare it from the current label-propagated segmentation.",
+  resetMeshPreparation: "Preview a fresh prepared target from label propagation. It is not saved until denoise or manual removal commits it.",
   removeNoise: "Run the selected denoise method: SOR, DBSCAN, or SOR followed by DBSCAN.",
   undoNoise: "Restore the prepared mesh point cloud to the state before the last denoise step.",
-  manualRemoval: "Draw a screen-space polygon in Mesh Prep view and remove selected prepared rock or interpolated bottom-face points.",
+  hagVegetation: "For prepared pedestal points, estimate local ground and select vegetation points above the height threshold.",
+  hagApply: "Run Height Above Ground selection and preview vegetation candidates.",
+  hagConfirm: "Remove the currently selected vegetation candidates from the prepared pedestal point cloud.",
+  hagClear: "Clear the Height Above Ground preview selection without changing the prepared pedestal point cloud.",
+  roughnessRemoval: "For prepared pedestal points, compute local best-fit-plane roughness and select points above the threshold.",
+  roughnessCalculate: "Calculate roughness for the current prepared pedestal points using the radius.",
+  roughnessApply: "Use the threshold to select points from the current roughness heatmap without recalculating.",
+  roughnessConfirm: "Remove the currently selected rough pedestal points from the prepared pedestal point cloud.",
+  roughnessClear: "Clear the Roughness preview selection without changing the prepared pedestal point cloud.",
+  manualRemoval: "Draw a screen-space polygon in Mesh Prep view and remove all prepared points projected inside it, including points hidden behind the front surface.",
   drawPolygon: "Add polygon vertices with left clicks in the viewer. The preview updates after three vertices.",
   undoVertex: "Remove the most recent polygon vertex and update the preview.",
   clearManualRemoval: "Clear the polygon and selected preview points without changing the prepared mesh.",
@@ -206,7 +244,8 @@ const buttonHelp = {
   closeManualRemoval: "Close the manual-removal tool without changing the prepared mesh.",
   analyze: "Compute geometric metrics and make the analysis CSV available for download.",
   computeNormals: "Estimate and orient normals with PyMeshLab or Open3D before Poisson mesh reconstruction.",
-  reconstruct: "Run Poisson reconstruction and create the downloadable mesh PLY."
+  reconstruct: "Run Poisson for rock or local-plane filled-hole surface reconstruction for pedestal, based on the selected reconstruction target.",
+  loadRockPedestal: "Load rock and pedestal together. Existing meshes are used first; missing meshes fall back to their segmented point clouds."
 };
 
 function wait(ms: number) {
@@ -392,7 +431,15 @@ async function ensureProjectWritePermission(handle: ProjectSaveFileHandle | null
   return true;
 }
 
-function viewIsAvailable(summary: SessionSummary, viewName: ViewName) {
+function meshTargetAvailableInSummary(summary: SessionSummary, target: MeshTarget = "rock") {
+  const targetState = summary.mesh_prepared_targets?.[target];
+  if (targetState) {
+    return Boolean(targetState.available ?? targetState.prepared ?? targetState.preview);
+  }
+  return target === "rock" && Boolean(summary.status.mesh_prepared);
+}
+
+function viewIsAvailable(summary: SessionSummary, viewName: ViewName, meshTarget: MeshTarget = "rock") {
   if (viewName === "raw") {
     return summary.status.point_cloud_loaded;
   }
@@ -409,28 +456,53 @@ function viewIsAvailable(summary: SessionSummary, viewName: ViewName) {
     return Boolean(summary.status.voxel_segmentation_ready);
   }
   if (viewName === "mesh_prepared") {
-    return summary.status.mesh_prepared;
+    return meshTargetAvailableInSummary(summary, meshTarget);
+  }
+  if (viewName === "analysis") {
+    return summary.status.analysis_completed;
+  }
+  if (viewName === "mesh") {
+    const targetState = summary.mesh_reconstruction_targets?.[meshTarget];
+    if (targetState) {
+      return Boolean(targetState.completed);
+    }
+    return meshTarget === "rock" && summary.status.mesh_completed;
+  }
+  if (viewName === "combined_mesh") {
+    return Boolean(summary.combined_reconstruction?.available);
   }
   return summary.status.mesh_completed;
 }
 
-function bestAvailableView(summary: SessionSummary, preferred?: string): ViewName {
-  const candidateViews: ViewName[] = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"];
-  if (preferred && candidateViews.includes(preferred as ViewName) && viewIsAvailable(summary, preferred as ViewName)) {
+function bestAvailableView(summary: SessionSummary, preferred?: string, meshTarget: MeshTarget = "rock"): ViewName {
+  const candidateViews: ViewName[] = ["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh", "analysis"];
+  if (preferred && candidateViews.includes(preferred as ViewName) && viewIsAvailable(summary, preferred as ViewName, meshTarget)) {
     return preferred as ViewName;
   }
   for (const candidate of [...candidateViews].reverse()) {
-    if (viewIsAvailable(summary, candidate)) {
+    if (viewIsAvailable(summary, candidate, meshTarget)) {
       return candidate;
     }
   }
   return "raw";
 }
 
+function formatAnalysisPanelValue(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((item) => Number(item).toFixed(4)).join(", ");
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value.toFixed(3);
+  }
+  if (value === null || value === undefined || value === "") {
+    return "--";
+  }
+  return String(value);
+}
+
 function StatusRow({ done, label }: { done: boolean; label: string }) {
   return (
     <div className={`status-row ${done ? "done" : ""}`}>
-      {done ? <Check size={16} /> : <Circle size={16} />}
       <span>{label}</span>
     </div>
   );
@@ -448,7 +520,7 @@ function InfoTip({ title, children }: { title: string; children: ReactNode }) {
         event.stopPropagation();
       }}
     >
-      <Info size={13} />
+      i
       <span className="info-popover" role="tooltip">
         <strong>{title}</strong>
         <span>{children}</span>
@@ -484,6 +556,7 @@ function NumericField({
   min,
   max,
   step,
+  disabled = false,
   onChange
 }: {
   label: string;
@@ -492,6 +565,7 @@ function NumericField({
   min: number;
   max: number;
   step: number;
+  disabled?: boolean;
   onChange: (value: number) => void;
 }) {
   return (
@@ -506,6 +580,7 @@ function NumericField({
         max={max}
         step={step}
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(Number(event.target.value))}
       />
     </label>
@@ -572,6 +647,9 @@ export default function App() {
   const [pointSize, setPointSize] = useState(0.025);
   const [segmentParams, setSegmentParams] = useState<SegmentParams>(defaultSegmentParams);
   const [denoiseParams, setDenoiseParams] = useState<DenoiseParams>(defaultDenoiseParams);
+  const [hagVegetationParams, setHagVegetationParams] = useState<HagVegetationParams>(defaultHagVegetationParams);
+  const [roughnessParams, setRoughnessParams] = useState<RoughnessParams>(defaultRoughnessParams);
+  const [activeMeshTarget, setActiveMeshTarget] = useState<MeshTarget>("rock");
   const [hoverTipsEnabled, setHoverTipsEnabled] = useState(true);
   const [interfaceWindowOpen, setInterfaceWindowOpen] = useState(false);
   const [interfaceWindowPosition, setInterfaceWindowPosition] = useState<{ left: number; top: number } | null>(null);
@@ -583,8 +661,14 @@ export default function App() {
   const [manualRemovalDrawing, setManualRemovalDrawing] = useState(false);
   const [manualRemovalPolygon, setManualRemovalPolygon] = useState<ScreenPoint[]>([]);
   const [manualRemovalSelected, setManualRemovalSelected] = useState<number[]>([]);
+  const [vegetationSelected, setVegetationSelected] = useState<number[]>([]);
+  const [roughnessSelected, setRoughnessSelected] = useState<number[]>([]);
+  const [roughnessValues, setRoughnessValues] = useState<Array<number | null>>([]);
+  const [roughnessStats, setRoughnessStats] = useState<RoughnessStats | null>(null);
   const [manualRemovalWindowPosition, setManualRemovalWindowPosition] = useState<{ left: number; top: number } | null>(null);
   const manualRemovalWindowDragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
+  const [vegetationWindowOpen, setVegetationWindowOpen] = useState(false);
+  const [roughnessWindowOpen, setRoughnessWindowOpen] = useState(false);
   const seedAutosaveSignatureRef = useRef("");
 
   useEffect(() => {
@@ -623,18 +707,88 @@ export default function App() {
     if (!view) {
       return [];
     }
-    if (view.kind === "mesh") {
+    if (view.analysis_summary) {
       return [
-        view.vertices?.length ? `${view.vertices.length.toLocaleString()} vertices` : null,
-        view.triangles?.length ? `${view.triangles.length.toLocaleString()} faces` : null
+        view.kind === "mesh" && view.vertices?.length ? `${view.vertices.length.toLocaleString()} vertices` : null,
+        view.kind === "mesh" && view.triangles?.length ? `${view.triangles.length.toLocaleString()} faces` : null,
+        view.kind === "pointCloud" ? `${view.rendered_points.toLocaleString()} shown` : null,
+        view.analysis_segments?.length ? `${view.analysis_segments.length.toLocaleString()} axes/lines` : null,
+        view.analysis_markers?.length ? `${view.analysis_markers.length.toLocaleString()} markers` : null
       ].filter(Boolean);
     }
-    return [
+    if (view.kind === "mesh") {
+      const target = view.mesh_target ?? activeMeshTarget;
+      const method = view.mesh_method ?? (target === "pedestal" ? "local_plane_filled_holes" : "poisson");
+      return [
+        `${target} ${String(method).toUpperCase()}`,
+        view.vertices?.length ? `${view.vertices.length.toLocaleString()} vertices` : null,
+        view.triangles?.length ? `${view.triangles.length.toLocaleString()} faces` : null,
+        Number.isFinite(view.triangle_count) ? `${Number(view.triangle_count).toLocaleString()} triangles` : null
+      ].filter(Boolean);
+    }
+    if (view.kind === "combinedMesh") {
+      return [
+        `${view.total_points.toLocaleString()} total`,
+        ...view.components.map((component) => `${component.target} ${component.source}`)
+      ];
+    }
+    const parts = [
       `${view.rendered_points.toLocaleString()} shown`,
       view.normal_segments ? `${view.normal_segments.length.toLocaleString()} normal arrows` : null,
       view.normal_diagnostics ? `${view.normal_diagnostics.nonzero_normal_count.toLocaleString()} valid normals` : null
     ].filter(Boolean);
-  }, [view]);
+    if (activeView === "mesh_prepared") {
+      const target = view.mesh_target ?? activeMeshTarget;
+      if (Number.isFinite(view.object_point_count)) {
+        parts.push(`${target} ${view.object_point_count?.toLocaleString()}`);
+      }
+      if (Number.isFinite(view.interface_fill_point_count) && Number(view.interface_fill_point_count) > 0) {
+        parts.push(`interface fill ${view.interface_fill_point_count?.toLocaleString()}`);
+      }
+    }
+    return parts;
+  }, [activeMeshTarget, activeView, view]);
+
+  const analysisSummary = view?.analysis_summary;
+  const roughnessHeatmapRange = roughnessWindowOpen && roughnessStats
+    ? {
+      min: Number(roughnessStats.min_roughness ?? 0),
+      max: Number(roughnessStats.max_roughness ?? 0)
+    }
+    : null;
+  const meshTargetAvailable = useCallback(
+    (target: MeshTarget = activeMeshTarget, summary: SessionSummary | null = session) => {
+      const targetState = summary?.mesh_prepared_targets?.[target];
+      if (targetState) {
+        return Boolean(targetState.available ?? targetState.prepared ?? targetState.preview);
+      }
+      return target === "rock" && Boolean(summary?.status.mesh_prepared);
+    },
+    [activeMeshTarget, session]
+  );
+  const meshTargetSaved = useCallback(
+    (target: MeshTarget = activeMeshTarget, summary: SessionSummary | null = session) => {
+      const targetState = summary?.mesh_prepared_targets?.[target];
+      if (targetState) {
+        return Boolean(targetState.prepared);
+      }
+      return target === "rock" && Boolean(summary?.status.mesh_prepared);
+    },
+    [activeMeshTarget, session]
+  );
+  const meshTargetPrepared = meshTargetAvailable;
+  const activeMeshTargetPrepared = meshTargetAvailable(activeMeshTarget);
+  const activeMeshTargetSaved = meshTargetSaved(activeMeshTarget);
+  const meshReconstructionCompleted = useCallback(
+    (target: MeshTarget = activeMeshTarget, summary: SessionSummary | null = session) => {
+      const targetState = summary?.mesh_reconstruction_targets?.[target];
+      if (targetState) {
+        return Boolean(targetState.completed);
+      }
+      return target === "rock" && Boolean(summary?.status.mesh_completed);
+    },
+    [activeMeshTarget, session]
+  );
 
   const refreshSession = useCallback(
     async (preferredSession?: SessionSummary, options: { syncSeeds?: boolean } = {}) => {
@@ -653,16 +807,22 @@ export default function App() {
   );
 
   const refreshView = useCallback(
-    async (viewName: ViewName, summary?: SessionSummary | null) => {
+    async (viewName: ViewName, summary?: SessionSummary | null, options: { meshTarget?: MeshTarget } = {}) => {
       const targetSession = summary ?? session;
       if (!targetSession) {
         return;
       }
-      const payload = await getViewer(targetSession.session_id, viewName);
+      const payload = await getViewer(
+        targetSession.session_id,
+        viewName,
+        viewName === "mesh_prepared" || viewName === "mesh"
+          ? { meshTarget: options.meshTarget ?? activeMeshTarget }
+          : undefined
+      );
       setView(payload);
       setActiveView(viewName);
     },
-    [session]
+    [activeMeshTarget, session]
   );
 
   function buildProjectUiState(filename = projectFilename): ProjectUiState {
@@ -670,6 +830,7 @@ export default function App() {
       project_filename: projectFilenameFromName(filename),
       active_view: activeView,
       pick_mode: pickMode,
+      active_mesh_target: activeMeshTarget,
       point_size: pointSize,
       segment_params: segmentParams,
       denoise_params: denoiseParams,
@@ -685,7 +846,7 @@ export default function App() {
     };
   }
 
-  function restoreProjectUiState(uiState: ProjectUiState | undefined, summary: SessionSummary) {
+  function restoreProjectUiState(uiState: ProjectUiState | undefined, summary: SessionSummary): MeshTarget {
     const restoredFilename = projectFilenameFromName(uiState?.project_filename || summary.current_file || "rock_detection_project");
     setProjectFilename(restoredFilename);
     setRockSeeds(summary.seeds.rock ?? []);
@@ -721,6 +882,18 @@ export default function App() {
     if (uiState?.pick_mode === "rock" || uiState?.pick_mode === "pedestal" || uiState?.pick_mode === "interface") {
       setPickMode(uiState.pick_mode);
     }
+    let nextMeshTarget: MeshTarget = uiState?.active_mesh_target === "pedestal" ? "pedestal" : "rock";
+    const targetState = summary.mesh_prepared_targets?.[nextMeshTarget];
+    if (targetState && !(targetState.available ?? targetState.prepared ?? targetState.preview)) {
+      const rockState = summary.mesh_prepared_targets?.rock;
+      const pedestalState = summary.mesh_prepared_targets?.pedestal;
+      if (rockState?.available ?? rockState?.prepared ?? rockState?.preview) {
+        nextMeshTarget = "rock";
+      } else if (pedestalState?.available ?? pedestalState?.prepared ?? pedestalState?.preview) {
+        nextMeshTarget = "pedestal";
+      }
+    }
+    setActiveMeshTarget(nextMeshTarget);
     setInterfacePoints(Array.isArray(uiState?.interface_points) ? uiState.interface_points : []);
     setInterfaceParts(Array.isArray(uiState?.interface_parts) ? uiState.interface_parts : []);
     setCurrentPartLateral(Boolean(uiState?.current_part_lateral));
@@ -728,6 +901,7 @@ export default function App() {
     setInterfaceDraft(null);
     setInterfaceEditorOpen(false);
     clearManualRemoval();
+    return nextMeshTarget;
   }
 
   async function pollJob(jobId: string) {
@@ -871,12 +1045,19 @@ export default function App() {
     try {
       const imported = await importProject(session.session_id, file);
       await refreshSession(imported.summary);
-      restoreProjectUiState(imported.ui_state, imported.summary);
+      const restoredMeshTarget = restoreProjectUiState(imported.ui_state, imported.summary);
       setProjectFilename(projectFilenameFromName(imported.project_filename || file.name));
       setProjectSaveHandle(options.saveHandle || null);
       setProjectHasSaveTarget(Boolean(options.saveHandle));
-      const nextView = bestAvailableView(imported.summary, imported.ui_state?.active_view);
-      await refreshView(nextView, imported.summary);
+      setVegetationWindowOpen(false);
+      setVegetationSelected([]);
+      setRoughnessWindowOpen(false);
+      setRoughnessSelected([]);
+      setRoughnessValues([]);
+      setRoughnessStats(null);
+      clearManualRemoval();
+      const nextView = bestAvailableView(imported.summary, imported.ui_state?.active_view, restoredMeshTarget);
+      await refreshView(nextView, imported.summary, { meshTarget: restoredMeshTarget });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -938,6 +1119,13 @@ export default function App() {
       setProjectFilename(projectFilenameFromName(file.name));
       setProjectHasSaveTarget(false);
       setProjectSaveHandle(null);
+      setActiveMeshTarget("rock");
+      setVegetationWindowOpen(false);
+      setVegetationSelected([]);
+      setRoughnessWindowOpen(false);
+      setRoughnessSelected([]);
+      setRoughnessValues([]);
+      setRoughnessStats(null);
       clearManualRemoval();
       await refreshView("raw", summary);
     } catch (caught) {
@@ -948,6 +1136,9 @@ export default function App() {
   }
 
   function handlePickPoint(index: number) {
+    if (activeView === "analysis") {
+      return;
+    }
     if (pickMode === "rock") {
       setRockSeeds((items) => addIndex(items, index));
     } else if (pickMode === "pedestal") {
@@ -958,6 +1149,9 @@ export default function App() {
   }
 
   function handleUnpickPoint(index: number) {
+    if (activeView === "analysis") {
+      return;
+    }
     if (pickMode === "rock") {
       setRockSeeds((items) => removeIndex(items, index));
     } else if (pickMode === "pedestal") {
@@ -1211,11 +1405,184 @@ export default function App() {
     setManualRemovalSelected([]);
   }
 
-  async function openManualRemovalTools() {
-    if (!session?.status.mesh_prepared) {
-      setError("Prepare the mesh before manual removal.");
+  function clearPreparedSelectionPreviews() {
+    clearManualRemoval();
+    setVegetationSelected([]);
+    setRoughnessSelected([]);
+    setRoughnessValues([]);
+    setRoughnessStats(null);
+  }
+
+  function closeVegetationTool() {
+    setVegetationWindowOpen(false);
+    setVegetationSelected([]);
+    clearManualRemoval();
+  }
+
+  function closeRoughnessTool() {
+    setRoughnessWindowOpen(false);
+    setRoughnessSelected([]);
+    setRoughnessValues([]);
+    setRoughnessStats(null);
+    clearManualRemoval();
+  }
+
+  async function openVegetationTool() {
+    if (activeMeshTarget !== "pedestal") {
+      setError("Height Above Ground vegetation removal is only available for prepared pedestal mesh.");
       return;
     }
+    if (!activeMeshTargetPrepared) {
+      setError("Prepare the pedestal mesh before running Height Above Ground selection.");
+      return;
+    }
+    setManualRemovalOpen(false);
+    setRoughnessWindowOpen(false);
+    setRoughnessSelected([]);
+    setRoughnessValues([]);
+    setRoughnessStats(null);
+    clearManualRemoval();
+    setVegetationWindowOpen(true);
+    if (activeView !== "mesh_prepared") {
+      await refreshView("mesh_prepared");
+    }
+  }
+
+  async function applyHagVegetationSelection() {
+    if (!session) {
+      return;
+    }
+    const job = await runWorkflowAction(
+      "Selecting vegetation",
+      `/api/sessions/${session.session_id}/mesh/vegetation/hag/select`,
+      { ...hagVegetationParams, target: "pedestal" },
+      "mesh_prepared"
+    );
+    const result = job?.result as { selected_indices?: number[] } | undefined;
+    const selected = Array.isArray(result?.selected_indices) ? result.selected_indices.map(Number).filter(Number.isFinite) : [];
+    setManualRemovalDrawing(false);
+    setManualRemovalPolygon([]);
+    setManualRemovalSelected([]);
+    setVegetationSelected(selected);
+    setVegetationWindowOpen(true);
+  }
+
+  async function confirmHagVegetationRemoval() {
+    if (!session || !vegetationSelected.length) {
+      setError("Apply Height Above Ground first to select vegetation candidates.");
+      return;
+    }
+    const job = await runWorkflowAction(
+      "Removing vegetation",
+      `/api/sessions/${session.session_id}/mesh/noise/manual-remove`,
+      { selected_indices: vegetationSelected, target: "pedestal" },
+      "mesh_prepared"
+    );
+    if (job) {
+      setVegetationSelected([]);
+      clearManualRemoval();
+      setVegetationWindowOpen(true);
+    }
+  }
+
+  async function openRoughnessTool() {
+    if (activeMeshTarget !== "pedestal") {
+      setError("Roughness removal is only available for prepared pedestal mesh.");
+      return;
+    }
+    if (!activeMeshTargetPrepared) {
+      setError("Prepare the pedestal mesh before running roughness selection.");
+      return;
+    }
+    setManualRemovalOpen(false);
+    setVegetationWindowOpen(false);
+    setVegetationSelected([]);
+    clearManualRemoval();
+    setRoughnessWindowOpen(true);
+    if (activeView !== "mesh_prepared") {
+      await refreshView("mesh_prepared");
+    }
+  }
+
+  async function calculateRoughnessHeatmap() {
+    if (!session) {
+      return;
+    }
+    const job = await runWorkflowAction(
+      "Calculating roughness",
+      `/api/sessions/${session.session_id}/mesh/roughness/calculate`,
+      { radius: roughnessParams.radius, target: "pedestal" },
+      "mesh_prepared"
+    );
+    const result = job?.result as ({ roughness_values?: Array<number | null> } & RoughnessStats) | undefined;
+    const values = Array.isArray(result?.roughness_values)
+      ? result.roughness_values.map((value) => {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : null;
+      })
+      : [];
+    setManualRemovalDrawing(false);
+    setManualRemovalPolygon([]);
+    setManualRemovalSelected([]);
+    setRoughnessSelected([]);
+    setRoughnessValues(values);
+    setRoughnessStats({
+      min_roughness: result?.min_roughness,
+      max_roughness: result?.max_roughness,
+      mean_roughness: result?.mean_roughness,
+      valid_roughness_count: result?.valid_roughness_count,
+      voxel_size: result?.voxel_size,
+      voxel_point_count: result?.voxel_point_count
+    });
+    setRoughnessWindowOpen(true);
+  }
+
+  function applyRoughnessThreshold() {
+    if (!roughnessValues.length) {
+      setError("Calculate roughness before applying the threshold.");
+      return;
+    }
+    const selected: number[] = [];
+    roughnessValues.forEach((value, index) => {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && numeric > roughnessParams.threshold) {
+        selected.push(index);
+      }
+    });
+    setRoughnessSelected(selected);
+  }
+
+  async function confirmRoughnessRemoval() {
+    if (!session || !roughnessSelected.length) {
+      setError("Apply Roughness first to select points above the threshold.");
+      return;
+    }
+    const job = await runWorkflowAction(
+      "Removing rough points",
+      `/api/sessions/${session.session_id}/mesh/noise/manual-remove`,
+      { selected_indices: roughnessSelected, target: "pedestal" },
+      "mesh_prepared"
+    );
+    if (job) {
+      setRoughnessSelected([]);
+      setRoughnessValues([]);
+      setRoughnessStats(null);
+      clearManualRemoval();
+      setRoughnessWindowOpen(true);
+    }
+  }
+
+  async function openManualRemovalTools() {
+    if (!activeMeshTargetPrepared) {
+      setError(`Prepare the ${activeMeshTarget} mesh before manual removal.`);
+      return;
+    }
+    setVegetationWindowOpen(false);
+    setVegetationSelected([]);
+    setRoughnessWindowOpen(false);
+    setRoughnessSelected([]);
+    setRoughnessValues([]);
+    setRoughnessStats(null);
     setManualRemovalOpen(true);
     if (activeView !== "mesh_prepared") {
       await refreshView("mesh_prepared");
@@ -1224,18 +1591,38 @@ export default function App() {
 
   async function applyManualRemoval() {
     if (!session || !manualRemovalSelected.length) {
-      setError("Draw a polygon that selects at least one visible rock point.");
+      setError("Draw a polygon that selects at least one visible prepared point.");
       return;
     }
     const job = await runWorkflowAction(
       "Manual removal",
       `/api/sessions/${session.session_id}/mesh/noise/manual-remove`,
-      { selected_indices: manualRemovalSelected },
+      { selected_indices: manualRemovalSelected, target: activeMeshTarget },
       "mesh_prepared"
     );
     if (job) {
       clearManualRemoval();
       setManualRemovalOpen(true);
+    }
+  }
+
+  async function selectMeshTarget(target: MeshTarget) {
+    setActiveMeshTarget(target);
+    if (target !== "pedestal") {
+      setVegetationWindowOpen(false);
+      setVegetationSelected([]);
+      setRoughnessWindowOpen(false);
+      setRoughnessSelected([]);
+      setRoughnessValues([]);
+      setRoughnessStats(null);
+    }
+    clearManualRemoval();
+    if (activeView === "mesh_prepared" && session) {
+      const nextView = meshTargetPrepared(target) ? "mesh_prepared" : bestAvailableView(session, undefined, target);
+      await refreshView(nextView, session, { meshTarget: target });
+    } else if (activeView === "mesh" && session) {
+      const nextView = meshReconstructionCompleted(target) ? "mesh" : bestAvailableView(session, undefined, target);
+      await refreshView(nextView, session, { meshTarget: target });
     }
   }
 
@@ -1282,7 +1669,9 @@ export default function App() {
     }
   }
 
-  const canDownload = session?.outputs ?? { segmented: null, mesh: null, analysis: null };
+  const canDownload = session?.outputs ?? { segmented: null, mesh: null, pedestal_mesh: null, analysis: null };
+  const activeMeshDownloadKind = activeMeshTarget === "pedestal" ? "pedestal_mesh" : "mesh";
+  const activeMeshDownloadPath = activeMeshTarget === "pedestal" ? canDownload.pedestal_mesh : canDownload.mesh;
   const interfaceWindowStyle: CSSProperties | undefined = interfaceWindowPosition
     ? { left: interfaceWindowPosition.left, top: interfaceWindowPosition.top, right: "auto" }
     : undefined;
@@ -1294,7 +1683,7 @@ export default function App() {
     <div className={`app-shell ${hoverTipsEnabled ? "" : "tips-off"}`}>
       <aside className="sidebar">
         <div className="brand-row">
-          <Triangle size={26} />
+          <div className="brand-mark" aria-hidden="true"></div>
           <div>
             <h1>Rock Detection 3D</h1>
             <p>{session?.current_file ?? "No point cloud loaded"}</p>
@@ -1303,7 +1692,6 @@ export default function App() {
 
         <div className="project-actions">
           <label className="project-file-button">
-            <FileUp size={16} />
             <span>Import Project</span>
             <input
               type="file"
@@ -1342,7 +1730,7 @@ export default function App() {
             disabledHelp="Load or import a point cloud first."
             onClick={handleProjectSave}
           >
-            <Save size={16} /> Save Project
+            Save Project
           </ActionButton>
           <ActionButton
             disabled={!session?.status.point_cloud_loaded}
@@ -1350,12 +1738,11 @@ export default function App() {
             disabledHelp="Load or import a point cloud first."
             onClick={handleProjectSaveAs}
           >
-            <Download size={16} /> Save As
+            Save As
           </ActionButton>
         </div>
 
         <label className="upload-button">
-          <FileUp size={18} />
           <span>Upload LAS/LAZ</span>
           <input
             type="file"
@@ -1371,20 +1758,20 @@ export default function App() {
           <StatusRow done={Boolean(session?.status.interface_ready)} label="Interface" />
           <StatusRow done={Boolean(session?.status.segmentation_ready)} label="Segmentation" />
           <StatusRow done={Boolean(session?.status.mesh_prepared)} label="Mesh prep" />
-          <StatusRow done={Boolean(session?.status.mesh_completed)} label="Mesh" />
+          <StatusRow done={meshReconstructionCompleted("rock") || meshReconstructionCompleted("pedestal")} label="Mesh" />
           <StatusRow done={Boolean(session?.status.analysis_completed)} label="Analysis" />
         </section>
 
         <section className="panel compact">
           <h2>Views</h2>
           <div className="view-grid">
-            {(["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh"] as ViewName[]).map((name) => (
+            {(["raw", "seeds", "interface", "voxel_segmented", "segmented", "mesh_prepared", "mesh", "analysis"] as ViewName[]).map((name) => (
               <ActionButton
                 key={name}
                 className={activeView === name ? "active" : ""}
-                disabled={!session?.status.point_cloud_loaded}
+                disabled={!session || !viewIsAvailable(session, name, activeMeshTarget)}
                 help={viewHelp[name]}
-                disabledHelp="Upload a point cloud first."
+                disabledHelp={name === "analysis" ? "Run analysis first." : "Complete the required workflow step first."}
                 onClick={() => refreshView(name)}
               >
                 {viewLabels[name]}
@@ -1404,13 +1791,13 @@ export default function App() {
         <section className="panel compact">
           <h2>Downloads</h2>
           <a className={!canDownload.segmented ? "disabled-link" : ""} href={canDownload.segmented && session ? downloadUrl(session.session_id, "segmented") : undefined}>
-            <Download size={16} /> Segmented LAS
+            Segmented LAS
           </a>
-          <a className={!canDownload.mesh ? "disabled-link" : ""} href={canDownload.mesh && session ? downloadUrl(session.session_id, "mesh") : undefined}>
-            <Download size={16} /> Mesh PLY
+          <a className={!activeMeshDownloadPath ? "disabled-link" : ""} href={activeMeshDownloadPath && session ? downloadUrl(session.session_id, activeMeshDownloadKind) : undefined}>
+            Mesh PLY
           </a>
           <a className={!canDownload.analysis ? "disabled-link" : ""} href={canDownload.analysis && session ? downloadUrl(session.session_id, "analysis") : undefined}>
-            <Download size={16} /> Analysis CSV
+            Analysis CSV
           </a>
         </section>
       </aside>
@@ -1435,9 +1822,19 @@ export default function App() {
           onPickPoint={handlePickPoint}
           onUnpickPoint={handleUnpickPoint}
           pickedIndices={selectedForMode}
-          pickedColor={pickMode === "interface" ? 0x00ff00 : undefined}
+          pickedColor={PICKED_MARKER_COLORS[pickMode]}
           pointSize={pointSize}
           normalDisplayScale={normalDisplayScale}
+          highlightIndices={
+            roughnessWindowOpen && activeMeshTarget === "pedestal"
+              ? roughnessSelected
+              : vegetationWindowOpen && activeMeshTarget === "pedestal"
+                ? vegetationSelected
+                : []
+          }
+          highlightColor={roughnessWindowOpen ? [0.95, 0.18, 0.85] : [1.0, 0.84, 0.0]}
+          heatmapValues={roughnessWindowOpen && activeMeshTarget === "pedestal" ? roughnessValues : []}
+          heatmapRange={roughnessHeatmapRange}
           manualRemoval={{
             active: manualRemovalOpen && activeView === "mesh_prepared",
             drawing: manualRemovalDrawing,
@@ -1448,9 +1845,41 @@ export default function App() {
           }}
         />
 
+        {roughnessWindowOpen && roughnessStats && roughnessValues.length > 0 && (
+          <div className="roughness-colorbar">
+            <div className="roughness-colorbar-title">Roughness</div>
+            <div className="roughness-colorbar-gradient" />
+            <div className="roughness-colorbar-labels">
+              <span>{Number(roughnessStats.min_roughness ?? 0).toFixed(4)} m</span>
+              <span>{Number(roughnessStats.max_roughness ?? 0).toFixed(4)} m</span>
+            </div>
+          </div>
+        )}
+
+        {activeView === "analysis" && analysisSummary && (
+          <div className="analysis-window">
+            <div className="analysis-window-title">{analysisSummary.title ?? "Analysis"}</div>
+            <div className="analysis-window-list">
+              {(analysisSummary.metrics ?? []).map((item) => (
+                <div className="analysis-window-row" key={item.label}>
+                  <span>{item.label}</span>
+                  <strong>{formatAnalysisPanelValue(item.value)}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="analysis-window-list analysis-window-vectors">
+              {(analysisSummary.vectors ?? []).map((item) => (
+                <div className="analysis-window-row" key={item.label}>
+                  <span>{item.label}</span>
+                  <strong>{formatAnalysisPanelValue(item.value)}</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {(busyLabel || error) && (
           <div className={`toast ${error ? "error" : ""}`}>
-            {busyLabel && <Loader2 className="spin" size={16} />}
             <span>{error ?? busyLabel}</span>
           </div>
         )}
@@ -1500,7 +1929,7 @@ export default function App() {
               disabledHelp="Upload a point cloud first."
               onClick={autoSeeds}
             >
-              <Sparkles size={16} /> Auto
+              Auto
             </ActionButton>
             <ActionButton disabled={!session?.status.point_cloud_loaded} help={buttonHelp.clearMode} disabledHelp="Upload a point cloud first." onClick={clearCurrentPickMode}>
               Clear Mode
@@ -1581,7 +2010,7 @@ export default function App() {
               );
             }}
           >
-            <Play size={16} /> Run Region Growing
+            Run Region Growing
           </ActionButton>
           <ActionButton
             className="wide"
@@ -1604,7 +2033,7 @@ export default function App() {
               );
             }}
           >
-            <Play size={16} /> Run ICRG
+            Run ICRG
           </ActionButton>
         </section>
 
@@ -1631,26 +2060,63 @@ export default function App() {
               "segmented"
             )}
           >
-            <Play size={16} /> Run Label Propagation
+            Run Label Propagation
           </ActionButton>
         </section>
 
         <section className="panel">
           <h2>4. Mesh Preparation</h2>
-          <ActionButton
-            className="wide"
-            disabled={!session?.status.segmentation_ready}
-            help={buttonHelp.prepareMesh}
-            disabledHelp="Run segmentation first."
-            onClick={async () => {
-              const job = await runWorkflowAction("Preparing mesh", `/api/sessions/${session?.session_id}/mesh/prepare`, undefined, "mesh_prepared");
-              if (job) {
-                clearManualRemoval();
-              }
-            }}
-          >
-            <Pickaxe size={16} /> Prepare Mesh
-          </ActionButton>
+          <div className="segmented mesh-target-control" aria-label="Mesh preparation target">
+            <button className={activeMeshTarget === "rock" ? "active" : ""} type="button" onClick={() => void selectMeshTarget("rock")}>
+              Prepare Rock Mesh
+            </button>
+            <button
+              className={activeMeshTarget === "pedestal" ? "active" : ""}
+              type="button"
+              title="Use only pedestal/support points. Interface points are not included."
+              onClick={() => void selectMeshTarget("pedestal")}
+            >
+              Prepare Pedestal Mesh
+            </button>
+          </div>
+          <div className="button-row mesh-prep-actions">
+            <ActionButton
+              disabled={!session?.status.segmentation_ready}
+              help={buttonHelp.prepareMesh}
+              disabledHelp="Run segmentation first."
+              onClick={async () => {
+                const job = await runWorkflowAction(
+                  `Preparing ${activeMeshTarget} mesh`,
+                  `/api/sessions/${session?.session_id}/mesh/prepare`,
+                  { target: activeMeshTarget },
+                  "mesh_prepared"
+                );
+                if (job) {
+                  clearPreparedSelectionPreviews();
+                }
+              }}
+            >
+              Run Preparation
+            </ActionButton>
+            <ActionButton
+              disabled={!session?.status.segmentation_ready}
+              help={buttonHelp.resetMeshPreparation}
+              disabledHelp="Run segmentation first."
+              onClick={async () => {
+                const job = await runWorkflowAction(
+                  `Resetting ${activeMeshTarget} preparation`,
+                  `/api/sessions/${session?.session_id}/mesh/prepare`,
+                  { target: activeMeshTarget, reset: true },
+                  "mesh_prepared"
+                );
+                if (job) {
+                  clearPreparedSelectionPreviews();
+                }
+              }}
+            >
+              Reset
+            </ActionButton>
+          </div>
           <label className="field">
             <span className="field-label">
               <span>Denoise method</span>
@@ -1709,37 +2175,65 @@ export default function App() {
           </div>
           <div className="button-row">
             <ActionButton
-              disabled={!session?.status.mesh_prepared}
+              disabled={!activeMeshTargetPrepared}
               help={buttonHelp.removeNoise}
-              disabledHelp="Prepare the mesh point set first."
+              disabledHelp={`Prepare the ${activeMeshTarget} mesh point set first.`}
               onClick={async () => {
-                const job = await runWorkflowAction("Denoising", `/api/sessions/${session?.session_id}/mesh/noise/remove`, denoiseParams, "mesh_prepared");
+                const job = await runWorkflowAction(
+                  `Denoising ${activeMeshTarget}`,
+                  `/api/sessions/${session?.session_id}/mesh/noise/remove`,
+                  { ...denoiseParams, target: activeMeshTarget },
+                  "mesh_prepared"
+                );
                 if (job) {
-                  clearManualRemoval();
+                  clearPreparedSelectionPreviews();
                 }
               }}
             >
-              <Activity size={16} /> Denoise
+              Denoise
             </ActionButton>
             <ActionButton
-              disabled={!session?.status.mesh_prepared}
+              disabled={!activeMeshTargetSaved}
               help={buttonHelp.undoNoise}
-              disabledHelp="Prepare the mesh point set first."
+              disabledHelp={`Prepare the ${activeMeshTarget} mesh point set first.`}
               onClick={async () => {
-                const job = await runWorkflowAction("Undo noise", `/api/sessions/${session?.session_id}/mesh/noise/undo`, undefined, "mesh_prepared");
+                const job = await runWorkflowAction(
+                  `Undo ${activeMeshTarget} noise`,
+                  `/api/sessions/${session?.session_id}/mesh/noise/undo`,
+                  { target: activeMeshTarget },
+                  "mesh_prepared"
+                );
                 if (job) {
-                  clearManualRemoval();
+                  clearPreparedSelectionPreviews();
                 }
               }}
             >
-              <RotateCcw size={16} /> Undo Denoise
+              Undo Denoise
             </ActionButton>
           </div>
           <ActionButton
             className="wide"
-            disabled={!session?.status.mesh_prepared}
+            disabled={!activeMeshTargetPrepared || activeMeshTarget !== "pedestal"}
+            help={buttonHelp.hagVegetation}
+            disabledHelp={activeMeshTarget === "rock" ? "Height Above Ground removal is only available for prepared pedestal mesh." : "Prepare the pedestal mesh point set first."}
+            onClick={openVegetationTool}
+          >
+            Height Above Ground
+          </ActionButton>
+          <ActionButton
+            className="wide"
+            disabled={!activeMeshTargetPrepared || activeMeshTarget !== "pedestal"}
+            help={buttonHelp.roughnessRemoval}
+            disabledHelp={activeMeshTarget === "rock" ? "Roughness removal is only available for prepared pedestal mesh." : "Prepare the pedestal mesh point set first."}
+            onClick={openRoughnessTool}
+          >
+            Roughness
+          </ActionButton>
+          <ActionButton
+            className="wide"
+            disabled={!activeMeshTargetPrepared}
             help={buttonHelp.manualRemoval}
-            disabledHelp="Prepare the mesh point set first."
+            disabledHelp={`Prepare the ${activeMeshTarget} mesh point set first.`}
             onClick={openManualRemovalTools}
           >
             Manual Removal
@@ -1748,6 +2242,14 @@ export default function App() {
 
         <section className="panel">
           <h2>5. Normals</h2>
+          <div className="segmented mesh-target-control" aria-label="Normals target">
+            <button className={activeMeshTarget === "rock" ? "active" : ""} type="button" onClick={() => void selectMeshTarget("rock")}>
+              Rock Normals
+            </button>
+            <button className={activeMeshTarget === "pedestal" ? "active" : ""} type="button" onClick={() => void selectMeshTarget("pedestal")}>
+              Pedestal Normals
+            </button>
+          </div>
           <label className="field">
             <span className="field-label">
               <span>Normal method</span>
@@ -1770,40 +2272,66 @@ export default function App() {
           />
           <ActionButton
             className="wide"
-            disabled={!session?.status.mesh_prepared}
+            disabled={!activeMeshTargetPrepared}
             help={buttonHelp.computeNormals}
-            disabledHelp="Prepare the mesh point set first."
+            disabledHelp={`Prepare the ${activeMeshTarget} mesh point set first.`}
             onClick={() =>
               runWorkflowAction(
                 "Computing normals",
                 `/api/sessions/${session?.session_id}/mesh/normals`,
-                { method: normalMethod, k: normalK },
+                { method: normalMethod, k: normalK, target: activeMeshTarget },
                 "mesh_prepared"
               )
             }
           >
-            <Activity size={16} /> Compute Normals
+            Compute Normals
           </ActionButton>
         </section>
 
         <section className="panel">
           <h2>6. Reconstruction</h2>
-          <NumericField label="Depth" help={helpText.depth} value={meshDepth} min={5} max={12} step={1} onChange={setMeshDepth} />
+          <div className="segmented mesh-target-control" aria-label="Reconstruction target">
+            <button className={activeMeshTarget === "rock" ? "active" : ""} type="button" onClick={() => void selectMeshTarget("rock")}>
+              Rock
+            </button>
+            <button className={activeMeshTarget === "pedestal" ? "active" : ""} type="button" onClick={() => void selectMeshTarget("pedestal")}>
+              Pedestal
+            </button>
+          </div>
+          <NumericField
+            label="Depth"
+            help={activeMeshTarget === "pedestal" ? "Poisson depth is only used for rock reconstruction. Pedestal uses local-plane filled-hole surface reconstruction." : helpText.depth}
+            value={meshDepth}
+            min={5}
+            max={12}
+            step={1}
+            disabled={activeMeshTarget === "pedestal"}
+            onChange={setMeshDepth}
+          />
           <ActionButton
             className="wide"
-            disabled={!session?.status.mesh_prepared}
+            disabled={!activeMeshTargetSaved}
             help={buttonHelp.reconstruct}
-            disabledHelp="Prepare the mesh point set first."
+            disabledHelp={`Prepare the ${activeMeshTarget} mesh point set first.`}
             onClick={() =>
               runWorkflowAction(
-                "Reconstructing",
+                activeMeshTarget === "pedestal" ? "Reconstructing pedestal surface" : "Reconstructing",
                 `/api/sessions/${session?.session_id}/mesh/reconstruct`,
-                { depth: meshDepth },
+                { depth: meshDepth, target: activeMeshTarget },
                 "mesh"
               )
             }
           >
-            <Layers3 size={16} /> Reconstruct
+            {activeMeshTarget === "pedestal" ? "Reconstruct Surface" : "Reconstruct"}
+          </ActionButton>
+          <ActionButton
+            className="wide"
+            disabled={!session?.combined_reconstruction?.available}
+            help={buttonHelp.loadRockPedestal}
+            disabledHelp="Requires rock and pedestal sources. Each side needs either a reconstructed mesh or segmented point-cloud points."
+            onClick={() => refreshView("combined_mesh")}
+          >
+            Load Rock + Pedestal
           </ActionButton>
         </section>
 
@@ -1811,12 +2339,12 @@ export default function App() {
           <h2>7. Analysis</h2>
           <ActionButton
             className="wide"
-            disabled={!session?.status.mesh_completed}
+            disabled={!session?.status.mesh_completed || activeMeshTarget !== "rock"}
             help={buttonHelp.analyze}
-            disabledHelp="Reconstruct the mesh first."
-            onClick={() => runWorkflowAction("Analyzing", `/api/sessions/${session?.session_id}/analysis`)}
+            disabledHelp={activeMeshTarget === "pedestal" ? "Analysis is rock-only in this version." : "Reconstruct the mesh first."}
+            onClick={() => runWorkflowAction("Analyzing", `/api/sessions/${session?.session_id}/analysis`, undefined, "analysis")}
           >
-            <Triangle size={16} /> Analyze
+            Analyze
           </ActionButton>
         </section>
       </aside>
@@ -1868,14 +2396,14 @@ export default function App() {
               </div>
               <div className="button-row">
                 <ActionButton disabled={interfacePoints.length < 2} help={buttonHelp.stagePart} disabledHelp="Pick at least two interface points first." onClick={stageInterfacePart}>
-                  <Layers3 size={16} /> Stage Part
+                  Stage Part
                 </ActionButton>
                 <ActionButton disabled={!session?.status.point_cloud_loaded} help={buttonHelp.interpolateInterface} disabledHelp="Upload a point cloud first." onClick={interpolateInterface}>
-                  <Sparkles size={16} /> Interpolate Path
+                  Interpolate Path
                 </ActionButton>
               </div>
               <ActionButton className="wide" disabled={!session?.status.point_cloud_loaded} help={buttonHelp.saveInterface} disabledHelp="Upload a point cloud first." onClick={saveInterface}>
-                <Save size={16} /> Save Interface
+                Save Interface
               </ActionButton>
             </section>
 
@@ -1920,7 +2448,7 @@ export default function App() {
                       Undo Edit
                     </ActionButton>
                     <ActionButton disabled={!interfaceDraft} help={buttonHelp.saveDraftManual} disabledHelp="Create a draft first." onClick={saveDraftAsManualInterface}>
-                      <Save size={16} /> Save as Manual
+                      Save as Manual
                     </ActionButton>
                   </div>
                   <ActionButton className="wide" disabled={!interfaceDraft} help={buttonHelp.clearDraft} disabledHelp="Create a draft first." onClick={discardInterfaceDraft}>
@@ -1929,6 +2457,151 @@ export default function App() {
                 </div>
               )}
             </section>
+          </div>
+        </div>
+      )}
+
+      {vegetationWindowOpen && (
+        <div className="floating-window vegetation-window" role="dialog" aria-labelledby="vegetationWindowTitle">
+          <div className="floating-window-header">
+            <h2 id="vegetationWindowTitle">Height Above Ground</h2>
+            <button className="floating-window-close" type="button" aria-label="Close vegetation selection window" onClick={closeVegetationTool}>
+              x
+            </button>
+          </div>
+          <div className="floating-window-body">
+            <p className="tool-note">Apply previews likely vegetation in yellow. Adjust parameters and apply again until the selection looks right, then confirm removal.</p>
+            <div className="inline-fields">
+              <NumericField
+                label="Grid size"
+                help="XY cell size used to estimate local ground elevation. Increase for sparse scans; decrease for denser or uneven ground."
+                value={hagVegetationParams.grid_size}
+                min={0.001}
+                max={5}
+                step={0.001}
+                onChange={(value) => setHagVegetationParams((params) => ({ ...params, grid_size: value }))}
+              />
+              <NumericField
+                label="Height threshold"
+                help="Points this far above the local ground estimate are selected as vegetation candidates. Increase to select only taller vegetation."
+                value={hagVegetationParams.height_threshold}
+                min={0}
+                max={5}
+                step={0.001}
+                onChange={(value) => setHagVegetationParams((params) => ({ ...params, height_threshold: value }))}
+              />
+            </div>
+            <div className="inline-fields">
+              <NumericField
+                label="Ground percentile"
+                help="Low Z percentile in each grid cell used as the local ground estimate. Lower values follow the lowest points more aggressively."
+                value={hagVegetationParams.ground_percentile}
+                min={0}
+                max={100}
+                step={1}
+                onChange={(value) => setHagVegetationParams((params) => ({ ...params, ground_percentile: value }))}
+              />
+              <NumericField
+                label="Min points"
+                help="A cell needs at least this many points to estimate ground directly. Sparse cells borrow the nearest valid ground cell."
+                value={hagVegetationParams.min_points_per_cell}
+                min={1}
+                max={1000}
+                step={1}
+                onChange={(value) => setHagVegetationParams((params) => ({ ...params, min_points_per_cell: value }))}
+              />
+            </div>
+            <div className="button-row">
+              <ActionButton help={buttonHelp.hagApply} onClick={applyHagVegetationSelection}>
+                Apply
+              </ActionButton>
+              <ActionButton disabled={!vegetationSelected.length} help={buttonHelp.hagConfirm} disabledHelp="Apply Height Above Ground first." onClick={confirmHagVegetationRemoval}>
+                Confirm Removal
+              </ActionButton>
+            </div>
+            <div className="button-row">
+              <ActionButton disabled={!vegetationSelected.length} help={buttonHelp.hagClear} disabledHelp="No preview selection is active." onClick={() => setVegetationSelected([])}>
+                Clear
+              </ActionButton>
+              <ActionButton help={buttonHelp.closeManualRemoval} onClick={closeVegetationTool}>
+                Close
+              </ActionButton>
+            </div>
+            <div className="selection-readout">
+              <span>{vegetationSelected.length.toLocaleString()} vegetation candidates selected</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {roughnessWindowOpen && (
+        <div className="floating-window roughness-window" role="dialog" aria-labelledby="roughnessWindowTitle">
+          <div className="floating-window-header">
+            <h2 id="roughnessWindowTitle">Roughness</h2>
+            <button className="floating-window-close" type="button" aria-label="Close roughness selection window" onClick={closeRoughnessTool}>
+              x
+            </button>
+          </div>
+          <div className="floating-window-body">
+            <p className="tool-note">Calculate builds a local plane roughness heatmap from the radius. Apply uses the threshold on the current heatmap without recalculating.</p>
+            <div className="inline-fields">
+              <div className="field-with-action">
+                <NumericField
+                  label="Radius"
+                  help="Spherical neighborhood radius used to fit a local least-squares plane around each pedestal point. Larger radii smooth over broader ground trends; smaller radii react to local texture and noise."
+                  value={roughnessParams.radius}
+                  min={0.001}
+                  max={5}
+                  step={0.001}
+                  onChange={(value) => setRoughnessParams((params) => ({ ...params, radius: value }))}
+                />
+                <ActionButton help={buttonHelp.roughnessCalculate} onClick={calculateRoughnessHeatmap}>
+                  Calculate
+                </ActionButton>
+              </div>
+              <NumericField
+                label="Threshold"
+                help="Prepared pedestal points with point-to-local-plane roughness above this value are selected for removal. Increase to select only rougher points."
+                value={roughnessParams.threshold}
+                min={0}
+                max={5}
+                step={0.001}
+                onChange={(value) => setRoughnessParams((params) => ({ ...params, threshold: value }))}
+              />
+            </div>
+            <div className="button-row">
+              <ActionButton disabled={!roughnessValues.length} disabledHelp="Calculate roughness first." help={buttonHelp.roughnessApply} onClick={applyRoughnessThreshold}>
+                Apply
+              </ActionButton>
+              <ActionButton disabled={!roughnessSelected.length} help={buttonHelp.roughnessConfirm} disabledHelp="Apply Roughness first." onClick={confirmRoughnessRemoval}>
+                Confirm Removal
+              </ActionButton>
+            </div>
+            <div className="button-row">
+              <ActionButton
+                disabled={!roughnessSelected.length}
+                help={buttonHelp.roughnessClear}
+                disabledHelp="No preview selection is active."
+                onClick={() => {
+                  setRoughnessSelected([]);
+                }}
+              >
+                Clear
+              </ActionButton>
+              <ActionButton help={buttonHelp.closeManualRemoval} onClick={closeRoughnessTool}>
+                Close
+              </ActionButton>
+            </div>
+            <div className="selection-readout">
+              <span>{roughnessSelected.length.toLocaleString()} roughness candidates selected</span>
+            </div>
+            <div className="selection-readout">
+              <span>
+                {roughnessStats
+                  ? `Heatmap ready: ${Number(roughnessStats.voxel_point_count ?? 0).toLocaleString()} voxel points at ${Number(roughnessStats.voxel_size ?? 0).toFixed(4)} m, max ${Number(roughnessStats.max_roughness ?? 0).toFixed(4)} m, mean ${Number(roughnessStats.mean_roughness ?? 0).toFixed(4)} m`
+                  : "Click Calculate to build the roughness heatmap"}
+              </span>
+            </div>
           </div>
         </div>
       )}
@@ -1948,7 +2621,7 @@ export default function App() {
             </button>
           </div>
           <div className="floating-window-body">
-            <p className="tool-note">Draw around visible noise in Mesh Prep. Front rendered rock and interpolated bottom-face points can be removed.</p>
+            <p className="tool-note">Draw around noise in Mesh Prep. All prepared points projected inside the polygon are removed, including points hidden behind the front surface.</p>
             <div className="button-row">
               <ActionButton className={manualRemovalDrawing ? "active" : ""} help={buttonHelp.drawPolygon} onClick={() => setManualRemovalDrawing((drawing) => !drawing)}>
                 {manualRemovalDrawing ? "Drawing Polygon" : "Draw Polygon"}

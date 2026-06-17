@@ -28,6 +28,10 @@ type PointCloudViewerProps = {
   pickedColor?: number;
   pointSize: number;
   normalDisplayScale: number;
+  highlightIndices?: number[];
+  highlightColor?: [number, number, number];
+  heatmapValues?: Array<number | null>;
+  heatmapRange?: { min: number; max: number } | null;
   manualRemoval?: ManualRemovalState;
 };
 
@@ -92,16 +96,53 @@ function boxCenter(bounds?: Bounds) {
   return center;
 }
 
-function makePointGeometry(view: PointCloudView) {
+function makePointGeometry(
+  view: PointCloudView,
+  highlightIndices: number[] = [],
+  highlightColor: [number, number, number] = [1.0, 0.84, 0.0],
+  heatmapValues: Array<number | null> = [],
+  heatmapRange: { min: number; max: number } | null = null
+) {
   const geometry = new THREE.BufferGeometry();
   const positions = new Float32Array(view.points.length * 3);
   const colors = new Float32Array(view.colors.length * 3);
   const hasNormals = Array.isArray(view.normals) && view.normals.length === view.points.length;
   const normals = new Float32Array(view.points.length * 3);
+  const highlighted = new Set(highlightIndices.map(Number));
+  const heatmapColor = (value: number | null | undefined): [number, number, number] | null => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || !heatmapRange || heatmapRange.max <= heatmapRange.min) {
+      return null;
+    }
+    const stops: Array<[number, [number, number, number]]> = [
+      [0.0, [0.17, 0.29, 0.85]],
+      [0.25, [0.12, 0.61, 0.83]],
+      [0.5, [0.19, 0.72, 0.44]],
+      [0.75, [1.0, 0.83, 0.23]],
+      [1.0, [0.84, 0.21, 0.16]]
+    ];
+    const t = THREE.MathUtils.clamp((numeric - heatmapRange.min) / (heatmapRange.max - heatmapRange.min), 0, 1);
+    for (let stopIndex = 1; stopIndex < stops.length; stopIndex += 1) {
+      if (t <= stops[stopIndex][0]) {
+        const [leftT, leftColor] = stops[stopIndex - 1];
+        const [rightT, rightColor] = stops[stopIndex];
+        const localT = (t - leftT) / Math.max(rightT - leftT, 1e-9);
+        return [
+          leftColor[0] + (rightColor[0] - leftColor[0]) * localT,
+          leftColor[1] + (rightColor[1] - leftColor[1]) * localT,
+          leftColor[2] + (rightColor[2] - leftColor[2]) * localT
+        ];
+      }
+    }
+    return stops[stops.length - 1][1];
+  };
 
   for (let i = 0; i < view.points.length; i += 1) {
     const point = view.points[i];
-    const color = view.colors[i] ?? [0.5, 0.5, 0.5];
+    const sourceIndex = view.indices[i];
+    const color = highlighted.has(sourceIndex)
+      ? highlightColor
+      : heatmapColor(heatmapValues[sourceIndex]) ?? (view.colors[i] ?? [0.5, 0.5, 0.5]);
     const normal = hasNormals ? view.normals?.[i] ?? [0, 0, 1] : [0, 0, 1];
     positions[i * 3] = point[0];
     positions[i * 3 + 1] = point[1];
@@ -272,18 +313,21 @@ function addNormalSegments(parent: THREE.Object3D, view: PointCloudView, normalD
   );
 }
 
-function makeMeshGeometry(view: ViewerPayload) {
-  if (view.kind !== "mesh" || !view.vertices?.length || !view.triangles?.length) {
+function makeTriangleGeometry(
+  vertices?: [number, number, number][],
+  triangles?: [number, number, number][]
+) {
+  if (!vertices?.length || !triangles?.length) {
     return null;
   }
-  const positions = new Float32Array(view.vertices.length * 3);
-  view.vertices.forEach((vertex, index) => {
+  const positions = new Float32Array(vertices.length * 3);
+  vertices.forEach((vertex, index) => {
     positions[index * 3] = vertex[0];
     positions[index * 3 + 1] = vertex[1];
     positions[index * 3 + 2] = vertex[2];
   });
-  const indices = new Uint32Array(view.triangles.length * 3);
-  view.triangles.forEach((triangle, index) => {
+  const indices = new Uint32Array(triangles.length * 3);
+  triangles.forEach((triangle, index) => {
     indices[index * 3] = triangle[0];
     indices[index * 3 + 1] = triangle[1];
     indices[index * 3 + 2] = triangle[2];
@@ -296,7 +340,98 @@ function makeMeshGeometry(view: ViewerPayload) {
   return geometry;
 }
 
-export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndices, pickedColor, pointSize, normalDisplayScale, manualRemoval }: PointCloudViewerProps) {
+function makeMeshGeometry(view: ViewerPayload) {
+  if (view.kind !== "mesh") {
+    return null;
+  }
+  return makeTriangleGeometry(view.vertices, view.triangles);
+}
+
+function makeMeshMaterial(color: [number, number, number] = [0.5, 0.5, 0.5]) {
+  return new THREE.MeshStandardMaterial({
+    color: new THREE.Color(color[0], color[1], color[2]),
+    roughness: 0.58,
+    metalness: 0.04,
+    side: THREE.DoubleSide
+  });
+}
+
+function makeWireframeMaterial() {
+  return new THREE.LineBasicMaterial({
+    color: 0x2f3437,
+    transparent: true,
+    opacity: 0.32
+  });
+}
+
+function analysisOverlayScale(view: ViewerPayload) {
+  const bounds = frameBoundsForView(view);
+  if (!bounds) {
+    return 0.04;
+  }
+  const dx = bounds.max[0] - bounds.min[0];
+  const dy = bounds.max[1] - bounds.min[1];
+  const dz = bounds.max[2] - bounds.min[2];
+  const diagonal = Math.max(Math.hypot(dx, dy, dz), 1);
+  return Math.max(0.025, diagonal * 0.018);
+}
+
+function addAnalysisOverlays(parent: THREE.Object3D, view: ViewerPayload) {
+  if (!view.analysis_segments?.length && !view.analysis_markers?.length) {
+    return;
+  }
+  const markerRadius = analysisOverlayScale(view);
+  (view.analysis_segments ?? []).forEach((segment) => {
+    const geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(segment.start[0], segment.start[1], segment.start[2]),
+      new THREE.Vector3(segment.end[0], segment.end[1], segment.end[2])
+    ]);
+    const color = segment.color ?? [1, 0.82, 0];
+    parent.add(
+      new THREE.Line(
+        geometry,
+        new THREE.LineBasicMaterial({
+          color: new THREE.Color(color[0], color[1], color[2]),
+          depthTest: false,
+          transparent: true,
+          opacity: 0.96
+        })
+      )
+    );
+  });
+  (view.analysis_markers ?? []).forEach((marker) => {
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(markerRadius * 1.45, 20, 14),
+      new THREE.MeshBasicMaterial({ color: 0x101010, depthTest: false })
+    );
+    halo.position.set(marker.point[0], marker.point[1], marker.point[2]);
+    const core = new THREE.Mesh(
+      new THREE.SphereGeometry(markerRadius, 20, 14),
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color(marker.color[0], marker.color[1], marker.color[2]),
+        depthTest: false
+      })
+    );
+    core.position.copy(halo.position);
+    parent.add(halo);
+    parent.add(core);
+  });
+}
+
+export function PointCloudViewer({
+  view,
+  onPickPoint,
+  onUnpickPoint,
+  pickedIndices,
+  pickedColor,
+  pointSize,
+  normalDisplayScale,
+  highlightIndices = [],
+  highlightColor = [1.0, 0.84, 0.0],
+  heatmapValues = [],
+  heatmapRange = null,
+  manualRemoval
+}: PointCloudViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onPickRef = useRef(onPickPoint);
   const onUnpickRef = useRef(onUnpickPoint);
@@ -319,6 +454,8 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     if (!container || !view) {
       return undefined;
     }
+    const activeContainer = container;
+    const activeView = view;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xf6f7f4);
@@ -326,11 +463,11 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     const camera = new THREE.PerspectiveCamera(55, 1, 0.001, 10000);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setSize(activeContainer.clientWidth, activeContainer.clientHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     const overlay = document.createElement("canvas");
     overlay.className = "manual-removal-overlay-react";
-    container.replaceChildren(renderer.domElement, overlay);
+    activeContainer.replaceChildren(renderer.domElement, overlay);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enablePan = true;
@@ -345,9 +482,9 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
       RIGHT: THREE.MOUSE.PAN
     };
 
-    const frameBounds = frameBoundsForView(view);
+    const frameBounds = frameBoundsForView(activeView);
     const frameKey = boundsKey(frameBounds);
-    const activePivot = boxCenter(activeBoundsForView(view) ?? frameBounds);
+    const activePivot = boxCenter(activeBoundsForView(activeView) ?? frameBounds);
     const contentGroup = new THREE.Group();
     const localGroup = new THREE.Group();
     contentGroup.position.copy(activePivot);
@@ -381,84 +518,134 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     let pointerStart: { x: number; y: number; button: number; mode: "shift" | "manual" | "rotate" } | null = null;
     let trackballLast: THREE.Vector3 | null = null;
 
-    if (view.kind === "pointCloud") {
-      const geometry = makePointGeometry(view);
+    if (activeView.kind === "pointCloud") {
+      const geometry = makePointGeometry(activeView, highlightIndices, highlightColor, heatmapValues, heatmapRange);
       const material = makePointMaterial(pointSize, Boolean(geometry.getAttribute("normal")), renderer.domElement.height);
       pointMaterial = material;
       pointsObject = new THREE.Points(geometry, material);
       localGroup.add(pointsObject);
-      addMarkers(localGroup, view);
+      addMarkers(localGroup, activeView);
 
       const box = boxFromBounds(frameBounds) ?? geometry.boundingBox?.clone() ?? new THREE.Box3();
       if (box.isEmpty()) {
         box.setFromArray(Array.from(geometry.getAttribute("position").array));
       }
-      addPickedMarkers(localGroup, view, pickedIndices, pickedColor);
+      addPickedMarkers(localGroup, activeView, pickedIndices, pickedColor);
       if (manualRemoval?.active) {
-        addPickedMarkers(localGroup, view, manualRemoval.selectedIndices, 0xffd43b);
+        addPickedMarkers(localGroup, activeView, manualRemoval.selectedIndices, 0xffd43b);
       }
-      addNormalSegments(localGroup, view, normalDisplayScale);
+      addNormalSegments(localGroup, activeView, normalDisplayScale);
+      addAnalysisOverlays(localGroup, activeView);
       applyCameraFrame(box);
-    } else {
-      const payloadGeometry = makeMeshGeometry(view);
-      if (payloadGeometry) {
-        const mesh = new THREE.Mesh(
-          payloadGeometry,
-          new THREE.MeshStandardMaterial({
-            color: 0xbc5a4b,
-            roughness: 0.58,
-            metalness: 0.04,
-            side: THREE.DoubleSide
-          })
-        );
-        localGroup.add(mesh);
-        if (view.show_wireframe) {
+    } else if (activeView.kind === "combinedMesh") {
+      const loader = new PLYLoader();
+      activeView.components.forEach((component) => {
+        if (component.kind === "pointCloud") {
+          const componentView: PointCloudView = {
+            kind: "pointCloud",
+            points: component.points,
+            colors: component.colors,
+            normals: component.normals,
+            indices: component.indices,
+            markers: [],
+            bounds: activeView.bounds,
+            scene_bounds: activeView.scene_bounds,
+            total_points: component.point_count,
+            rendered_points: component.point_count
+          };
+          const geometry = makePointGeometry(componentView);
           localGroup.add(
-            new THREE.LineSegments(
-              new THREE.WireframeGeometry(payloadGeometry),
-              new THREE.LineBasicMaterial({ color: 0x2f3437, transparent: true, opacity: 0.32 })
+            new THREE.Points(
+              geometry,
+              makePointMaterial(pointSize, Boolean(geometry.getAttribute("normal")), renderer.domElement.height)
             )
           );
+          return;
         }
-        const box = boxFromBounds(frameBounds) ?? payloadGeometry.boundingBox?.clone() ?? new THREE.Box3().setFromObject(mesh);
-        applyCameraFrame(box);
-      } else {
-      const loader = new PLYLoader();
-      loader.load(
-        `${view.url}?t=${Date.now()}`,
-        (geometry) => {
+        const addMeshGeometry = (geometry: THREE.BufferGeometry) => {
           geometry.computeVertexNormals();
           const mesh = new THREE.Mesh(
             geometry,
-            new THREE.MeshStandardMaterial({
-              color: 0xbc5a4b,
-              roughness: 0.58,
-              metalness: 0.04,
-              side: THREE.DoubleSide
-            })
+            makeMeshMaterial(component.color)
           );
           localGroup.add(mesh);
-          if (view.show_wireframe) {
-            const wireframe = new THREE.LineSegments(
-              new THREE.WireframeGeometry(geometry),
-              new THREE.LineBasicMaterial({ color: 0x2f3437, transparent: true, opacity: 0.32 })
+          if (component.show_wireframe) {
+            localGroup.add(
+              new THREE.LineSegments(
+                new THREE.WireframeGeometry(geometry),
+                makeWireframeMaterial()
+              )
             );
-            localGroup.add(wireframe);
           }
-          const box = boxFromBounds(frameBounds) ?? new THREE.Box3().setFromObject(mesh);
-          applyCameraFrame(box);
-        },
-        undefined,
-        (error) => {
-          console.error("Failed to load mesh", error);
+        };
+        const payloadGeometry = makeTriangleGeometry(component.vertices, component.triangles);
+        if (payloadGeometry) {
+          addMeshGeometry(payloadGeometry);
+        } else if (component.url) {
+          loader.load(
+            `${component.url}?t=${Date.now()}`,
+            addMeshGeometry,
+            undefined,
+            (error) => {
+              console.error("Failed to load combined mesh component", error);
+            }
+          );
         }
-      );
+      });
+      const box = boxFromBounds(frameBounds) ?? new THREE.Box3();
+      applyCameraFrame(box);
+    } else {
+      const payloadGeometry = makeMeshGeometry(activeView);
+      if (payloadGeometry) {
+        const mesh = new THREE.Mesh(
+          payloadGeometry,
+          makeMeshMaterial()
+        );
+        localGroup.add(mesh);
+        if (activeView.show_wireframe) {
+          localGroup.add(
+            new THREE.LineSegments(
+              new THREE.WireframeGeometry(payloadGeometry),
+              makeWireframeMaterial()
+            )
+          );
+        }
+        addAnalysisOverlays(localGroup, activeView);
+        const box = boxFromBounds(frameBounds) ?? payloadGeometry.boundingBox?.clone() ?? new THREE.Box3().setFromObject(mesh);
+        applyCameraFrame(box);
+      } else {
+        const loader = new PLYLoader();
+        loader.load(
+          `${activeView.url}?t=${Date.now()}`,
+          (geometry) => {
+            geometry.computeVertexNormals();
+            const mesh = new THREE.Mesh(
+              geometry,
+              makeMeshMaterial()
+            );
+            localGroup.add(mesh);
+            if (activeView.show_wireframe) {
+              const wireframe = new THREE.LineSegments(
+                new THREE.WireframeGeometry(geometry),
+                makeWireframeMaterial()
+              );
+              localGroup.add(wireframe);
+            }
+            addAnalysisOverlays(localGroup, activeView);
+            const box = boxFromBounds(frameBounds) ?? new THREE.Box3().setFromObject(mesh);
+            applyCameraFrame(box);
+          },
+          undefined,
+          (error) => {
+            console.error("Failed to load mesh", error);
+          }
+        );
       }
     }
 
     function resize() {
-      const width = Math.max(1, container.clientWidth);
-      const height = Math.max(1, container.clientHeight);
+      const width = Math.max(1, activeContainer.clientWidth);
+      const height = Math.max(1, activeContainer.clientHeight);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
@@ -474,8 +661,8 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     }
 
     function drawManualOverlay() {
-      const width = Math.max(1, container.clientWidth);
-      const height = Math.max(1, container.clientHeight);
+      const width = Math.max(1, activeContainer.clientWidth);
+      const height = Math.max(1, activeContainer.clientHeight);
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const ctx = overlay.getContext("2d");
       if (!ctx) {
@@ -548,7 +735,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     }
 
     function pickAtPointer(event: PointerEvent) {
-      if (!pointsObject || view.kind !== "pointCloud") {
+      if (!pointsObject || activeView.kind !== "pointCloud") {
         return;
       }
       const bounds = renderer.domElement.getBoundingClientRect();
@@ -560,14 +747,14 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
       if (first?.index === undefined) {
         return;
       }
-      const sourceIndex = view.indices[first.index];
+      const sourceIndex = activeView.indices[first.index];
       if (sourceIndex !== undefined) {
         onPickRef.current(sourceIndex);
       }
     }
 
     function selectedPointAtPointer(event: PointerEvent) {
-      if (!pointsObject || view.kind !== "pointCloud" || !pickedRef.current.length) {
+      if (!pointsObject || activeView.kind !== "pointCloud" || !pickedRef.current.length) {
         return null;
       }
       const selected = new Set(pickedRef.current);
@@ -582,8 +769,8 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
       let bestDepth = Infinity;
       let bestDist = Infinity;
 
-      for (let renderIndex = 0; renderIndex < view.indices.length; renderIndex += 1) {
-        const sourceIndex = view.indices[renderIndex];
+      for (let renderIndex = 0; renderIndex < activeView.indices.length; renderIndex += 1) {
+        const sourceIndex = activeView.indices[renderIndex];
         if (!selected.has(sourceIndex)) {
           continue;
         }
@@ -619,7 +806,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     }
 
     function updateManualRemovalSelection(polygon: ScreenPoint[]) {
-      if (!manualRemoval?.active || !pointsObject || view.kind !== "pointCloud" || polygon.length < 3) {
+      if (!manualRemoval?.active || !pointsObject || activeView.kind !== "pointCloud" || polygon.length < 3) {
         if (manualRemoval?.selectedIndices.length) {
           manualRemoval.onSelectionChange([]);
         }
@@ -629,8 +816,8 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
       const positions = pointsObject.geometry.getAttribute("position") as THREE.BufferAttribute;
       const projected = new THREE.Vector3();
       const selected = new Set<number>();
-      const totalPointCount = Number.isFinite(view.total_points) ? Number(view.total_points) : Infinity;
-      for (let renderIndex = 0; renderIndex < view.indices.length; renderIndex += 1) {
+      const totalPointCount = Number.isFinite(activeView.total_points) ? Number(activeView.total_points) : Infinity;
+      for (let renderIndex = 0; renderIndex < activeView.indices.length; renderIndex += 1) {
         projected.fromBufferAttribute(positions, renderIndex);
         pointsObject.localToWorld(projected);
         projected.project(camera);
@@ -644,7 +831,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
         ) {
           continue;
         }
-        const sourceIndex = view.indices[renderIndex];
+        const sourceIndex = activeView.indices[renderIndex];
         if (sourceIndex === undefined || sourceIndex < 0 || sourceIndex >= totalPointCount) {
           continue;
         }
@@ -758,7 +945,7 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     }
 
     const resizeObserver = new ResizeObserver(resize);
-    resizeObserver.observe(container);
+    resizeObserver.observe(activeContainer);
     drawManualOverlay();
     if (manualRemoval?.active) {
       updateManualRemovalSelection(manualRemoval.polygon);
@@ -809,6 +996,10 @@ export function PointCloudViewer({ view, onPickPoint, onUnpickPoint, pickedIndic
     pointSize,
     pickedIndices,
     pickedColor,
+    highlightIndices,
+    highlightColor,
+    heatmapValues,
+    heatmapRange,
     normalDisplayScale,
     manualRemoval?.active,
     manualRemoval?.drawing,
