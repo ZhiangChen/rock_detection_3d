@@ -71,13 +71,20 @@ The `rock_detection_3d` module is not just a backend segmentation library. It al
 
 The repository also includes a browser-based web tool for the `rock_detection_3d` workflow. It is the recommended interactive interface for current development because it exposes the full segmentation workflow in one place:
 
-- import and export `.rd3dproj` project archives,
+- import, save, and save-as `.rd3dproj` project archives,
 - upload LAS/LAZ point clouds,
 - select rock and pedestal seeds,
 - generate and refine automatic/manual interface constraints,
 - run regular region growing and interface-constrained region growing (ICRG),
 - inspect voxel-stage RG results, final dense segmentation, seed branches, and interface overlays,
-- prepare meshes, reconstruct surfaces, run analysis, and download available outputs.
+- measure point-to-point distances in point-cloud views,
+- prepare rock and pedestal mesh targets independently,
+- clean pedestal points with Height Above Ground, roughness, denoise, and manual-removal tools,
+- reconstruct rock surfaces with Poisson reconstruction and pedestal surfaces with the local-plane filled-hole method,
+- load rock and pedestal together, using reconstructed meshes when available and falling back to segmented point clouds when a mesh is missing,
+- run rock analysis and download available outputs.
+
+Project archives use the `.rd3dproj` extension. They are portable ZIP files containing a `project.json` manifest plus binary point-cloud, mesh, state, and analysis artifacts when available.
 
 Install the 3D/web dependencies first:
 
@@ -98,6 +105,8 @@ http://127.0.0.1:8010/
 ```
 
 Port `8010` is used here to avoid conflicts with other local services that commonly use port `8000`. If needed, choose another open port and open the matching URL.
+
+The FastAPI backend serves the current static web UI directly, so no frontend build is required for normal use. The React source in `web/` mirrors the same workflow for future builds and development.
 
 For the recommended web-tool workflow and parameter-tuning guidance, see [docs/web_tool_workflow.md](docs/web_tool_workflow.md).
 

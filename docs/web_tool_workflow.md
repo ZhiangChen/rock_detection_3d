@@ -5,7 +5,9 @@ This workflow is based on the current web-tool implementation of regular region 
 ## 1. Start a project early
 
 Upload or import the point cloud, then use **Save As** to create a `.rd3dproj` project file.
-After a save target has been chosen, **Save Project** can update the same project file.
+After a save target has been chosen, **Save Project** updates the same project file when the browser supports file-system write access.
+
+The `.rd3dproj` file is a ZIP archive with a readable `project.json` manifest plus binary artifacts. It is intended to preserve both the analysis settings and the recoverable workflow state: raw/working point clouds, seeds, interface metadata, region-growing outputs, label-propagated segmentation, available mesh products, and analysis results.
 
 Save the project at major milestones:
 
@@ -137,11 +139,46 @@ Use **Segmented** after label propagation.
 
 If the final dense labels look wrong, go back to **RG Result** first. Fix the voxel-stage region growing or ICRG result before tuning label propagation.
 
-## 9. Prepare mesh and analysis last
+## 9. Prepare meshes after segmentation is stable
 
 Once segmentation is stable, run mesh preparation, normals, reconstruction, and analysis.
 
 Do not tune mesh settings before the segmentation boundary is correct. Mesh and analysis quality depend strongly on the segmentation result.
+
+The web tool now keeps rock and pedestal preparation states separately. In **4. Mesh Preparation**, choose the target before running mesh-prep tools:
+
+- **Prepare Rock Mesh** uses rock object points plus the interpolated interface-fill points needed for rock reconstruction.
+- **Prepare Pedestal Mesh** uses only pedestal/support object points. Interface path points are not included in the pedestal preparation state.
+
+Use **Run Preparation** to open an existing prepared target when it already exists. Use **Reset** when you want to reload from the label-propagated segmentation. For pedestal reset, select which pedestal seed branches to include, or choose all label-propagated pedestal points.
+
+For pedestal cleanup, use these tools before reconstruction:
+
+- **Height Above Ground** selects likely vegetation points above local ground.
+- **Roughness** computes local best-fit-plane roughness, displays a heatmap, then selects points above the chosen threshold.
+- **Manual Removal** removes all prepared points projected inside the polygon, including points hidden behind the front surface.
+
+For rock cleanup, **Manual Removal** can remove rock object points, interpolated interface-fill points, and visible interface path points from the mesh-prep state.
+
+In **5. Normals**, choose **Rock Normals** or **Pedestal Normals** to match the current mesh-prep target.
+
+## 10. Reconstruct rock and pedestal surfaces
+
+In **6. Reconstruction**, choose the target before reconstruction:
+
+- **Rock** uses the existing Poisson reconstruction workflow.
+- **Pedestal** uses the local-plane filled-hole surface reconstruction workflow.
+
+Use **Load Rock + Pedestal** to inspect both targets together. The combined view uses each target's reconstructed mesh when available. If a mesh is missing, it falls back to that target's segmented point cloud. The button is disabled unless both rock and pedestal have at least one available source: either a reconstructed mesh or segmented point-cloud points.
+
+Analysis remains rock-only in the current web tool. Run **Analyze** after rock reconstruction when the rock mesh is ready.
+
+## 11. Use measurement as a temporary inspection tool
+
+The **Measurement** panel is useful for checking distances while reviewing segmentation or prepared point clouds.
+It uses the currently displayed point-cloud coordinates and is not saved into `.rd3dproj` projects.
+
+Use **Shift + Left Click** to select two points and **Shift + Right Click** to remove a selected measurement point.
 
 ## Practical recommendation
 
@@ -160,6 +197,8 @@ Upload or import
 -> Run Label Propagation
 -> inspect Segmented
 -> prepare mesh
--> reconstruct and analyze
+-> reconstruct rock and/or pedestal
+-> load rock + pedestal together when needed
+-> analyze rock geometry
 -> Save Project
 ```
