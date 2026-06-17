@@ -2,6 +2,8 @@
 
 This workflow is based on the current web-tool implementation of regular region growing, interface-constrained region growing (ICRG), and distance-weighted dense label propagation.
 
+The web tool now lives in the standalone `rock_seg_3d_web` package. Launch and frontend-development details are in [`rock_seg_3d_web/README.md`](../rock_seg_3d_web/README.md).
+
 ## 1. Start a project early
 
 Upload or import the point cloud, then use **Save As** to create a `.rd3dproj` project file.

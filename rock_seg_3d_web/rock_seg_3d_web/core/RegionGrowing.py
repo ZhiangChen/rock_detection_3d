@@ -1,0 +1,908 @@
+import argparse
+import numpy as np
+import pandas as pd
+import open3d as o3d
+import laspy
+from collections import deque
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+import time
+
+
+BRANCH_COLOR_PALETTE = [
+    [0.93, 0.18, 0.14],
+    [0.10, 0.36, 0.95],
+    [0.96, 0.62, 0.05],
+    [0.00, 0.62, 0.45],
+    [0.55, 0.28, 0.90],
+    [0.90, 0.20, 0.58],
+    [0.42, 0.70, 0.12],
+    [0.13, 0.66, 0.86],
+    [0.75, 0.38, 0.00],
+    [0.35, 0.35, 0.35],
+]
+
+
+def load_las_as_open3d_point_cloud(las_file_path, evaluate=False):
+    """
+    Load a LAS file and convert it to an Open3D point cloud.
+    """
+    # Read LAS file
+    pc = laspy.read(las_file_path)
+    x = pc.x.scaled_array()
+    y = pc.y.scaled_array()
+    z = pc.z.scaled_array()
+
+    ground_truth_labels = None
+    if evaluate:
+        if "Original cloud index" in pc.point_format.dimension_names:
+            ground_truth_labels = np.int_(pc["Original cloud index"])
+        else:
+            raise ValueError(
+                "The 'Original cloud index' field does not exist in the LAS file."
+            )
+
+    # Normalize coordinates
+    x_mean = np.mean(x)
+    y_mean = np.mean(y)
+    z_mean = np.mean(z)
+    xyz = np.vstack((x - x_mean, y - y_mean, z - z_mean)).transpose()
+
+    # Extract RGB colors if available
+    if (
+        "red" in pc.point_format.dimension_names
+        and "green" in pc.point_format.dimension_names
+        and "blue" in pc.point_format.dimension_names
+    ):
+        r = np.uint8(pc.red / 65535.0 * 255)
+        g = np.uint8(pc.green / 65535.0 * 255)
+        b = np.uint8(pc.blue / 65535.0 * 255)
+        rgb = np.vstack((r, g, b)).transpose()
+    else:
+        rgb = np.zeros((len(x), 3))
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+    return pcd, ground_truth_labels
+
+
+class RegionGrowingSegmentation:
+    def __init__(
+        self,
+        pcd,
+        downsample=True,
+        voxel_size=0.02,
+        num_neighbors=50,
+        smoothness_threshold=0.99,
+        distance_threshold=0.05,
+        curvature_threshold=0.15,
+        use_smoothness=True,
+        use_curvature=True,
+        rock_seeds=None,
+        pedestal_seeds=None,
+        basal_points=None,  # List or array of basal points (optional, default is None)
+        basal_proximity_threshold=0.01,  # Threshold distance for checking proximity to basal points
+        basal_proximity_check=False,  # Flag to override the smoothness and curvature criteria and use basal proximity
+        stepwise_visualize=False,
+    ):
+        """
+        Initialize the region growing segmentation object.
+        """
+        self.original_pcd = pcd  # Store the original point cloud
+        self.voxel_size = voxel_size
+        num_points = len(pcd.points)
+
+        # Validate seed indices
+        if rock_seeds is not None:
+            rock_seeds = [idx for idx in rock_seeds if 0 <= idx < num_points]
+            if not rock_seeds:
+                raise ValueError("No valid rock seeds provided")
+            print(f"Valid rock seeds: {rock_seeds}")
+
+        if pedestal_seeds is not None:
+            pedestal_seeds = [idx for idx in pedestal_seeds if 0 <= idx < num_points]
+            if not pedestal_seeds:
+                raise ValueError("No valid pedestal seeds provided")
+            print(f"Valid pedestal seeds: {pedestal_seeds}")
+
+        if downsample:
+            print(f"Points before downsampling: {len(self.original_pcd.points)}")
+            self.pcd = pcd.voxel_down_sample(voxel_size)
+            print(f"Points after downsampling: {len(self.pcd.points)}")
+            
+            # Transfer seeds to downsampled point cloud
+            if rock_seeds is not None or pedestal_seeds is not None:
+                print("Transferring seeds to downsampled point cloud")
+                dense_points = np.asarray(self.original_pcd.points)
+                sparse_points = np.asarray(self.pcd.points)
+                
+                # Find nearest neighbors in downsampled point cloud
+                nbrs = NearestNeighbors(n_neighbors=1, algorithm='auto').fit(sparse_points)
+                
+                if rock_seeds is not None:
+                    dense_rock_points = dense_points[rock_seeds]
+                    _, rock_indices = nbrs.kneighbors(dense_rock_points)
+                    self.rock_seeds = rock_indices.flatten()
+                    print(f"Transferred {len(rock_seeds)} rock seeds")
+                
+                if pedestal_seeds is not None:
+                    dense_pedestal_points = dense_points[pedestal_seeds]
+                    _, pedestal_indices = nbrs.kneighbors(dense_pedestal_points)
+                    self.pedestal_seeds = pedestal_indices.flatten()
+                    print(f"Transferred {len(pedestal_seeds)} pedestal seeds")
+        else:
+            self.pcd = pcd
+            self.rock_seeds = rock_seeds
+            self.pedestal_seeds = pedestal_seeds
+
+        self.num_neighbors = self._bounded_neighbor_count(num_neighbors, len(self.pcd.points))
+
+        # Estimate normals used by the smoothness and curvature tests.
+        radius_normal = voxel_size * 5
+        self.pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=radius_normal, max_nn=self.num_neighbors
+            )
+        )
+        orientation_neighbors = max(1, min(self.num_neighbors, max(len(self.pcd.points) - 1, 1)))
+        self.pcd.orient_normals_consistent_tangent_plane(k=orientation_neighbors)
+        self.pcd.normals = o3d.utility.Vector3dVector(-np.asarray(self.pcd.normals))
+
+        self.smoothness_threshold = smoothness_threshold
+        self.distance_threshold = distance_threshold
+        self.curvature_threshold = curvature_threshold
+        self.use_smoothness = use_smoothness
+        self.use_curvature = use_curvature
+        self.basal_points = basal_points
+        self.basal_proximity_threshold = basal_proximity_threshold
+        self.basal_proximity_check = self._has_basal_constraint_points(
+            self.basal_points
+        )
+        self.stepwise_visualize = stepwise_visualize
+        self.voxel_region_points = None
+        self.voxel_region_normals = None
+        self.voxel_region_labels = None
+        self.voxel_region_branch_ids = None
+        self.voxel_region_branches = []
+
+        self.labels = np.array([-1] * len(self.pcd.points))
+        self.branch_ids = np.array([-1] * len(self.pcd.points), dtype=np.int32)
+        self.branch_metadata = []
+        self.rock_seeds = self._normalize_seed_indices(getattr(self, "rock_seeds", rock_seeds))
+        self.pedestal_seeds = self._normalize_seed_indices(getattr(self, "pedestal_seeds", pedestal_seeds))
+        print(f"Points before downsampling: {len(self.original_pcd.points)}")
+        print(f"Points after downsampling: {len(self.labels)}")  # -1 indicates unlabeled
+        self.normals = np.asarray(self.pcd.normals)
+        self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+        print("Performing region growing with", self.smoothness_threshold, "smoothness threshold", self.curvature_threshold, "curvature threshold") 
+
+    def _normalize_seed_indices(self, seeds):
+        """
+        Return a sorted array of unique valid seed indices for the current working cloud.
+        """
+        if seeds is None:
+            return None
+        seed_array = np.asarray(seeds, dtype=int).reshape(-1)
+        if seed_array.size == 0:
+            return np.asarray([], dtype=int)
+        point_count = len(self.pcd.points)
+        valid = seed_array[(seed_array >= 0) & (seed_array < point_count)]
+        return np.unique(valid.astype(int))
+
+    @staticmethod
+    def _bounded_neighbor_count(num_neighbors, point_count):
+        try:
+            requested = int(num_neighbors)
+        except (TypeError, ValueError):
+            requested = 50
+        requested = max(1, requested)
+        if point_count <= 0:
+            return requested
+        return max(1, min(requested, int(point_count)))
+
+    @staticmethod
+    def _has_basal_constraint_points(basal_points):
+        if basal_points is None:
+            return False
+        return np.asarray(basal_points).size > 0
+
+    def _initialize_seed_labels(self):
+        """
+        Treat user-provided rock and pedestal seeds as hard constraints before
+        either region starts growing.
+        """
+        rock_seeds = self._normalize_seed_indices(self.rock_seeds)
+        pedestal_seeds = self._normalize_seed_indices(self.pedestal_seeds)
+        if rock_seeds is None or len(rock_seeds) == 0:
+            raise ValueError("No valid rock seeds provided")
+        if pedestal_seeds is None or len(pedestal_seeds) == 0:
+            raise ValueError("No valid pedestal seeds provided")
+
+        overlap = np.intersect1d(rock_seeds, pedestal_seeds)
+        if len(overlap):
+            raise ValueError(
+                "Rock and pedestal seeds overlap after voxel transfer. "
+                "Choose seeds farther apart or use a smaller voxel size."
+            )
+
+        self.rock_seeds = rock_seeds
+        self.pedestal_seeds = pedestal_seeds
+        self.labels[rock_seeds] = 1
+        self.labels[pedestal_seeds] = 0
+        self.branch_ids[:] = -1
+        self.branch_metadata = []
+
+        def assign_branch_metadata(seeds, region_index, class_label, label_prefix):
+            for local_index, seed_index in enumerate(seeds, start=1):
+                branch_id = len(self.branch_metadata)
+                self.branch_ids[int(seed_index)] = branch_id
+                self.branch_metadata.append(
+                    {
+                        "branch_id": int(branch_id),
+                        "seed_index": int(seed_index),
+                        "region_index": int(region_index),
+                        "class_label": class_label,
+                        "label": f"{label_prefix} seed {local_index}",
+                        "color": BRANCH_COLOR_PALETTE[branch_id % len(BRANCH_COLOR_PALETTE)],
+                    }
+                )
+
+        assign_branch_metadata(rock_seeds, 1, "rock", "Rock")
+        assign_branch_metadata(pedestal_seeds, 0, "pedestal", "Pedestal")
+
+    def _branch_summary(self):
+        summaries = []
+        for branch in self.branch_metadata:
+            branch_id = int(branch["branch_id"])
+            summary = dict(branch)
+            summary["node_count"] = int(np.sum(self.branch_ids == branch_id))
+            summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _majority_vote(values, default=-1):
+        values = np.asarray(values, dtype=int).reshape(-1)
+        values = values[values >= 0]
+        if len(values) == 0:
+            return int(default)
+        return int(np.bincount(values).argmax())
+
+    @staticmethod
+    def _distance_weighted_vote(values, distances, default=-1, epsilon=1e-12):
+        values = np.asarray(values, dtype=int).reshape(-1)
+        distances = np.asarray(distances, dtype=float).reshape(-1)
+        if values.shape != distances.shape:
+            raise ValueError("values and distances must have the same shape")
+
+        valid = (values >= 0) & np.isfinite(distances)
+        if not np.any(valid):
+            return int(default)
+
+        values = values[valid]
+        distances = np.maximum(distances[valid], 0.0)
+        weights = 1.0 / np.maximum(distances, epsilon)
+
+        candidates = []
+        for value in np.unique(values):
+            value_mask = values == value
+            candidates.append(
+                (
+                    int(value),
+                    float(np.sum(weights[value_mask])),
+                    float(np.min(distances[value_mask])),
+                )
+            )
+
+        max_weight = max(candidate[1] for candidate in candidates)
+        tied_by_weight = [
+            candidate
+            for candidate in candidates
+            if np.isclose(candidate[1], max_weight, rtol=1e-12, atol=1e-12)
+        ]
+        closest_distance = min(candidate[2] for candidate in tied_by_weight)
+        tied_by_distance = [
+            candidate
+            for candidate in tied_by_weight
+            if np.isclose(candidate[2], closest_distance, rtol=1e-12, atol=1e-12)
+        ]
+        return min(candidate[0] for candidate in tied_by_distance)
+
+    def _majority_branch_for_neighbors(self, neighbor_indices, selected_label=None):
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            return -1
+        neighbor_indices = np.asarray(neighbor_indices, dtype=int).reshape(-1)
+        if len(neighbor_indices) == 0:
+            return -1
+        valid = (neighbor_indices >= 0) & (neighbor_indices < len(self.branch_ids))
+        neighbor_indices = neighbor_indices[valid]
+        if len(neighbor_indices) == 0:
+            return -1
+        branch_values = self.branch_ids[neighbor_indices]
+        branch_mask = branch_values >= 0
+        if selected_label is not None:
+            branch_mask &= self.labels[neighbor_indices] == int(selected_label)
+        return self._majority_vote(branch_values[branch_mask], default=-1)
+
+    def _distance_weighted_branch_for_neighbors(self, neighbor_indices, distances, selected_label=None):
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            return -1
+        neighbor_indices = np.asarray(neighbor_indices, dtype=int).reshape(-1)
+        distances = np.asarray(distances, dtype=float).reshape(-1)
+        if neighbor_indices.shape != distances.shape:
+            raise ValueError("neighbor_indices and distances must have the same shape")
+        if len(neighbor_indices) == 0:
+            return -1
+        valid = (neighbor_indices >= 0) & (neighbor_indices < len(self.branch_ids))
+        neighbor_indices = neighbor_indices[valid]
+        distances = distances[valid]
+        if len(neighbor_indices) == 0:
+            return -1
+        branch_values = self.branch_ids[neighbor_indices]
+        branch_mask = branch_values >= 0
+        if selected_label is not None:
+            branch_mask &= self.labels[neighbor_indices] == int(selected_label)
+        return self._distance_weighted_vote(
+            branch_values[branch_mask],
+            distances[branch_mask],
+            default=-1,
+        )
+
+    def precompute_neighbors(self):
+        """
+        Precompute the neighbors for each point in the point cloud based on a distance threshold.
+        """
+        neighbors = []
+        for i in range(len(self.pcd.points)):
+            [k, idx, _] = self.pcd_tree.search_radius_vector_3d(
+                self.pcd.points[i], self.distance_threshold
+            )
+            neighbors.append(
+                np.array(idx[1:])
+            )  # Skip the first index as it's the point itself
+        return neighbors
+
+    def calculate_segmentation_criteria(self, neighbor_index, neighbors):
+        """
+        Calculate the smoothness criteria for a neighboring point.
+        """
+        # Get the normal of the current point and the normal of the neighboring point
+        neighbor_normal = self.normals[neighbor_index]
+        second_order_neighbors = neighbors[neighbor_index]
+
+        # Filter out the neighbors that are not yet labeled
+        filtered_neighbors = [n for n in second_order_neighbors if self.labels[n] != -1]
+        if len(filtered_neighbors) == 0:
+            return float("inf")
+
+        # Calculate the dot product of the normals between the neighboring point and its labeled neighbors
+        filtered_normals = self.normals[filtered_neighbors]
+        dot_products = np.clip(np.dot(filtered_normals, neighbor_normal), -1.0, 1.0)
+
+        return np.min(dot_products)
+
+    def estimate_curvature(self, index):
+        """
+        Estimate the curvature at a given point.
+        """
+        # Retrieve the neighboring points within a certain radius
+        k, idx, _ = self.pcd_tree.search_radius_vector_3d(
+            self.pcd.points[index], self.distance_threshold
+        )
+
+        # Skip the first index as it's the point itself
+        if k > 1:
+            neighbor_normals = self.normals[idx, :]
+            # Calculate the curvature based on the cross product of the normals
+            curvature = np.mean(
+                np.linalg.norm(
+                    np.cross(neighbor_normals - self.normals[index], neighbor_normals),
+                    axis=1,
+                )
+            )
+            return curvature
+        else:
+            # If no neighbors are found, return 0
+            return 0
+
+    def highlight_proximity_points(self, colored_pcd):
+        """
+        Highlight points that are near basal points in a different color.
+        """
+        # Calculate the distances from each point to all basal points
+        basal_points = np.array(self.basal_points)
+        points = np.asarray(colored_pcd.points)
+        distances_to_basal = np.linalg.norm(
+            basal_points[:, np.newaxis] - points, axis=2
+        )
+        # Determine which points are near any basal point
+        is_near_basal = np.any(
+            distances_to_basal < self.basal_proximity_threshold, axis=0
+        )
+
+        # Visualize the proximity points in a different color, e.g., green
+        colors = np.asarray(colored_pcd.colors)
+        colors[is_near_basal] = [0, 1, 0]  # Green for proximity
+        colored_pcd.colors = o3d.utility.Vector3dVector(colors)
+        return colored_pcd
+
+    def grow_region(self, starting_queue, region_index, neighbors):
+        """
+        Perform region growing segmentation starting from the given seeds.
+        """
+
+        seed_indices = self._normalize_seed_indices(starting_queue)
+        if seed_indices is None or len(seed_indices) == 0:
+            return
+
+        # Label every seed for this region, then start growing from all of them.
+        self.labels[seed_indices] = region_index
+        queue = deque(seed_indices.tolist())
+
+        points_marked = 0
+
+        # Process the queue until it's empty
+        while queue:
+
+            if (self.stepwise_visualize) and (points_marked % 5000 == 0):
+                print(f"Visualizing after marking {points_marked} points.")
+                self.visualize_current_segmentation()
+
+            points_marked += 1
+
+            # Get the next point from the queue
+            current_index = queue.popleft()
+            if self.labels[current_index] != region_index:
+                continue
+            current_point = np.asarray(self.pcd.points)[current_index]
+
+            # Check if basal proximity check is enabled and compute distance to nearest basal point
+            if self.basal_proximity_check:
+                distances_to_basal = np.linalg.norm(
+                    np.asarray(self.basal_points) - current_point, axis=1
+                )
+                min_distance_to_basal = np.min(distances_to_basal)
+
+                # Use a constant radius for neighbor search initially
+                search_radius = self.distance_threshold
+
+                # If the distance to the nearest basal point is less than the threshold, adapt the search radius
+                if min_distance_to_basal < search_radius:
+                    search_radius = min_distance_to_basal
+
+                    # Retrieve the indices of neighboring points using the adaptive radius
+                    [k, neighbor_indices, _] = self.pcd_tree.search_radius_vector_3d(current_point, search_radius)
+                    neighbor_indices = neighbor_indices[1:]  # Skip the first index as it's the point itself
+                else:
+                    # Use a constant radius for neighbor search initially
+                    neighbor_indices = neighbors[current_index]
+            else:
+                # If no basal proximity check, use the precomputed neighbors
+                neighbor_indices = neighbors[current_index]
+
+            # Iterate over the neighboring points
+            for neighbor_index in neighbor_indices:
+                if self.labels[neighbor_index] != -1:
+                    continue
+
+                neighbor_point = np.asarray(self.pcd.points)[neighbor_index]
+
+                # If basal proximity check is enabled, perform the proximity-based region growing
+                if self.basal_proximity_check:
+                    # Calculate the distances from the neighbor to all basal points
+                    distances_to_basal = np.linalg.norm(
+                        np.asarray(self.basal_points) - neighbor_point, axis=1
+                    )
+
+                    # Determine if this neighbor is near any basal point
+                    is_near_basal = np.any(
+                        distances_to_basal < self.basal_proximity_threshold
+                    )
+
+                    if is_near_basal:
+                        continue  # Skip the point if it is near the basal points
+
+                # If the point is not near basal or no basal proximity check is enabled,
+                # apply the smoothness and curvature thresholds
+
+                # Calculate the smoothness criteria (dot product of normals)
+                min_dot_product = self.calculate_segmentation_criteria(
+                    neighbor_index, neighbors
+                )
+
+                # Estimate the curvature for the neighboring point
+                curvature = self.estimate_curvature(neighbor_index)
+
+                # Apply the region growing criteria based on smoothness and curvature
+                if (
+                    self.use_smoothness and min_dot_product >= self.smoothness_threshold
+                ) or (self.use_curvature and curvature < self.curvature_threshold):
+                    self.labels[neighbor_index] = region_index
+                    self.branch_ids[neighbor_index] = self.branch_ids[current_index]
+                    queue.append(neighbor_index)
+
+        print(f"Points marked: {points_marked}")
+
+
+    def visualize_current_segmentation(self):
+        """
+        Visualize the current state of the point cloud segmentation.
+        """
+        colored_pcd = self.color_point_cloud()
+        o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
+
+    def segment(self):
+        """
+        Perform the full region growing segmentation.
+        """
+        if self.rock_seeds is None or self.pedestal_seeds is None:
+            # Auto-select seeds if not provided
+            points = np.asarray(self.pcd.points)
+            min_bound = points.min(axis=0)
+            max_bound = points.max(axis=0)
+
+            centroid_x = (min_bound[0] + max_bound[0]) / 2.0
+            centroid_y = (min_bound[1] + max_bound[1]) / 2.0
+
+            distances = np.linalg.norm(
+                points[:, :2] - np.array([centroid_x, centroid_y]), axis=1
+            )
+            highest_point_index = np.argmax(points[:, 2] - distances)
+            self.rock_seeds = [highest_point_index]
+
+            bottommost_point_index = np.argmin(points[:, 2])
+            self.pedestal_seeds = [bottommost_point_index]
+
+        neighbors = self.precompute_neighbors()
+        self._initialize_seed_labels()
+
+        # Grow the region starting from rock and pedestal seeds
+        self.grow_region(self.rock_seeds, region_index=1, neighbors=neighbors)
+        self.grow_region(self.pedestal_seeds, region_index=0, neighbors=neighbors)
+        self.voxel_region_points = np.asarray(self.pcd.points).copy()
+        self.voxel_region_normals = np.asarray(self.pcd.normals).copy() if self.pcd.has_normals() else None
+        self.voxel_region_labels = self.labels.copy()
+        self.voxel_region_branch_ids = self.branch_ids.copy()
+        self.voxel_region_branches = self._branch_summary()
+
+        # Transfer labels back to original dense point cloud if downsampling was used
+        if hasattr(self, 'original_pcd'):
+            print("Transferring labels to dense point cloud")
+            self.labels = self.transfer_labels_to_dense(
+                self.original_pcd, 
+                self.pcd, 
+                self.labels
+            )
+            self.branch_ids = self.transfer_labels_to_dense(
+                self.original_pcd,
+                self.pcd,
+                self.branch_ids,
+            )
+            # Update the point cloud and KD-tree to use the original dense point cloud
+            self.pcd = self.original_pcd
+            self.pcd_tree = o3d.geometry.KDTreeFlann(self.pcd)
+            return self.pcd, self.labels
+        
+        return self.pcd, self.labels
+
+    def color_point_cloud(self):
+        """
+        Color the segmented point cloud based on the labels.
+        """
+
+        points = np.asarray(self.pcd.points)
+        colors = np.zeros_like(points)
+
+        # Default color (gray)
+        colors[:, :] = [0.5, 0.5, 0.5]
+
+        # Color rock region red and pedestal region blue
+        colors[self.labels == 1] = [1, 0, 0]
+        colors[self.labels == 0] = [0, 0, 1]
+
+        colored_pcd = o3d.geometry.PointCloud()
+        colored_pcd.points = o3d.utility.Vector3dVector(points)
+        colored_pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        # Update the point cloud colors
+        self.pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        return self.pcd
+
+    def conditional_label_propagation(self, distance_threshold=0.05):
+        """
+        Propagate labels to unlabeled points based on the labels of nearby points.
+        """
+        points = np.asarray(self.pcd.points)
+        tree = self.pcd_tree
+        if not hasattr(self, "branch_ids") or len(self.branch_ids) != len(self.labels):
+            self.branch_ids = np.full(len(self.labels), -1, dtype=np.int32)
+
+        unlabeled_indices = np.where(self.labels == -1)[0]
+        print(f"Starting label propagation with {len(unlabeled_indices)} unlabeled points")
+        
+        # Perform label propagation until no more points are labeled
+        unchanged_iterations = 0
+        prev_unlabeled_count = len(unlabeled_indices)
+        points_processed = 0
+
+        while len(unlabeled_indices) > 0:
+            for index in unlabeled_indices:
+                # Find the neighbors within a certain radius
+                [k, idx, squared_distances] = tree.search_radius_vector_3d(
+                    points[index], distance_threshold
+                )
+                idx = np.asarray(idx, dtype=int)
+                distances = np.sqrt(
+                    np.maximum(np.asarray(squared_distances, dtype=float), 0.0)
+                )
+                neighbor_labels = self.labels[idx]
+                # Filter out the unlabeled neighbors
+                labeled_neighbors = neighbor_labels[neighbor_labels != -1]
+                if len(labeled_neighbors) > 0:
+                    selected_label = self._distance_weighted_vote(
+                        neighbor_labels,
+                        distances,
+                    )
+                    self.labels[index] = selected_label
+                    selected_branch = self._distance_weighted_branch_for_neighbors(
+                        idx,
+                        distances,
+                        selected_label,
+                    )
+                    if selected_branch >= 0:
+                        self.branch_ids[index] = selected_branch
+                    points_processed += 1
+
+                    if self.stepwise_visualize and points_processed % 10 == 0:
+                        print(f"Label propagation: processed {points_processed} points")
+                        colored_pcd = self.color_point_cloud()
+                        o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
+
+            unlabeled_indices = np.where(self.labels == -1)[0]
+            current_unlabeled_count = len(unlabeled_indices)
+
+            print(f"Unlabeled points remaining: {current_unlabeled_count}")
+
+            # Check for convergence
+            if current_unlabeled_count == prev_unlabeled_count:
+                unchanged_iterations += 1
+            else:
+                unchanged_iterations = 0
+
+            # Break if no more points are labeled or the number of unlabeled points is unchanged
+            if unchanged_iterations >= 2:
+                break
+
+            prev_unlabeled_count = current_unlabeled_count
+
+            if self.stepwise_visualize:
+                print(f"Label propagation iteration complete. {current_unlabeled_count} unlabeled points remaining.")
+                colored_pcd = self.color_point_cloud()
+                o3d.visualization.draw_geometries([colored_pcd], mesh_show_wireframe=True)
+
+        # Final step: Assign remaining unlabeled points to nearest labeled point
+        unlabeled_indices = np.where(self.labels == -1)[0]
+        if len(unlabeled_indices) > 0:
+            print(f"Final assignment: {len(unlabeled_indices)} unlabeled points remain")
+            labeled_indices = np.where(self.labels != -1)[0]
+            
+            if len(labeled_indices) > 0:
+                # Build a KNN model on ONLY labeled points for efficiency
+                # This ensures we always find a labeled neighbor
+                labeled_points = points[labeled_indices]
+                unlabeled_points = points[unlabeled_indices]
+                
+                # Use sklearn NearestNeighbors to search among labeled points only.
+                # Use k=10 for distance-weighted voting.
+                k = min(10, len(labeled_indices))
+                nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(labeled_points)
+                distances, indices = nbrs.kneighbors(unlabeled_points)
+                
+                # Assign labels based on distance-weighted votes among k nearest labeled neighbors.
+                for i, unlabeled_idx in enumerate(unlabeled_indices):
+                    neighbor_indices = labeled_indices[indices[i]]
+                    neighbor_labels = self.labels[neighbor_indices]
+                    selected_label = self._distance_weighted_vote(
+                        neighbor_labels,
+                        distances[i],
+                    )
+                    self.labels[unlabeled_idx] = selected_label
+                    selected_branch = self._distance_weighted_branch_for_neighbors(
+                        neighbor_indices,
+                        distances[i],
+                        selected_label,
+                    )
+                    if selected_branch >= 0:
+                        self.branch_ids[unlabeled_idx] = selected_branch
+                
+                final_unlabeled = np.sum(self.labels == -1)
+                print(f"Final assignment complete. Assigned {len(unlabeled_indices)} points using k={k} distance-weighted voting. {final_unlabeled} points still unlabeled (if any)")
+
+        return self.labels
+
+    def transfer_labels_to_dense(self, dense_pcd, sparse_pcd, sparse_labels):
+        """
+        Transfer labels from a sparse point cloud to a dense point cloud.
+        """
+        print(f"Transferring labels from {len(sparse_labels)} points to {len(dense_pcd.points)} points")
+        dense_points = np.asarray(dense_pcd.points)
+        sparse_points = np.asarray(sparse_pcd.points)
+
+        # Initialize labels array with the correct size
+        dense_labels = np.full(len(dense_points), -1, dtype=np.int32)
+
+        # Find the nearest neighbor in the sparse point cloud for each point in the dense point cloud
+        nbrs = NearestNeighbors(n_neighbors=1, algorithm="auto").fit(sparse_points)
+        distances, indices = nbrs.kneighbors(dense_points)
+
+        # Transfer labels
+        dense_labels = sparse_labels[indices.flatten()]
+        
+        # Verify the sizes match
+        assert len(dense_labels) == len(dense_points), (
+            f"Label transfer mismatch: {len(dense_labels)} labels for {len(dense_points)} points"
+        )
+        
+        print(f"Label transfer complete. Dense points: {len(dense_points)}, Labels: {len(dense_labels)}")
+        print(f"Unique labels: {np.unique(dense_labels)}")
+        
+        return dense_labels
+
+    def evaluate_segmentation_performance(self, ground_truth_labels, predicted_labels):
+        """
+        Evaluate the segmentation performance using various metrics.
+        """
+        accuracy = np.mean(ground_truth_labels == predicted_labels)
+        conf_matrix = pd.DataFrame(
+            confusion_matrix(
+                ground_truth_labels,
+                predicted_labels,
+            ),
+            index=["true:PBR", "true:PED"],
+            columns=["pred:PBR", "pred:PED"],
+        )
+
+        precision = precision_score(
+            ground_truth_labels, predicted_labels, average="weighted"
+        )
+        recall = recall_score(
+            ground_truth_labels, predicted_labels, average="weighted", zero_division=0
+        )
+        dice = f1_score(ground_truth_labels, predicted_labels, average="weighted")
+
+        return accuracy, conf_matrix, precision, recall, dice
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Region Growing Segmentation for Point Clouds"
+    )
+    parser.add_argument("las_file_path", type=str, help="Path to the input LAS file")
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.01,
+        help="Voxel size for downsampling the point cloud",
+    )
+    parser.add_argument(
+        "--distance_threshold",
+        type=float,
+        default=0.05,
+        help="Distance threshold for region growing",
+    )
+    parser.add_argument(
+        "--smoothness_threshold",
+        type=float,
+        default=0.99,
+        help="Smoothness threshold for region growing",
+    )
+    parser.add_argument(
+        "--curvature_threshold",
+        type=float,
+        default=0.15,
+        help="Curvature threshold for region growing",
+    )
+    parser.add_argument(
+        "--use_smoothness",
+        type=bool,
+        default=True,
+        help="Use smoothness criteria for segmentation",
+    )
+    parser.add_argument(
+        "--use_curvature",
+        type=bool,
+        default=True,
+        help="Use curvature criteria for segmentation",
+    )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        default=False,
+        help="Evaluate segmentation performance using ground truth labels",
+    )
+
+    args = parser.parse_args()
+
+    # Load the LAS file as an Open3D point cloud and get ground truth labels
+    print("Loading dense point cloud from LAS file...")
+    dense_pcd, ground_truth_labels = load_las_as_open3d_point_cloud(
+        args.las_file_path, evaluate=args.evaluate
+    )
+    print(f"Loaded point cloud with {len(dense_pcd.points)} points.")
+
+    # Record the start time
+    start_time = time.time()
+
+    # Initialize the segmenter
+    segmenter = RegionGrowingSegmentation(
+        dense_pcd,
+        voxel_size=args.voxel_size,
+        distance_threshold=args.distance_threshold,
+        smoothness_threshold=args.smoothness_threshold,
+        curvature_threshold=args.curvature_threshold,
+        use_smoothness=args.use_smoothness,
+        use_curvature=args.use_curvature,
+    )
+
+    # Perform segmentation
+    print("Initial segmentation...")
+    sparse_pcd, sparse_labels = segmenter.segment()
+
+    print("Postprocessing the segmentation...")
+    segmenter.conditional_label_propagation(args.distance_threshold)
+
+    sparse_labels[sparse_labels == -1] = 0
+
+    colored_sparse_pcd = segmenter.color_point_cloud()
+
+    # Transfer labels to the dense point cloud
+    dense_labels = segmenter.transfer_labels_to_dense(
+        dense_pcd, sparse_pcd, sparse_labels
+    )
+    print(len(dense_labels), "points after upsampling")
+
+    # Color the dense point cloud based on the transferred labels
+    dense_colors = np.zeros_like(np.asarray(dense_pcd.points))
+    dense_colors[dense_labels == 1] = [1, 0, 0]  # Red for region 0
+    dense_colors[dense_labels == 0] = [0, 0, 1]  # Blue for region 1
+
+    dense_pcd.colors = o3d.utility.Vector3dVector(dense_colors)
+
+    # Estimate normals for visualization
+    radius_normal = 0.05
+    dense_pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_normal, max_nn=50
+        )
+    )
+
+    # Record the end time
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    print(f"Segmentation complete. Total time taken: {total_time:.2f} seconds")
+    print("-" * 10)
+
+    if args.evaluate:
+        # Evaluate segmentation performance
+        accuracy, conf_matrix, precision, recall, dice = (
+            segmenter.evaluate_segmentation_performance(
+                ground_truth_labels, dense_labels
+            )
+        )
+
+        print(f"Accuracy: {accuracy:.2f}")
+        print(f"Precision: {precision:.2f}")
+        print(f"Recall: {recall:.2f}")
+        print(f"Dice Coefficient: {dice:.2f}")
+        print("Confusion Matrix:")
+        print(conf_matrix)
+
+    # Visualize the point cloud
+    o3d.visualization.draw_geometries([dense_pcd], mesh_show_wireframe=True)
+
+
+if __name__ == "__main__":
+    main()

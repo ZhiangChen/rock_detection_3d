@@ -69,7 +69,7 @@ The `rock_detection_3d` module is not just a backend segmentation library. It al
 
 ### Browser-Based Web Tool
 
-The repository also includes a browser-based web tool for the `rock_detection_3d` workflow. It is the recommended interactive interface for current development because it exposes the full segmentation workflow in one place:
+The repository also includes a browser-based web tool in [`rock_seg_3d_web`](rock_seg_3d_web/). It is the recommended interactive interface for current development because it exposes the full segmentation workflow in one place:
 
 - import, save, and save-as `.rd3dproj` project archives,
 - upload LAS/LAZ point clouds,
@@ -86,16 +86,16 @@ The repository also includes a browser-based web tool for the `rock_detection_3d
 
 Project archives use the `.rd3dproj` extension. They are portable ZIP files containing a `project.json` manifest plus binary point-cloud, mesh, state, and analysis artifacts when available.
 
-Install the 3D/web dependencies first:
+Install the web-tool dependencies first:
 
 ```bash
-pip install -r rock_detection_3d/requirements.txt
+pip install -r rock_seg_3d_web/requirements.txt
 ```
 
 Launch the web tool from the repository root:
 
 ```bash
-python -m uvicorn rock_detection_3d.web_app:app --host 127.0.0.1 --port 8010
+python -m uvicorn rock_seg_3d_web.web_app:app --host 127.0.0.1 --port 8010
 ```
 
 Then open:
@@ -106,9 +106,11 @@ http://127.0.0.1:8010/
 
 Port `8010` is used here to avoid conflicts with other local services that commonly use port `8000`. If needed, choose another open port and open the matching URL.
 
-The FastAPI backend serves the current static web UI directly, so no frontend build is required for normal use. The React source in `web/` mirrors the same workflow for future builds and development.
+The FastAPI backend serves the current static web UI directly, so no frontend build is required for normal use. The React source mirror now lives in `rock_seg_3d_web/frontend/`.
 
-For the recommended web-tool workflow and parameter-tuning guidance, see [docs/web_tool_workflow.md](docs/web_tool_workflow.md).
+The old `rock_detection_3d.web_app:app` launch path remains available as a compatibility shim, but new development should use `rock_seg_3d_web.web_app:app`.
+
+For package-specific launch and frontend development notes, see [rock_seg_3d_web/README.md](rock_seg_3d_web/README.md). For the recommended web-tool workflow and parameter-tuning guidance, see [docs/web_tool_workflow.md](docs/web_tool_workflow.md).
 
 ### Part 2: Learning-Based Methods
 
@@ -210,6 +212,7 @@ Additional dataset-format notes are available in [notebooks/data/README.md](/Use
 
 - [rock_detection_3d/README.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/README.md): detailed notes on the unsupervised 3D segmentation workflow.
 - [rock_detection_3d/GUI_TUTORIAL.md](/Users/zhiang/Projects/rock_detection_3d/rock_detection_3d/GUI_TUTORIAL.md): detailed guide to the interactive GUI.
+- [rock_seg_3d_web/README.md](rock_seg_3d_web/README.md): standalone browser web-tool package launch and development notes.
 - [docs/web_tool_workflow.md](docs/web_tool_workflow.md): recommended browser web-tool workflow and parameter-tuning guidance.
 - [learning_based_README.md](/Users/zhiang/Projects/rock_detection_3d/learning_based_README.md): learning-based training and inference workflow.
 

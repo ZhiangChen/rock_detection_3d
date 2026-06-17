@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-from rock_detection_3d.web_workflow import (
+from rock_seg_3d_web.web_workflow import (
     PROJECT_FORMAT,
     PROJECT_SCHEMA_VERSION,
     WebWorkflowSession,

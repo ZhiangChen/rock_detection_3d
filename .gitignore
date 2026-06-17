@@ -235,10 +235,14 @@ unsupervised_rock_detection_3d/scripts/test_cluster_cleanup.py
 web_runs/
 web/dist/
 web/node_modules/
+rock_seg_3d_web/web_runs/
+rock_seg_3d_web/frontend/dist/
+rock_seg_3d_web/frontend/node_modules/
+rock_seg_3d_web/*.egg-info/
 
 # Browser web-tool local outputs and scratch experiments
 *.rd3dproj
 *_mesh.ply
 *_pedestal_mesh.ply
 experiments/
-web/src/vite-env.d.ts
+rock_seg_3d_web/frontend/src/vite-env.d.ts

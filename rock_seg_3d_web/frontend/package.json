@@ -1,5 +1,5 @@
 {
-  "name": "rock-detection-3d-web",
+  "name": "rock-seg-3d-web-frontend",
   "private": true,
   "version": "0.1.0",
   "type": "module",
